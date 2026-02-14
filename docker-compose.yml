@@ -1,0 +1,48 @@
+# ═══════════════════════════════════════════════════════════════════
+# BigQgisMCP — Docker Compose
+# ═══════════════════════════════════════════════════════════════════
+#
+# Usage:
+#   docker compose up -d --build       # Build & start
+#   docker compose logs -f bigqgismcp  # View logs
+#   docker compose down                # Stop
+#
+# Endpoints:
+#   MCP Server:  http://localhost:8100/mcp
+#   QGIS noVNC:  http://localhost:6080
+#   REST API:    http://localhost:8080
+#   MJPEG:       http://localhost:8081/stream
+
+services:
+  bigqgismcp:
+    build: .
+    container_name: bigqgismcp
+    ports:
+      - "${MCP_PORT:-8100}:8100"    # MCP Server
+      - "${QGIS_VNC_PORT:-6080}:6080"  # noVNC (QGIS in browser)
+      - "8080:8080"                  # REST API
+      - "8081:8081"                  # MJPEG stream
+    environment:
+      - QGIS_RESOLUTION=${QGIS_RESOLUTION:-1920x1080x24}
+      - MCP_PORT=8100
+      - VNC_HOST=${VNC_HOST:-localhost}
+      - MOONDREAM_URL=${MOONDREAM_URL:-http://host.docker.internal:8001}
+      - SAMGEO3_URL=${SAMGEO3_URL:-http://host.docker.internal:8002}
+      - DEPTHPRO_URL=${DEPTHPRO_URL:-http://host.docker.internal:8003}
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/data
+      - ./projects:/projects
+      # Dev: mount source for live editing (restart container to apply)
+      - ./main_mcp.py:/app/main_mcp.py:ro
+      - ./src:/app/src:ro
+      - ./skills:/app/skills:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s

@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.eggs/
+*.egg-info/
+dist/
+build/
+
+# Env
+.env
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker data
+data/
+model-cache/
+
+# OS
+.DS_Store
+Thumbbs.db
+
+# Logs
+*.log
+logs/
+
+# QGIS temp
+*.qgz~
+*.qgs~
+
+# Large files
+*.onnx
+*.pt
+*.pth
+*.safetensors
