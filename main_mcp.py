@@ -39,7 +39,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 
 # ── Configuration ─────────────────────────────────────────────────
 
@@ -125,6 +125,8 @@ Read the skill://external-services resource for usage patterns.
 Before writing complex scripts, read the relevant skill:// resources.
 They contain PyQGIS patterns, Processing algorithm references, and best practices.
 """,
+    host="0.0.0.0",
+    port=int(os.environ.get("MCP_PORT", "8100")),
 )
 
 
@@ -165,29 +167,27 @@ def execute_python(code: str) -> str:
 # ── Screenshot ────────────────────────────────────────────────────
 
 @mcp.tool()
-def get_screenshot(width: int = 800, height: int = 600) -> str:
+def get_screenshot(width: int = 800, height: int = 600) -> Image:
     """Capture the current QGIS map canvas as a PNG image.
 
-    Returns base64-encoded PNG. Use this to see what's displayed,
-    verify layer additions, check styling, etc.
+    Returns the screenshot as an inline image displayed directly in the conversation.
+    Use this to see what's displayed, verify layer additions, check styling, etc.
 
     Args:
         width: Image width in pixels (default 800)
         height: Image height in pixels (default 600)
     """
+    import base64
+
     response = qgis_command("screenshot", {
         "width": width, "height": height, "format": "png"
     })
     if "error" in response:
-        return json.dumps(response)
+        raise ValueError(response.get("error", "Screenshot failed"))
 
-    # Return as MCP image content
-    return json.dumps({
-        "type": "image",
-        "format": "png",
-        "base64": response.get("image_base64", ""),
-        "size": response.get("size", 0),
-    })
+    image_b64 = response.get("image_base64", "")
+    image_bytes = base64.b64decode(image_b64)
+    return Image(data=image_bytes, format="png")
 
 
 # ── Project management ────────────────────────────────────────────
@@ -400,17 +400,24 @@ def export_pdf(
 
 # ── VNC Access ────────────────────────────────────────────────────
 
-@mcp.tool()
+@mcp.tool(
+    annotations={
+        "ui": {
+            "resourceUri": "ui://bigqgismcp/qgis-desktop",
+            "visibility": ["model", "app"],
+        }
+    }
+)
 def get_vnc_url() -> str:
-    """Get the URL to access QGIS Desktop interactively in a browser.
+    """Open the QGIS Desktop interactive view.
 
-    Returns a noVNC URL that opens the full QGIS Desktop GUI.
-    The user can interact with QGIS directly — zoom, pan, edit features,
+    Opens the QGIS GUI directly in the conversation as an MCP App.
+    The user can interact with QGIS — zoom, pan, edit features,
     modify styles, use any QGIS tool. Everything happens on the same
     QGIS instance that the MCP tools control.
 
-    Share this URL when:
-    - The user wants to see the map
+    Call this when:
+    - The user wants to see or interact with the map
     - Manual adjustments are needed
     - The user wants to validate results visually
     - Complex styling needs human input
@@ -418,9 +425,9 @@ def get_vnc_url() -> str:
     url = f"http://{VNC_HOST}:{VNC_PORT}/vnc.html?autoconnect=true&resize=scale"
     return json.dumps({
         "vnc_url": url,
-        "description": "Open this URL in a browser to interact with QGIS Desktop directly. "
-                       "You'll see the same QGIS instance — all layers, styles, and data "
-                       "are shared between AI tools and the visual interface."
+        "app": "ui://bigqgismcp/qgis-desktop",
+        "description": "QGIS Desktop is now available as an interactive view in the conversation. "
+                       "You can also open it in a browser at the URL above."
     })
 
 
@@ -465,6 +472,156 @@ def skill_external_services() -> str:
 def skill_data_sources() -> str:
     """French national data sources — Panoramax, IGN, BD TOPO, OCS GE, Foncier."""
     return _load_skill("data_sources")
+
+
+# ── MCP App: QGIS Interactive View ─────────────────────────────
+
+@mcp.resource(
+    "ui://bigqgismcp/qgis-desktop",
+    name="QGIS Desktop",
+    description="Interactive QGIS Desktop — live map canvas with full GUI access via noVNC.",
+    mime_type="text/html;profile=mcp-app",
+)
+def qgis_desktop_app() -> str:
+    """QGIS Desktop embedded as an interactive MCP App.
+
+    Displays the full QGIS GUI directly in the conversation via noVNC.
+    The user can pan, zoom, select features, edit styles — everything
+    they can do in QGIS Desktop. All changes are reflected in MCP tools.
+    """
+    vnc_url = f"http://{VNC_HOST}:{VNC_PORT}/vnc.html?autoconnect=true&resize=scale&view_only=false"
+    stream_url = f"http://{VNC_HOST}:8081/stream"
+    api_url = f"http://{VNC_HOST}:8080"
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QGIS Desktop — BigQgisMCP</title>
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #e0e0e0; }}
+  .header {{ display: flex; align-items: center; justify-content: space-between; padding: 8px 16px; background: #16213e; border-bottom: 1px solid #0f3460; }}
+  .header h1 {{ font-size: 14px; font-weight: 600; color: #e94560; }}
+  .status {{ display: flex; align-items: center; gap: 8px; font-size: 12px; }}
+  .status-dot {{ width: 8px; height: 8px; border-radius: 50%; background: #4ecca3; }}
+  .status-dot.offline {{ background: #e94560; }}
+  .toolbar {{ display: flex; gap: 6px; padding: 6px 16px; background: #16213e; border-bottom: 1px solid #0f3460; }}
+  .toolbar button {{ padding: 4px 12px; font-size: 12px; border: 1px solid #0f3460; background: #1a1a2e; color: #e0e0e0; border-radius: 4px; cursor: pointer; }}
+  .toolbar button:hover {{ background: #0f3460; }}
+  .toolbar button.active {{ background: #e94560; border-color: #e94560; }}
+  .canvas-wrapper {{ position: relative; width: 100%; height: calc(100vh - 80px); background: #000; }}
+  .canvas-wrapper iframe {{ width: 100%; height: 100%; border: none; }}
+  .canvas-wrapper img {{ width: 100%; height: 100%; object-fit: contain; }}
+  .tab-bar {{ display: flex; gap: 2px; padding: 0 16px; }}
+  .tab {{ padding: 4px 12px; font-size: 12px; border: 1px solid #0f3460; border-bottom: none; background: #1a1a2e; color: #999; cursor: pointer; border-radius: 4px 4px 0 0; }}
+  .tab.active {{ background: #16213e; color: #e0e0e0; }}
+  .info-panel {{ display: none; padding: 12px 16px; font-size: 12px; background: #16213e; max-height: 200px; overflow-y: auto; }}
+  .info-panel.visible {{ display: block; }}
+  .info-panel pre {{ white-space: pre-wrap; color: #4ecca3; }}
+</style>
+</head>
+<body>
+  <div class="header">
+    <h1>QGIS Desktop</h1>
+    <div class="status">
+      <div class="status-dot" id="statusDot"></div>
+      <span id="statusText">Connecting...</span>
+    </div>
+  </div>
+
+  <div class="toolbar">
+    <button onclick="switchView('interactive')" id="btnInteractive" class="active">Interactive</button>
+    <button onclick="switchView('stream')" id="btnStream">Live Stream</button>
+    <button onclick="takeScreenshot()" id="btnScreenshot">Screenshot</button>
+    <button onclick="toggleInfo()" id="btnInfo">Project Info</button>
+    <button onclick="openExternal()">Open in Browser</button>
+  </div>
+
+  <div class="canvas-wrapper" id="canvasWrapper">
+    <iframe id="vncFrame" src="{vnc_url}" allow="clipboard-write"></iframe>
+  </div>
+
+  <div class="info-panel" id="infoPanel">
+    <pre id="infoContent">Loading...</pre>
+  </div>
+
+  <script>
+    const API = "{api_url}";
+    const VNC = "{vnc_url}";
+    const STREAM = "{stream_url}";
+    let currentView = "interactive";
+
+    // Check QGIS health
+    async function checkHealth() {{
+      try {{
+        const r = await fetch(API + "/health");
+        const data = await r.json();
+        document.getElementById("statusDot").className = "status-dot";
+        document.getElementById("statusText").textContent =
+          "QGIS " + (data.qgis?.qgis_version || "connected") +
+          " | " + (data.qgis?.layer_count || 0) + " layers";
+        return data;
+      }} catch(e) {{
+        document.getElementById("statusDot").className = "status-dot offline";
+        document.getElementById("statusText").textContent = "Disconnected";
+        return null;
+      }}
+    }}
+
+    function switchView(view) {{
+      currentView = view;
+      const wrapper = document.getElementById("canvasWrapper");
+      document.getElementById("btnInteractive").className = view === "interactive" ? "active" : "";
+      document.getElementById("btnStream").className = view === "stream" ? "active" : "";
+      if (view === "interactive") {{
+        wrapper.innerHTML = '<iframe id="vncFrame" src="' + VNC + '" allow="clipboard-write"></iframe>';
+      }} else {{
+        wrapper.innerHTML = '<img id="streamImg" src="' + STREAM + '" alt="QGIS Live Stream">';
+      }}
+    }}
+
+    async function takeScreenshot() {{
+      try {{
+        const r = await fetch(API + "/api/screenshot");
+        const data = await r.json();
+        if (data.image_base64) {{
+          const wrapper = document.getElementById("canvasWrapper");
+          wrapper.innerHTML = '<img src="data:image/png;base64,' + data.image_base64 + '" alt="Screenshot">';
+          document.getElementById("btnInteractive").className = "";
+          document.getElementById("btnStream").className = "";
+        }}
+      }} catch(e) {{ console.error("Screenshot failed", e); }}
+    }}
+
+    async function toggleInfo() {{
+      const panel = document.getElementById("infoPanel");
+      panel.classList.toggle("visible");
+      if (panel.classList.contains("visible")) {{
+        const data = await checkHealth();
+        document.getElementById("infoContent").textContent = JSON.stringify(data, null, 2);
+      }}
+    }}
+
+    function openExternal() {{
+      // Request host to open VNC URL
+      try {{
+        window.parent.postMessage({{
+          jsonrpc: "2.0", method: "ui/open-link",
+          params: {{ url: VNC }}
+        }}, "*");
+      }} catch(e) {{
+        window.open(VNC, "_blank");
+      }}
+    }}
+
+    // Health check on load + periodic
+    checkHealth();
+    setInterval(checkHealth, 15000);
+  </script>
+</body>
+</html>"""
 
 
 @mcp.resource("skill://qgis-status")
@@ -544,6 +701,5 @@ if __name__ == "__main__":
     else:
         print("[BigQgisMCP] WARNING: Bridge not found, starting MCP server anyway")
 
-    port = int(os.environ.get("MCP_PORT", "8100"))
-    print(f"[BigQgisMCP] Starting MCP server on :{port}")
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
+    print(f"[BigQgisMCP] Starting MCP server on :{mcp.settings.port}")
+    mcp.run(transport="streamable-http")

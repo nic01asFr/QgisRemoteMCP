@@ -29,9 +29,9 @@ ENV LIBGL_ALWAYS_SOFTWARE=1
 ENV GALLIUM_DRIVER=llvmpipe
 ENV LP_NUM_THREADS=4
 
-# Prevent Wayland issues
-ENV WAYLAND_DISPLAY=
-ENV XDG_RUNTIME_DIR=/tmp
+# Force X11 session (prevent Wayland detection by x11vnc)
+ENV XDG_SESSION_TYPE=x11
+ENV XDG_RUNTIME_DIR=/run/user/0
 ENV QT_X11_NO_MITSHM=1
 
 # Python
@@ -49,7 +49,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # OpenGL software rendering
     mesa-utils \
     libgl1-mesa-dri \
-    libgl1-mesa-glx \
+    libgl1 \
     libosmesa6 \
     libglapi-mesa \
     libegl1 \
@@ -77,9 +77,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ── QGIS 3.34 LTR from official repository ──────────────────────
-RUN wget -qO - https://qgis.org/downloads/qgis-2024.gpg.key \
-        | gpg --dearmor -o /etc/apt/keyrings/qgis-archive-keyring.gpg \
-    && echo "deb [signed-by=/etc/apt/keyrings/qgis-archive-keyring.gpg] \
+RUN wget -qO /etc/apt/keyrings/qgis-archive-keyring.gpg \
+        https://download.qgis.org/downloads/qgis-archive-keyring.gpg \
+    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/qgis-archive-keyring.gpg] \
         https://qgis.org/ubuntu-ltr noble main" \
         > /etc/apt/sources.list.d/qgis.list \
     && apt-get update \
@@ -98,11 +98,13 @@ RUN wget -qO- https://github.com/novnc/noVNC/archive/v1.5.0.tar.gz \
 
 # ── Python dependencies (MCP server + API) ───────────────────────
 COPY requirements.txt /tmp/requirements.txt
-RUN pip3 install --break-system-packages --no-cache-dir -r /tmp/requirements.txt \
+RUN pip3 install --break-system-packages --no-cache-dir --ignore-installed -r /tmp/requirements.txt \
     && rm /tmp/requirements.txt
 
 # ── Directory structure ──────────────────────────────────────────
 RUN mkdir -p /app /data /projects /tmp/qgis \
+    && mkdir -p -m 0700 /run/user/0 \
+    && mkdir -p \
     /var/log/supervisor \
     /root/.local/share/QGIS/QGIS3/profiles/default/python/plugins \
     /root/.local/share/QGIS/QGIS3/profiles/default/python/startup
