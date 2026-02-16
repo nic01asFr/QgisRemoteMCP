@@ -107,19 +107,26 @@ RUN mkdir -p /app /data /projects /tmp/qgis \
     && mkdir -p \
     /var/log/supervisor \
     /root/.local/share/QGIS/QGIS3/profiles/default/python/plugins \
-    /root/.local/share/QGIS/QGIS3/profiles/default/python/startup
+    /root/.local/share/QGIS/QGIS3/profiles/default/python/startup \
+    /root/.fluxbox
+
+# ── Fluxbox: maximize all windows by default ───────────────────
+RUN printf '[app] (name=.*)\n  [Maximized] {yes}\n[end]\n' > /root/.fluxbox/apps
 
 WORKDIR /app
 
 # ── Copy application files ───────────────────────────────────────
 COPY main_mcp.py /app/
+COPY qgis_app.html /app/
+COPY maximize_qgis.sh /app/
+COPY datasources.json /app/
 COPY src/ /app/src/
 COPY skills/ /app/skills/
 COPY projects/ /projects/
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY entrypoint.sh /app/
 
-RUN chmod +x /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh /app/maximize_qgis.sh
 
 # ── QGIS startup script (auto-loads bridge on QGIS launch) ──────
 RUN cp /app/src/qgis_bridge.py \

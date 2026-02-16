@@ -12,14 +12,17 @@ Runs on port 8080.
 """
 
 import json
+import re
 import socket
+import subprocess
 import os
 import time
+from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.responses import RedirectResponse, JSONResponse, FileResponse
 import uvicorn
 
 SOCKET_PATH = "/tmp/qgis_bridge.sock"
@@ -144,6 +147,165 @@ async def list_algorithms(search: str = "", provider: str = "", limit: int = 50)
         "provider": provider,
         "limit": limit,
     })
+
+
+# ── File management ──────────────────────────────────────────────
+
+MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50MB
+
+def _validate_filename(name: str) -> str:
+    """Sanitize filename — reject path traversal and unsafe characters."""
+    if not name or not name.strip():
+        raise HTTPException(400, "Empty filename")
+    basename = name.replace("\\", "/").split("/")[-1]
+    if ".." in basename or basename.startswith("."):
+        raise HTTPException(400, f"Unsafe filename: {basename}")
+    if not re.match(r'^[\w\-. ()\[\]]+$', basename):
+        raise HTTPException(400, f"Invalid characters in filename: {basename}")
+    return basename
+
+
+@app.get("/api/files")
+async def list_files(directory: str = "/data", pattern: str = "*"):
+    """List files in /data/ or /projects/."""
+    allowed = ["/data", "/projects"]
+    if directory not in allowed:
+        raise HTTPException(400, f"Directory must be one of: {allowed}")
+    if not os.path.isdir(directory):
+        return {"files": [], "count": 0}
+    results = []
+    for fpath in sorted(Path(directory).glob(pattern)):
+        if fpath.is_file():
+            stat = fpath.stat()
+            results.append({
+                "name": fpath.name, "path": str(fpath),
+                "size": stat.st_size, "modified": int(stat.st_mtime),
+                "suffix": fpath.suffix,
+            })
+    return {"files": results, "count": len(results)}
+
+
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """Upload a file to /data/ via multipart form."""
+    name = _validate_filename(file.filename or "upload")
+    content = await file.read()
+    if len(content) > MAX_UPLOAD_SIZE:
+        raise HTTPException(413, f"File too large: {len(content)} bytes (max {MAX_UPLOAD_SIZE // 1024 // 1024}MB)")
+    dest = Path("/data") / name
+    dest.write_bytes(content)
+    return {"success": True, "name": name, "path": str(dest), "size": len(content)}
+
+
+@app.get("/api/files/{filename}")
+async def download_file(filename: str):
+    """Download a file from /data/."""
+    name = _validate_filename(filename)
+    fpath = Path("/data") / name
+    if not fpath.exists():
+        raise HTTPException(404, f"File not found: {name}")
+    return FileResponse(
+        path=str(fpath),
+        filename=name,
+        media_type="application/octet-stream",
+    )
+
+
+@app.delete("/api/files/{filename}")
+async def delete_file(filename: str):
+    """Delete a file from /data/."""
+    name = _validate_filename(filename)
+    fpath = Path("/data") / name
+    if not fpath.exists():
+        raise HTTPException(404, f"File not found: {name}")
+    fpath.unlink()
+    return {"success": True, "deleted": name}
+
+
+# ── X11 Input (xdotool) ──────────────────────────────────────────
+
+DISPLAY = os.environ.get("DISPLAY", ":99")
+# Parse resolution from env (e.g. "1920x1080x24")
+_res = os.environ.get("QGIS_RESOLUTION", "1920x1080x24").split("x")
+DISPLAY_W = int(_res[0])
+DISPLAY_H = int(_res[1])
+ALLOWED_KEY_RE = re.compile(r'^[a-zA-Z0-9_+\- ]+$')
+
+
+def _xdotool(*args):
+    """Run xdotool with the correct DISPLAY."""
+    env = {**os.environ, "DISPLAY": DISPLAY}
+    subprocess.run(["xdotool", *args], env=env, timeout=2, check=True)
+
+
+def _clamp_coords(body: dict) -> tuple:
+    """Extract and clamp x,y from body to display bounds."""
+    x = max(0, min(int(body["x"]), DISPLAY_W))
+    y = max(0, min(int(body["y"]), DISPLAY_H))
+    return x, y
+
+
+@app.post("/api/input")
+async def send_input(body: dict):
+    """Send mouse/keyboard input to X11 display via xdotool."""
+    event = body.get("type", "")
+    try:
+        if event == "click":
+            x, y = _clamp_coords(body)
+            btn = max(1, min(int(body.get("button", 1)), 3))
+            _xdotool("mousemove", "--screen", "0", str(x), str(y),
+                     "click", str(btn))
+
+        elif event == "dblclick":
+            x, y = _clamp_coords(body)
+            _xdotool("mousemove", "--screen", "0", str(x), str(y),
+                     "click", "--repeat", "2", "--delay", "50", "1")
+
+        elif event == "mousedown":
+            x, y = _clamp_coords(body)
+            btn = max(1, min(int(body.get("button", 1)), 3))
+            _xdotool("mousemove", "--screen", "0", str(x), str(y),
+                     "mousedown", str(btn))
+
+        elif event == "mouseup":
+            x, y = _clamp_coords(body)
+            btn = max(1, min(int(body.get("button", 1)), 3))
+            _xdotool("mousemove", "--screen", "0", str(x), str(y),
+                     "mouseup", str(btn))
+
+        elif event == "mousemove":
+            x, y = _clamp_coords(body)
+            _xdotool("mousemove", "--screen", "0", str(x), str(y))
+
+        elif event == "scroll":
+            x, y = _clamp_coords(body)
+            direction = body.get("direction", "down")
+            clicks = max(1, min(int(body.get("clicks", 3)), 10))
+            button = "5" if direction == "down" else "4"
+            _xdotool("mousemove", "--screen", "0", str(x), str(y),
+                     "click", "--repeat", str(clicks), "--delay", "20", button)
+
+        elif event == "key":
+            key = body.get("key", "")
+            if not key or not ALLOWED_KEY_RE.match(key):
+                raise HTTPException(400, f"Invalid key: {key}")
+            _xdotool("key", key)
+
+        elif event == "type":
+            text = body.get("text", "")
+            if len(text) > 200:
+                raise HTTPException(400, "Text too long")
+            _xdotool("type", "--delay", "20", "--", text)
+
+        else:
+            raise HTTPException(400, f"Unknown event: {event}")
+
+        return {"ok": True}
+
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(500, f"xdotool error: {e}")
+    except (ValueError, KeyError) as e:
+        raise HTTPException(400, f"Invalid input: {e}")
 
 
 # ── VNC redirect ──────────────────────────────────────────────────

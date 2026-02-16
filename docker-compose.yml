@@ -35,6 +35,8 @@ services:
       - ./projects:/projects
       # Dev: mount source for live editing (restart container to apply)
       - ./main_mcp.py:/app/main_mcp.py:ro
+      - ./qgis_app.html:/app/qgis_app.html:ro
+      - ./datasources.json:/app/datasources.json:ro
       - ./src:/app/src:ro
       - ./skills:/app/skills:ro
     extra_hosts:

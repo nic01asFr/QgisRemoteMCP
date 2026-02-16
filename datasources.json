@@ -1,0 +1,178 @@
+{
+  "version": "1.0",
+  "description": "Default data source catalog for BigQgisMCP. All IGN sources are free (no API key since July 2021).",
+  "categories": ["basemap", "imagery", "topography", "administrative", "elevation", "environment", "api"],
+  "sources": [
+    {
+      "id": "osm_xyz",
+      "name": "OpenStreetMap",
+      "category": "basemap",
+      "type": "xyz",
+      "url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+      "params": {"zmin": "0", "zmax": "19"},
+      "description": "OpenStreetMap standard tile layer"
+    },
+    {
+      "id": "ign_planign",
+      "name": "Plan IGN v2",
+      "category": "basemap",
+      "type": "wms",
+      "url": "https://data.geopf.fr/wms-r",
+      "params": {"layers": "GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2", "format": "image/png", "crs": "EPSG:3857"},
+      "description": "Carte topographique IGN de la France"
+    },
+    {
+      "id": "cartodb_positron",
+      "name": "CartoDB Positron (Light)",
+      "category": "basemap",
+      "type": "xyz",
+      "url": "https://cartodb-basemaps-a.global.ssl.fastly.net/light_all/{z}/{x}/{y}.png",
+      "params": {"zmin": "0", "zmax": "19"},
+      "description": "Fond de carte clair minimaliste"
+    },
+    {
+      "id": "cartodb_dark",
+      "name": "CartoDB Dark Matter",
+      "category": "basemap",
+      "type": "xyz",
+      "url": "https://cartodb-basemaps-a.global.ssl.fastly.net/dark_all/{z}/{x}/{y}.png",
+      "params": {"zmin": "0", "zmax": "19"},
+      "description": "Fond de carte sombre"
+    },
+    {
+      "id": "ign_ortho_wmts",
+      "name": "Orthophotos IGN (WMTS)",
+      "category": "imagery",
+      "type": "wmts",
+      "url": "https://data.geopf.fr/wmts",
+      "params": {"layers": "ORTHOIMAGERY.ORTHOPHOTOS", "format": "image/jpeg", "tilematrixset": "PM", "crs": "EPSG:3857", "styles": "normal"},
+      "description": "Photos aériennes haute résolution de la France (tuilées, rapide)"
+    },
+    {
+      "id": "ign_ortho_wms",
+      "name": "Orthophotos IGN (WMS)",
+      "category": "imagery",
+      "type": "wms",
+      "url": "https://data.geopf.fr/wms-r",
+      "params": {"layers": "ORTHOIMAGERY.ORTHOPHOTOS", "format": "image/jpeg", "crs": "EPSG:3857"},
+      "description": "Photos aériennes IGN via WMS (plus lent, supporte GetFeatureInfo)"
+    },
+    {
+      "id": "ign_ortho_irc",
+      "name": "Orthophotos Infrarouge IGN",
+      "category": "imagery",
+      "type": "wms",
+      "url": "https://data.geopf.fr/wms-r",
+      "params": {"layers": "ORTHOIMAGERY.ORTHOPHOTOS.IRC", "format": "image/jpeg", "crs": "EPSG:3857"},
+      "description": "Photos aériennes infrarouge (végétation, hydrologie)"
+    },
+    {
+      "id": "ign_cadastre",
+      "name": "Cadastre (Parcelles)",
+      "category": "administrative",
+      "type": "wms",
+      "url": "https://data.geopf.fr/wms-r",
+      "params": {"layers": "CADASTRALPARCELS.PARCELLAIRE_EXPRESS", "format": "image/png", "crs": "EPSG:3857"},
+      "description": "Parcelles cadastrales françaises"
+    },
+    {
+      "id": "ign_dem",
+      "name": "MNT / DEM Haute Résolution",
+      "category": "elevation",
+      "type": "wms",
+      "url": "https://data.geopf.fr/wms-r",
+      "params": {"layers": "ELEVATION.ELEVATIONGRIDCOVERAGE.HIGHRES", "format": "image/tiff", "crs": "EPSG:2154"},
+      "description": "Modèle Numérique de Terrain haute résolution"
+    },
+    {
+      "id": "bdtopo_batiments",
+      "name": "Bâtiments (BD TOPO)",
+      "category": "topography",
+      "type": "wfs",
+      "url": "https://data.geopf.fr/wfs/ows",
+      "params": {"typename": "BDTOPO_V3:batiment", "srsname": "EPSG:4326"},
+      "description": "Tous les bâtiments de la BD TOPO v3"
+    },
+    {
+      "id": "bdtopo_routes",
+      "name": "Routes (BD TOPO)",
+      "category": "topography",
+      "type": "wfs",
+      "url": "https://data.geopf.fr/wfs/ows",
+      "params": {"typename": "BDTOPO_V3:troncon_de_route", "srsname": "EPSG:4326"},
+      "description": "Segments routiers de la BD TOPO v3"
+    },
+    {
+      "id": "bdtopo_communes",
+      "name": "Communes (BD TOPO)",
+      "category": "administrative",
+      "type": "wfs",
+      "url": "https://data.geopf.fr/wfs/ows",
+      "params": {"typename": "BDTOPO_V3:commune", "srsname": "EPSG:4326"},
+      "description": "Communes françaises de la BD TOPO v3"
+    },
+    {
+      "id": "bdtopo_hydrographie",
+      "name": "Cours d'eau (BD TOPO)",
+      "category": "topography",
+      "type": "wfs",
+      "url": "https://data.geopf.fr/wfs/ows",
+      "params": {"typename": "BDTOPO_V3:cours_d_eau", "srsname": "EPSG:4326"},
+      "description": "Rivières et ruisseaux de la BD TOPO v3"
+    },
+    {
+      "id": "bdtopo_vegetation",
+      "name": "Végétation (BD TOPO)",
+      "category": "topography",
+      "type": "wfs",
+      "url": "https://data.geopf.fr/wfs/ows",
+      "params": {"typename": "BDTOPO_V3:zone_de_vegetation", "srsname": "EPSG:4326"},
+      "description": "Zones de végétation de la BD TOPO v3"
+    },
+    {
+      "id": "bdtopo_voie_ferree",
+      "name": "Voies ferrées (BD TOPO)",
+      "category": "topography",
+      "type": "wfs",
+      "url": "https://data.geopf.fr/wfs/ows",
+      "params": {"typename": "BDTOPO_V3:troncon_de_voie_ferree", "srsname": "EPSG:4326"},
+      "description": "Réseau ferroviaire de la BD TOPO v3"
+    },
+    {
+      "id": "bdtopo_hydro_surfaces",
+      "name": "Surfaces hydrographiques (BD TOPO)",
+      "category": "topography",
+      "type": "wfs",
+      "url": "https://data.geopf.fr/wfs/ows",
+      "params": {"typename": "BDTOPO_V3:surface_hydrographique", "srsname": "EPSG:4326"},
+      "description": "Plans d'eau et surfaces hydrographiques"
+    },
+    {
+      "id": "ban_geocode",
+      "name": "BAN Géocodage",
+      "category": "api",
+      "type": "api",
+      "url": "https://api-adresse.data.gouv.fr",
+      "params": {},
+      "description": "Géocodage d'adresses françaises (Base Adresse Nationale). Endpoints: /search/?q=..., /reverse/?lon=...&lat=..."
+    },
+    {
+      "id": "panoramax",
+      "name": "Panoramax (Imagerie terrain)",
+      "category": "api",
+      "type": "api",
+      "url": "https://api.panoramax.xyz/api",
+      "params": {},
+      "description": "Imagerie de niveau rue open source. Endpoints: /search?bbox=..., /pictures/{id}/sd.jpg"
+    },
+    {
+      "id": "ign_altimetrie",
+      "name": "API Altimétrie IGN",
+      "category": "api",
+      "type": "api",
+      "url": "https://data.geopf.fr/altimetrie",
+      "params": {},
+      "description": "Calcul d'altitude pour un point ou un profil. REST API."
+    }
+  ]
+}
