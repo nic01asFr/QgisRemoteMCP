@@ -186,13 +186,90 @@ def search_dvf(code_commune, year=2023):
     return json.loads(resp.read())
 ```
 
+## Environment & Protected Areas
+
+### Corine Land Cover (WMS)
+```python
+helpers.load_catalog_source("corine_land_cover")
+```
+Layer: `LANDCOVER.CLC18_FR` — land use classification 2018.
+
+### Natura 2000 / ZNIEFF
+> **Unavailable** — Natura 2000 (SIC/ZPS) and ZNIEFF (Type 1/2) WFS sources were removed from the catalog. The typenames appear in Géoplateforme GetCapabilities but GetFeature returns "Feature type unknown" (INPN migration + cyberattaque 2025).
+
+## Administrative Boundaries
+
+### Admin Express (WFS)
+```python
+helpers.load_catalog_source("admin_express_communes", bbox=[4.3, 43.6, 4.5, 43.8])
+helpers.load_catalog_source("admin_express_departements", bbox=[2.0, 43.0, 5.0, 45.0])
+helpers.load_catalog_source("admin_express_regions")
+```
+
+### RPG — Agricultural Parcels (WFS)
+```python
+helpers.load_catalog_source("rpg", bbox=[4.3, 43.6, 4.5, 43.8])
+```
+
+## Additional BD TOPO layers
+
+| Catalog ID | Typename | Description |
+|------------|----------|-------------|
+| `bdtopo_poi` | `BDTOPO_V3:construction_ponctuelle` | Points of interest |
+| `bdtopo_lieu_dit` | `BDTOPO_V3:lieu_dit_non_habite` | Named places |
+| `bdtopo_surface_activite` | `BDTOPO_V3:zone_d_activite_ou_d_interet` | Activity zones |
+| `bdtopo_equipement_transport` | `BDTOPO_V3:equipement_de_transport` | Transport facilities |
+
+## International Basemaps
+
+```python
+# Esri World Imagery (satellite)
+helpers.load_catalog_source("esri_world_imagery")
+# Esri World Topo
+helpers.load_catalog_source("esri_world_topo")
+# Stadia Stamen Terrain
+helpers.load_catalog_source("stamen_terrain")
+# IGN Scan 25 (topographic maps)
+helpers.load_catalog_source("ign_scan25")
+```
+
+## APIs
+
+### Geo API Communes
+```python
+commune = helpers.search_commune("Nimes")
+# Returns: {nom, code, population, departement, region, bbox}
+```
+
+### DVF (Property Transactions)
+API: `https://api.cquest.org/dvf`
+```python
+data = helpers.fetch_json("https://api.cquest.org/dvf", {"code_commune": "30189", "annee_mutation": "2023"})
+```
+
 ## Typical workflow: load base data for a zone
 
+### Using helpers (recommended)
+```python
+# 1. Geocode + zoom
+loc = helpers.geocode("Gare de Nimes")
+helpers.zoom_to(loc["bbox"])
+
+# 2. Add orthophoto + buildings + roads
+helpers.load_catalog_source("ign_ortho_wmts")
+helpers.load_catalog_source("bdtopo_batiments", bbox=loc["bbox"])
+helpers.load_catalog_source("bdtopo_routes", bbox=loc["bbox"])
+
+result["center"] = [loc["lon"], loc["lat"]]
+result["bbox"] = loc["bbox"]
+```
+
+### Manual approach (for custom URIs)
 ```python
 import urllib.request, json, urllib.parse
 
 # 1. Geocode
-q = urllib.parse.quote("Gare de Nîmes")
+q = urllib.parse.quote("Gare de Nimes")
 resp = urllib.request.urlopen(f"https://api-adresse.data.gouv.fr/search/?q={q}&limit=1")
 data = json.loads(resp.read())
 lon = data['features'][0]['geometry']['coordinates'][0]
@@ -208,7 +285,7 @@ project.addMapLayer(QgsRasterLayer(ortho_uri, "Orthophoto", "wms"))
 
 # 4. Add buildings
 bat_uri = f"url='https://data.geopf.fr/wfs/ows' typename='BDTOPO_V3:batiment' srsname='EPSG:4326' bbox='{bbox[1]},{bbox[0]},{bbox[3]},{bbox[2]}' pagingEnabled='true'"
-project.addMapLayer(QgsVectorLayer(bat_uri, "Bâtiments", "WFS"))
+project.addMapLayer(QgsVectorLayer(bat_uri, "Batiments", "WFS"))
 
 # 5. Add roads
 route_uri = f"url='https://data.geopf.fr/wfs/ows' typename='BDTOPO_V3:troncon_de_route' srsname='EPSG:4326' bbox='{bbox[1]},{bbox[0]},{bbox[3]},{bbox[2]}' pagingEnabled='true'"
