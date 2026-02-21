@@ -29,9 +29,9 @@ from pathlib import Path
 from qgis.core import (
     QgsProject, QgsVectorLayer, QgsRasterLayer, QgsCoordinateReferenceSystem,
     QgsFeatureRequest, QgsRectangle, QgsMapSettings, QgsMapRendererParallelJob,
-    QgsLayoutExporter, QgsApplication, QgsExpression, QgsField,
-    QgsCoordinateTransform, QgsPointXY, Qgis,
-    QgsVectorFileWriter,
+    QgsLayoutExporter, QgsApplication, QgsExpression, QgsField, QgsFields,
+    QgsCoordinateTransform, QgsPointXY, Qgis, QgsWkbTypes,
+    QgsVectorFileWriter, QgsEditorWidgetSetup,
     QgsSingleSymbolRenderer, QgsFillSymbol, QgsMarkerSymbol, QgsLineSymbol,
     QgsCategorizedSymbolRenderer, QgsRendererCategory,
     QgsGraduatedSymbolRenderer, QgsRendererRange,
@@ -87,6 +87,17 @@ class QGISBridge:
 
     # ── Command dispatcher ────────────────────────────────────────
 
+    # Actions that modify project state — context is appended to their responses
+    _MUTATING_ACTIONS = frozenset({
+        "execute_python", "new_project", "open_project",
+        "add_vector_layer", "add_raster_layer", "add_wfs_layer", "add_wms_layer",
+        "remove_layer", "run_processing", "zoom_to_extent",
+        "set_layer_style", "set_layer_visibility", "apply_style",
+        "add_from_catalog", "set_study_zone", "smart_load",
+        "apply_layout_template", "export_web_map", "export_flood_map", "export_temporal_map", "export_qfield",
+        "mouse_click", "mouse_scroll", "key_press", "mouse_drag",
+    })
+
     def handle(self, request: dict) -> dict:
         """Route a command to the appropriate handler."""
         action = request.get("action", "")
@@ -98,7 +109,16 @@ class QGISBridge:
                 return {"error": f"Unknown action: {action}",
                         "available": self._list_actions()}
             with self._lock:
-                return handler(params)
+                response = handler(params)
+
+            # Append workflow context to mutating actions (no error)
+            if action in self._MUTATING_ACTIONS and "error" not in response:
+                try:
+                    response["_context"] = self._build_context()
+                except Exception:
+                    pass  # never fail on context building
+
+            return response
         except Exception as e:
             return {"error": str(e), "traceback": traceback.format_exc()}
 
@@ -128,6 +148,63 @@ class QGISBridge:
                 project.write("/data/.autosave.qgz")
         except Exception:
             pass  # never fail on autosave
+
+    # ── Workflow context ──────────────────────────────────────────
+
+    def _build_context(self) -> dict:
+        """Lightweight project state snapshot, appended to mutating action responses.
+        Inspired by BigLocalApps' _mode_context() pattern."""
+        from qgis.core import QgsExpressionContextUtils
+        project = QgsProject.instance()
+        scope = QgsExpressionContextUtils.projectScope(project)
+        zone_name = scope.variable("study_zone_name")
+
+        layers = list(project.mapLayers().values())
+        vector_layers = [l for l in layers if isinstance(l, QgsVectorLayer)]
+        raster_layers = [l for l in layers if isinstance(l, QgsRasterLayer)]
+
+        has_data = any(l.featureCount() > 0 for l in vector_layers)
+        has_styled = any(
+            l.renderer() and not isinstance(l.renderer(), QgsSingleSymbolRenderer)
+            for l in vector_layers
+        )
+        has_layouts = bool(project.layoutManager().printLayouts())
+
+        # Phase detection (soft, not strict)
+        if has_layouts:
+            phase = "export"
+        elif has_styled:
+            phase = "cartography"
+        elif has_data and zone_name:
+            phase = "analysis"
+        else:
+            phase = "setup"
+
+        return {
+            "phase": phase,
+            "study_zone": zone_name or None,
+            "layers": [
+                {"name": l.name(), "id": l.id(), "features": l.featureCount()}
+                for l in vector_layers
+            ],
+            "raster_count": len(raster_layers),
+            "has_layouts": has_layouts,
+            "hint": self._phase_hint(phase, zone_name, len(vector_layers)),
+        }
+
+    @staticmethod
+    def _phase_hint(phase: str, zone_name, vector_count: int) -> str:
+        if phase == "setup" and not zone_name:
+            return "Start with set_study_zone to define your area, then smart_load to load data"
+        if phase == "setup":
+            return "Load data with smart_load (e.g. bdtopo_batiments, osm_xyz). Use list_datasources to browse."
+        if phase == "analysis":
+            return "Analyze (run_processing, execute_python) or style layers (set_layer_style)"
+        if phase == "cartography":
+            return "Apply a layout (apply_layout_template) then export (export_pdf, export_web_map)"
+        if phase == "export":
+            return "Export: export_pdf, export_web_map, download_project, export_layer"
+        return ""
 
     # ══════════════════════════════════════════════════════════════
     # ACTIONS
@@ -995,6 +1072,929 @@ class QGISBridge:
             self.iface.mapCanvas().refresh()
         return {"success": True, "layer_id": layer_id, "visible": visible}
 
+    # ── Layout Templates ─────────────────────────────────────────
+
+    TEMPLATES_DIR = Path("/app/templates")
+
+    def _action_list_layout_templates(self, params: dict) -> dict:
+        """List available print layout templates."""
+        templates = []
+        if self.TEMPLATES_DIR.is_dir():
+            for qpt in sorted(self.TEMPLATES_DIR.glob("*.qpt")):
+                templates.append({
+                    "id": qpt.stem,
+                    "name": qpt.stem.replace("_", " ").title(),
+                    "file": str(qpt),
+                })
+        return {"templates": templates}
+
+    def _action_apply_layout_template(self, params: dict) -> dict:
+        """Load a .qpt layout template and configure with project variables."""
+        from qgis.PyQt.QtXml import QDomDocument
+        from qgis.core import (QgsReadWriteContext, QgsPrintLayout,
+                                QgsLayoutItemMap, QgsLayoutItemLegend,
+                                QgsLayoutItemScaleBar, QgsExpressionContextUtils)
+
+        template_id = params.get("template_id", params.get("template", ""))
+        variables = params.get("variables", {})
+        layout_name = params.get("name", "")
+
+        if not template_id:
+            return {"error": "Missing 'template_id' parameter (e.g. 'a3_landscape')"}
+
+        template_path = self.TEMPLATES_DIR / f"{template_id}.qpt"
+        if not template_path.exists():
+            available = [p.stem for p in self.TEMPLATES_DIR.glob("*.qpt")] if self.TEMPLATES_DIR.is_dir() else []
+            return {"error": f"Template not found: {template_id}",
+                    "available_templates": available}
+
+        # Read template XML
+        doc = QDomDocument()
+        with open(template_path, encoding="utf-8") as f:
+            content = f.read()
+        ok, err_msg, err_line, err_col = doc.setContent(content)
+        if not ok:
+            return {"error": f"Failed to parse template XML: {err_msg} (line {err_line})"}
+
+        project = QgsProject.instance()
+
+        # Set project variables (title, subtitle, etc.)
+        for key, value in variables.items():
+            QgsExpressionContextUtils.setProjectVariable(project, key, str(value))
+
+        # Create layout
+        layout = QgsPrintLayout(project)
+        layout.initializeDefaults()
+        context = QgsReadWriteContext()
+
+        items_loaded, ok = layout.loadFromTemplate(doc, context)
+        if not ok:
+            return {"error": "Failed to load layout from template"}
+
+        # Set layout name
+        if not layout_name:
+            layout_name = layout.name() or f"Export {template_id.replace('_', ' ').title()}"
+        layout.setName(layout_name)
+
+        # Remove existing layout with same name
+        existing = project.layoutManager().layoutByName(layout_name)
+        if existing:
+            project.layoutManager().removeLayout(existing)
+
+        # Link map item to current canvas extent
+        canvas = self.iface.mapCanvas() if self.iface else None
+        map_items = [item for item in layout.items() if isinstance(item, QgsLayoutItemMap)]
+        if map_items and canvas:
+            map_item = map_items[0]
+            map_item.setExtent(canvas.extent())
+            map_item.setCrs(project.crs())
+
+            # Link legend to map
+            for item in layout.items():
+                if isinstance(item, QgsLayoutItemLegend):
+                    item.setLinkedMap(map_item)
+                elif isinstance(item, QgsLayoutItemScaleBar):
+                    item.setLinkedMap(map_item)
+
+        # Register
+        project.layoutManager().addLayout(layout)
+
+        return {
+            "success": True,
+            "layout_name": layout_name,
+            "template": template_id,
+            "variables_set": list(variables.keys()),
+            "map_items": len(map_items),
+        }
+
+    # ── Recipes ───────────────────────────────────────────────────
+
+    RECIPES_DIR = Path("/app/recipes")
+
+    def _action_list_recipes(self, params: dict) -> dict:
+        """List available workflow recipes."""
+        recipes = []
+        if self.RECIPES_DIR.is_dir():
+            for rpath in sorted(self.RECIPES_DIR.glob("*.json")):
+                try:
+                    data = json.loads(rpath.read_text(encoding="utf-8"))
+                    recipes.append({
+                        "id": data.get("id", rpath.stem),
+                        "name": data.get("name", rpath.stem),
+                        "description": data.get("description", ""),
+                        "tags": data.get("tags", []),
+                        "parameters": data.get("parameters", {}),
+                    })
+                except Exception:
+                    pass
+        return {"recipes": recipes}
+
+    def _action_get_recipe(self, params: dict) -> dict:
+        """Get a specific recipe with parameter substitution."""
+        recipe_id = params.get("id", "")
+        if not recipe_id:
+            return {"error": "Missing 'id' parameter"}
+
+        recipe_path = self.RECIPES_DIR / f"{recipe_id}.json"
+        if not recipe_path.exists():
+            available = [p.stem for p in self.RECIPES_DIR.glob("*.json")] if self.RECIPES_DIR.is_dir() else []
+            return {"error": f"Recipe not found: {recipe_id}",
+                    "available_recipes": available}
+
+        data = json.loads(recipe_path.read_text(encoding="utf-8"))
+
+        # Substitute parameters: $zone → actual value from params
+        recipe_params = data.get("parameters", {})
+        for key in recipe_params:
+            placeholder = f"${key}"
+            value = params.get(key, recipe_params[key].get("default", placeholder))
+            if value is None:
+                value = placeholder
+            # Substitute in steps
+            data_str = json.dumps(data["steps"])
+            data_str = data_str.replace(f'"{placeholder}"', json.dumps(value))
+            data_str = data_str.replace(placeholder, str(value))
+            data["steps"] = json.loads(data_str)
+
+        return {
+            "id": data.get("id"),
+            "name": data.get("name"),
+            "description": data.get("description"),
+            "steps": data.get("steps", []),
+            "outputs": data.get("outputs", []),
+            "total_steps": len(data.get("steps", [])),
+        }
+
+    # ── Web Map Export ────────────────────────────────────────────
+
+    def _action_export_web_map(self, params: dict) -> dict:
+        """Export visible vector layers as interactive Leaflet HTML."""
+        title = params.get("title", "")
+        max_features = params.get("max_features", 5000)
+        output_path = params.get("output_path", "")
+
+        project = QgsProject.instance()
+        if not title:
+            title = project.title() or "Web Map"
+
+        if not output_path:
+            output_path = f"/data/webmap_{int(time.time())}.html"
+
+        # Collect visible vector layers
+        layer_data = []
+        palette = ["#3498db", "#e74c3c", "#2ecc71", "#f39c12", "#9b59b6",
+                    "#1abc9c", "#e67e22", "#34495e", "#16a085", "#c0392b"]
+        color_idx = 0
+
+        # Canvas extent for initial view
+        canvas = self.iface.mapCanvas() if self.iface else None
+        center = [0, 0]
+        zoom = 13
+        if canvas:
+            ext = canvas.extent()
+            # Transform to 4326 for Leaflet
+            tr = QgsCoordinateTransform(project.crs(),
+                                         QgsCoordinateReferenceSystem("EPSG:4326"),
+                                         project)
+            ext_4326 = tr.transformBoundingBox(ext)
+            center = [
+                (ext_4326.yMinimum() + ext_4326.yMaximum()) / 2,
+                (ext_4326.xMinimum() + ext_4326.xMaximum()) / 2,
+            ]
+
+        for lid, layer in project.mapLayers().items():
+            if not isinstance(layer, QgsVectorLayer):
+                continue
+            node = project.layerTreeRoot().findLayer(layer)
+            if node and not node.isVisible():
+                continue
+            if layer.featureCount() == 0:
+                continue
+
+            # Extract color from renderer (supports single, graduated, categorized)
+            color = palette[color_idx % len(palette)]
+            color_idx += 1
+            renderer = layer.renderer()
+            per_feature_colors = {}  # range_key → color for styled renderers
+            legend_items = []  # [{label, color}] for graduated/categorized legends
+            if renderer:
+                if isinstance(renderer, QgsSingleSymbolRenderer):
+                    sym = renderer.symbol()
+                    if sym:
+                        qcolor = sym.color()
+                        color = f"#{qcolor.red():02x}{qcolor.green():02x}{qcolor.blue():02x}"
+                elif isinstance(renderer, QgsGraduatedSymbolRenderer):
+                    field_name = renderer.classAttribute()
+                    for rng in renderer.ranges():
+                        sym = rng.symbol()
+                        if sym:
+                            qc = sym.color()
+                            hex_color = f"#{qc.red():02x}{qc.green():02x}{qc.blue():02x}"
+                            per_feature_colors[f"{rng.lowerValue()}-{rng.upperValue()}"] = hex_color
+                            legend_items.append({
+                                "label": rng.label() or f"{rng.lowerValue():.0f} - {rng.upperValue():.0f}",
+                                "color": hex_color,
+                            })
+                    ranges_list = renderer.ranges()
+                    if ranges_list:
+                        mid = ranges_list[len(ranges_list)//2].symbol()
+                        if mid:
+                            qc = mid.color()
+                            color = f"#{qc.red():02x}{qc.green():02x}{qc.blue():02x}"
+                elif isinstance(renderer, QgsCategorizedSymbolRenderer):
+                    for cat in renderer.categories():
+                        sym = cat.symbol()
+                        if sym:
+                            qc = sym.color()
+                            hex_color = f"#{qc.red():02x}{qc.green():02x}{qc.blue():02x}"
+                            legend_items.append({
+                                "label": str(cat.label()) if cat.label() else str(cat.value()),
+                                "color": hex_color,
+                            })
+                    cats = renderer.categories()
+                    if cats:
+                        mid = cats[len(cats)//2].symbol()
+                        if mid:
+                            qc = mid.color()
+                            color = f"#{qc.red():02x}{qc.green():02x}{qc.blue():02x}"
+
+            # Export features as GeoJSON
+            tr = QgsCoordinateTransform(layer.crs(),
+                                         QgsCoordinateReferenceSystem("EPSG:4326"),
+                                         project)
+            features = []
+            for i, feat in enumerate(layer.getFeatures()):
+                if i >= max_features:
+                    break
+                geom = feat.geometry()
+                if geom.isEmpty():
+                    continue
+                geom.transform(tr)
+                props = {}
+                for field in layer.fields():
+                    val = feat[field.name()]
+                    if val is not None and str(val) != "NULL":
+                        props[field.name()] = val
+                # Add per-feature color for graduated/categorized renderer
+                if renderer:
+                    if isinstance(renderer, QgsGraduatedSymbolRenderer):
+                        field_name = renderer.classAttribute()
+                        val = feat[field_name] if field_name else None
+                        if val is not None:
+                            try:
+                                fval = float(val)
+                                for rng in renderer.ranges():
+                                    if rng.lowerValue() <= fval <= rng.upperValue():
+                                        qc = rng.symbol().color()
+                                        props["_color"] = f"#{qc.red():02x}{qc.green():02x}{qc.blue():02x}"
+                                        break
+                            except (ValueError, TypeError):
+                                pass
+                    elif isinstance(renderer, QgsCategorizedSymbolRenderer):
+                        field_name = renderer.classAttribute()
+                        val = feat[field_name] if field_name else None
+                        if val is not None:
+                            for cat in renderer.categories():
+                                if str(cat.value()) == str(val):
+                                    qc = cat.symbol().color()
+                                    props["_color"] = f"#{qc.red():02x}{qc.green():02x}{qc.blue():02x}"
+                                    break
+                features.append({
+                    "type": "Feature",
+                    "geometry": json.loads(geom.asJson()),
+                    "properties": props,
+                })
+
+            if features:
+                ld = {
+                    "name": layer.name(),
+                    "color": color,
+                    "geojson": {"type": "FeatureCollection", "features": features},
+                    "feature_count": len(features),
+                    "has_feature_colors": bool(per_feature_colors),
+                }
+                if legend_items:
+                    ld["legend"] = legend_items
+                layer_data.append(ld)
+
+        if not layer_data:
+            return {"error": "No visible vector layers with features to export"}
+
+        # Read template
+        template_path = Path("/app/templates/web/leaflet_template.html")
+        if not template_path.exists():
+            return {"error": "Leaflet template not found at /app/templates/web/leaflet_template.html"}
+
+        template = template_path.read_text(encoding="utf-8")
+
+        # Substitute
+        html = template.replace("{{TITLE}}", title)
+        html = html.replace("{{CENTER}}", json.dumps(center))
+        html = html.replace("{{ZOOM}}", str(zoom))
+        html = html.replace("{{LAYERS_JSON}}", json.dumps(layer_data, default=str))
+
+        # Write output
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_path).write_text(html, encoding="utf-8")
+
+        size = Path(output_path).stat().st_size
+        fname = Path(output_path).name
+        return {
+            "success": True,
+            "path": output_path,
+            "download_url": f"http://localhost:8080/api/files/{fname}",
+            "size_bytes": size,
+            "layers_exported": len(layer_data),
+            "title": title,
+        }
+
+    # ── Interactive Flood Map Export ─────────────────────────────
+
+    def _action_export_flood_map(self, params: dict) -> dict:
+        """Export an interactive flood simulation as a Leaflet HTML page.
+
+        Expects ISO_HT (water depth), buildings, and optionally sensitive facilities
+        layers already loaded in the project. Pre-computes building exposure by
+        spatial intersection with flood polygons, then injects into the flood template.
+        """
+        title = params.get("title", "")
+        output_path = params.get("output_path", "")
+        max_features = params.get("max_features", 10000)
+        # Optional field filter — list of field names to include in GeoJSON output.
+        # When set, only these fields are exported (reduces file size).
+        # Extra props (max_water_height, ht_min_exposure, area_ha) are always added.
+        include_fields_param = params.get("include_fields")
+        include_fields = set(include_fields_param) if include_fields_param else None
+
+        project = QgsProject.instance()
+
+        # Study zone name from project variables
+        from qgis.core import QgsExpressionContextUtils
+        scope = QgsExpressionContextUtils.projectScope(project)
+        zone_name = scope.variable("study_zone_name") or "Zone d'étude"
+
+        if not title:
+            title = f"Simulation inondation — {zone_name}"
+        if not output_path:
+            output_path = f"/data/flood_map_{int(time.time())}.html"
+
+        # ── Find layers by keywords ──
+        def find_layers(*keywords):
+            results = []
+            for l in project.mapLayers().values():
+                if not isinstance(l, QgsVectorLayer) or l.featureCount() == 0:
+                    continue
+                name_lower = l.name().lower()
+                if any(k in name_lower for k in keywords):
+                    results.append(l)
+            return results
+
+        # ISO_HT: flood depth polygons with ht_min/ht_max
+        flood_layers = find_layers('hauteur', 'iso_ht', 'depth')
+        # Also try the T10/T100/T1000 flood extent layers (ALEA_SYNT)
+        extent_layers = find_layers('alea', 'inondab', 'centennale', 'frequente', 'extreme', 't100', 't10', 't1000')
+        # Buildings
+        building_layers = find_layers('timent')
+        # Sensitive facilities
+        sensitive_layers = find_layers('sensible', 'enjeux')
+
+        # Determine which layers have ht_min/ht_max fields
+        all_flood = flood_layers + [l for l in extent_layers if l not in flood_layers]
+        iso_ht_layers = []
+        extent_only_layers = []
+        for l in all_flood:
+            field_names = [f.name().lower() for f in l.fields()]
+            if any('ht_min' in fn or 'ht_max' in fn for fn in field_names):
+                iso_ht_layers.append(l)
+            else:
+                extent_only_layers.append(l)
+
+        if not iso_ht_layers and not extent_only_layers:
+            return {
+                "error": "No flood layers found. Load ISO_HT or ALEA_SYNT layers first "
+                         "(e.g. smart_load tri_hauteurs_eau_t100, smart_load tri_inondation_t100)."
+            }
+
+        if not building_layers:
+            return {"error": "No building layers found. Load buildings first (smart_load bdtopo_batiments)."}
+
+        # ── Transform to EPSG:4326 for Leaflet ──
+        crs_4326 = QgsCoordinateReferenceSystem("EPSG:4326")
+
+        # Max realistic water depth — values above this (e.g. 9999) are sentinel "unbounded"
+        HT_MAX_CAP = 5.0
+
+        def to_geojson_features(layer, limit, extra_props_fn=None, fields_filter=None):
+            """Export layer features as GeoJSON dicts in EPSG:4326.
+            fields_filter: optional set of field names to include (None = all)."""
+            tr = QgsCoordinateTransform(layer.crs(), crs_4326, project)
+            features = []
+            for i, feat in enumerate(layer.getFeatures()):
+                if i >= limit:
+                    break
+                geom = feat.geometry()
+                if geom.isEmpty():
+                    continue
+                geom.transform(tr)
+                props = {}
+                for field in layer.fields():
+                    fname = field.name()
+                    if fields_filter and fname not in fields_filter:
+                        continue
+                    val = feat[fname]
+                    if val is not None and str(val) != "NULL":
+                        try:
+                            json.dumps(val)
+                            props[fname] = val
+                        except (TypeError, ValueError):
+                            props[fname] = str(val)
+                if extra_props_fn:
+                    extra_props_fn(feat, props)
+                features.append({
+                    "type": "Feature",
+                    "geometry": json.loads(geom.asJson()),
+                    "properties": props,
+                })
+            return features
+
+        # ── Export flood (ISO_HT) data ──
+        # Merge all ISO_HT layers into one GeoJSON, computing area_ha
+        flood_features = []
+        max_height = 0.0
+
+        from qgis.core import QgsDistanceArea
+        da = QgsDistanceArea()
+        da.setEllipsoid('WGS84')
+
+        for layer in iso_ht_layers:
+            da.setSourceCrs(layer.crs(), project.transformContext())
+            field_names_lower = {f.name().lower(): f.name() for f in layer.fields()}
+
+            # Find ht_min and ht_max field names (case-insensitive)
+            ht_min_field = None
+            ht_max_field = None
+            for fn_lower, fn_actual in field_names_lower.items():
+                if 'ht_min' in fn_lower:
+                    ht_min_field = fn_actual
+                if 'ht_max' in fn_lower:
+                    ht_max_field = fn_actual
+
+            def add_flood_props(feat, props):
+                nonlocal max_height
+                # Compute area in hectares from original geometry (before transform)
+                geom_orig = feat.geometry()
+                if geom_orig and not geom_orig.isEmpty() and geom_orig.type() == 2:
+                    props["area_ha"] = round(da.measureArea(geom_orig) / 10000, 2)
+                else:
+                    props["area_ha"] = 0
+
+                # Normalize ht_min / ht_max
+                ht_min = 0
+                ht_max = 0
+                if ht_min_field:
+                    try:
+                        ht_min = float(feat[ht_min_field] or 0)
+                    except (ValueError, TypeError):
+                        ht_min = 0
+                if ht_max_field:
+                    try:
+                        ht_max = float(feat[ht_max_field] or 0)
+                    except (ValueError, TypeError):
+                        ht_max = 0
+                # Cap sentinel values (Georisques uses 9999 for "> 2m" class)
+                if ht_max > HT_MAX_CAP:
+                    ht_max = HT_MAX_CAP
+                props["ht_min"] = ht_min
+                props["ht_max"] = ht_max
+                if ht_max > max_height:
+                    max_height = ht_max
+
+            flood_features.extend(to_geojson_features(
+                layer, max_features, add_flood_props, fields_filter=include_fields))
+
+        # If no ISO_HT but we have extent layers, create synthetic flood polygons
+        if not flood_features and extent_only_layers:
+            # Assign approximate water heights based on return period
+            for layer in extent_only_layers:
+                name_lower = layer.name().lower()
+                if any(k in name_lower for k in ['t10', 'frequente', '01_01']):
+                    synth_ht_min, synth_ht_max = 0.0, 0.5
+                elif any(k in name_lower for k in ['t1000', 'extreme', '01_04']):
+                    synth_ht_min, synth_ht_max = 1.0, 3.0
+                else:  # T100 / default
+                    synth_ht_min, synth_ht_max = 0.5, 2.0
+
+                da.setSourceCrs(layer.crs(), project.transformContext())
+
+                def add_synth_props(feat, props, _min=synth_ht_min, _max=synth_ht_max):
+                    nonlocal max_height
+                    geom_orig = feat.geometry()
+                    if geom_orig and not geom_orig.isEmpty() and geom_orig.type() == 2:
+                        props["area_ha"] = round(da.measureArea(geom_orig) / 10000, 2)
+                    else:
+                        props["area_ha"] = 0
+                    props["ht_min"] = _min
+                    props["ht_max"] = _max
+                    if _max > max_height:
+                        max_height = _max
+
+                flood_features.extend(to_geojson_features(layer, max_features, add_synth_props))
+
+        flood_geojson = {"type": "FeatureCollection", "features": flood_features}
+
+        # ── Build spatial index of flood polygons for building intersection ──
+        # Use a simple in-memory approach: for each building centroid, find overlapping flood polygons
+        from qgis.core import QgsSpatialIndex, QgsGeometry
+
+        # Create a combined flood layer in project CRS for spatial ops
+        # We'll work with the original layer features (not the reprojected ones)
+        flood_index = QgsSpatialIndex()
+        flood_feat_map = {}  # fid → (ht_min, ht_max, geometry)
+        global_fid = 0
+
+        for layer in (iso_ht_layers or extent_only_layers):
+            field_names_lower = {f.name().lower(): f.name() for f in layer.fields()}
+            ht_min_field = None
+            ht_max_field = None
+            for fn_lower, fn_actual in field_names_lower.items():
+                if 'ht_min' in fn_lower:
+                    ht_min_field = fn_actual
+                if 'ht_max' in fn_lower:
+                    ht_max_field = fn_actual
+
+            # Determine synthetic values for extent-only layers
+            name_lower = layer.name().lower()
+            synth_min, synth_max = 0.5, 2.0
+            if any(k in name_lower for k in ['t10', 'frequente', '01_01']):
+                synth_min, synth_max = 0.0, 0.5
+            elif any(k in name_lower for k in ['t1000', 'extreme', '01_04']):
+                synth_min, synth_max = 1.0, 3.0
+
+            # Transform to building layer CRS for intersection
+            building_crs = building_layers[0].crs()
+            tr_to_bld = QgsCoordinateTransform(layer.crs(), building_crs, project)
+
+            for feat in layer.getFeatures():
+                geom = feat.geometry()
+                if geom.isEmpty():
+                    continue
+                geom_copy = QgsGeometry(geom)
+                geom_copy.transform(tr_to_bld)
+
+                ht_min = synth_min
+                ht_max = synth_max
+                if ht_min_field:
+                    try:
+                        ht_min = float(feat[ht_min_field] or 0)
+                    except (ValueError, TypeError):
+                        pass
+                if ht_max_field:
+                    try:
+                        ht_max = float(feat[ht_max_field] or 0)
+                    except (ValueError, TypeError):
+                        pass
+                # Cap sentinel values
+                if ht_max > HT_MAX_CAP:
+                    ht_max = HT_MAX_CAP
+
+                from qgis.core import QgsFeature
+                idx_feat = QgsFeature(global_fid)
+                idx_feat.setGeometry(geom_copy)
+                flood_index.addFeature(idx_feat)
+                flood_feat_map[global_fid] = (ht_min, ht_max, geom_copy)
+                global_fid += 1
+
+        # ── Export buildings with pre-computed exposure ──
+        building_layer = building_layers[0]
+        building_features = []
+
+        def add_building_exposure(feat, props):
+            """For each building, find the max water height from overlapping flood polygons."""
+            geom = feat.geometry()
+            if geom.isEmpty():
+                return
+            # Query spatial index
+            candidates = flood_index.intersects(geom.boundingBox())
+            max_wh = 0.0
+            min_exposure = 999.0
+            for cand_fid in candidates:
+                if cand_fid not in flood_feat_map:
+                    continue
+                f_ht_min, f_ht_max, f_geom = flood_feat_map[cand_fid]
+                if geom.intersects(f_geom):
+                    if f_ht_max > max_wh:
+                        max_wh = f_ht_max
+                    if f_ht_min < min_exposure:
+                        min_exposure = f_ht_min
+            if max_wh > 0:
+                props["max_water_height"] = round(max_wh, 2)
+                props["ht_min_exposure"] = round(min_exposure, 2)
+
+        building_features = to_geojson_features(
+            building_layer, max_features, add_building_exposure, fields_filter=include_fields)
+        buildings_geojson = {"type": "FeatureCollection", "features": building_features}
+
+        # ── Export sensitive facilities with exposure ──
+        sensitive_features = []
+        if sensitive_layers:
+            sens_layer = sensitive_layers[0]
+            tr_sens_to_bld = QgsCoordinateTransform(sens_layer.crs(), building_crs, project)
+
+            def add_sens_exposure(feat, props):
+                geom = feat.geometry()
+                if geom.isEmpty():
+                    return
+                # Transform to building CRS for flood intersection
+                geom_bld = QgsGeometry(geom)
+                geom_bld.transform(tr_sens_to_bld)
+                candidates = flood_index.intersects(geom_bld.boundingBox())
+                max_wh = 0.0
+                min_exposure = 999.0
+                for cand_fid in candidates:
+                    if cand_fid not in flood_feat_map:
+                        continue
+                    f_ht_min, f_ht_max, f_geom = flood_feat_map[cand_fid]
+                    if geom_bld.intersects(f_geom):
+                        if f_ht_max > max_wh:
+                            max_wh = f_ht_max
+                        if f_ht_min < min_exposure:
+                            min_exposure = f_ht_min
+                if max_wh > 0:
+                    props["max_water_height"] = round(max_wh, 2)
+                    props["ht_min_exposure"] = round(min_exposure, 2)
+
+            sensitive_features = to_geojson_features(
+                sens_layer, 1000, add_sens_exposure, fields_filter=include_fields)
+
+        sensitive_geojson = {"type": "FeatureCollection", "features": sensitive_features}
+
+        # ── Canvas center for map view ──
+        canvas = self.iface.mapCanvas() if self.iface else None
+        center = [0, 0]
+        zoom = 14
+        if canvas:
+            ext = canvas.extent()
+            tr_view = QgsCoordinateTransform(project.crs(), crs_4326, project)
+            ext_4326 = tr_view.transformBoundingBox(ext)
+            center = [
+                (ext_4326.yMinimum() + ext_4326.yMaximum()) / 2,
+                (ext_4326.xMinimum() + ext_4326.xMaximum()) / 2,
+            ]
+
+        # Ensure max_height has a sensible value
+        if max_height <= 0:
+            max_height = 3.0
+
+        # ── Load and fill template ──
+        template_path = Path("/app/templates/web/leaflet_flood_template.html")
+        if not template_path.exists():
+            return {"error": "Flood template not found at /app/templates/web/leaflet_flood_template.html"}
+
+        template = template_path.read_text(encoding="utf-8")
+
+        html = template.replace("{{TITLE}}", title)
+        html = html.replace("{{CENTER}}", json.dumps(center))
+        html = html.replace("{{ZOOM}}", str(zoom))
+        html = html.replace("{{FLOOD_JSON}}", json.dumps(flood_geojson, default=str))
+        html = html.replace("{{BUILDINGS_JSON}}", json.dumps(buildings_geojson, default=str))
+        html = html.replace("{{SENSITIVE_JSON}}", json.dumps(sensitive_geojson, default=str))
+        html = html.replace("{{MAX_HEIGHT}}", str(round(max_height, 1)))
+        html = html.replace("{{ZONE_NAME}}", zone_name)
+
+        # Write output
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_path).write_text(html, encoding="utf-8")
+
+        size = Path(output_path).stat().st_size
+        fname = Path(output_path).name
+
+        # Stats
+        exposed_buildings = sum(
+            1 for f in building_features
+            if f["properties"].get("max_water_height", 0) > 0
+        )
+        exposed_sensitive = sum(
+            1 for f in sensitive_features
+            if f["properties"].get("max_water_height", 0) > 0
+        )
+
+        return {
+            "success": True,
+            "path": output_path,
+            "download_url": f"http://localhost:8080/api/files/{fname}",
+            "size_bytes": size,
+            "title": title,
+            "zone": zone_name,
+            "max_water_height_m": round(max_height, 1),
+            "flood_polygons": len(flood_features),
+            "buildings": len(building_features),
+            "buildings_exposed": exposed_buildings,
+            "buildings_pct": round(exposed_buildings / max(len(building_features), 1) * 100, 1),
+            "sensitive_facilities": len(sensitive_features),
+            "sensitive_exposed": exposed_sensitive,
+        }
+
+    # ── Temporal Map Export ─────────────────────────────────────
+
+    def _action_export_temporal_map(self, params: dict) -> dict:
+        """Export an interactive temporal analysis as a Leaflet HTML page.
+
+        Generic action for any time-series point data with optional spatial bands.
+        Produces a year slider, animated playback, color-coded points by value,
+        and dynamic statistics per time period and spatial band.
+        """
+        title = params.get("title", "")
+        output_path = params.get("output_path", "")
+        max_features = params.get("max_features", 15000)
+
+        # Layer identification keywords (generic — not DVF-specific)
+        point_kw = params.get("point_layer_keyword", "dvf")
+        band_kw = params.get("band_layer_keyword", "bande")
+        extra_kws = params.get("extra_polygon_keywords", ["submersion"])
+
+        # Field configuration
+        temporal_field = params.get("temporal_field", "year")
+        value_field = params.get("value_field", "price_m2")
+        band_field = params.get("band_field", "coastal_band")
+
+        include_fields_param = params.get("include_fields")
+        include_fields = set(include_fields_param) if include_fields_param else None
+
+        project = QgsProject.instance()
+
+        # Study zone name
+        from qgis.core import QgsExpressionContextUtils
+        scope = QgsExpressionContextUtils.projectScope(project)
+        zone_name = scope.variable("study_zone_name") or "Zone d'étude"
+
+        if not title:
+            title = f"Pression foncière — {zone_name}"
+        if not output_path:
+            output_path = f"/data/temporal_map_{int(time.time())}.html"
+
+        # ── Find layers ──
+        def find_layers(*keywords):
+            results = []
+            for l in project.mapLayers().values():
+                if not isinstance(l, QgsVectorLayer) or l.featureCount() == 0:
+                    continue
+                name_lower = l.name().lower()
+                if any(k in name_lower for k in keywords):
+                    results.append(l)
+            return results
+
+        point_layers = find_layers(point_kw)
+        band_layers = find_layers(band_kw)
+        extra_layers = find_layers(*extra_kws) if extra_kws else []
+
+        if not point_layers:
+            return {"error": f"No point layer found (keyword: '{point_kw}'). Load data first."}
+
+        # ── Transform to EPSG:4326 ──
+        crs_4326 = QgsCoordinateReferenceSystem("EPSG:4326")
+
+        def to_geojson_features(layer, limit, extra_props_fn=None, fields_filter=None):
+            tr = QgsCoordinateTransform(layer.crs(), crs_4326, project)
+            features = []
+            for i, feat in enumerate(layer.getFeatures()):
+                if i >= limit:
+                    break
+                geom = feat.geometry()
+                if geom.isEmpty():
+                    continue
+                geom.transform(tr)
+                props = {}
+                for field in layer.fields():
+                    fname = field.name()
+                    if fields_filter and fname not in fields_filter:
+                        continue
+                    val = feat[fname]
+                    if val is not None and str(val) != "NULL":
+                        try:
+                            json.dumps(val)
+                            props[fname] = val
+                        except (TypeError, ValueError):
+                            props[fname] = str(val)
+                if extra_props_fn:
+                    extra_props_fn(feat, props)
+                features.append({
+                    "type": "Feature",
+                    "geometry": json.loads(geom.asJson()),
+                    "properties": props,
+                })
+            return features
+
+        # ── Export point data ──
+        # Always include temporal, value, and band fields
+        always_fields = {temporal_field, value_field, band_field,
+                         "type_local", "date_mutation", "price", "surface"}
+        export_fields = (include_fields | always_fields) if include_fields else None
+
+        point_features = []
+        for layer in point_layers:
+            point_features.extend(to_geojson_features(layer, max_features, fields_filter=export_fields))
+
+        transactions_geojson = {"type": "FeatureCollection", "features": point_features}
+
+        # ── Export bands ──
+        band_features = []
+        for layer in band_layers:
+            band_features.extend(to_geojson_features(layer, 500))
+        bands_geojson = {"type": "FeatureCollection", "features": band_features}
+
+        # ── Export extra polygons (submersion, etc.) ──
+        extra_features = []
+        for layer in extra_layers:
+            extra_features.extend(to_geojson_features(layer, 2000))
+        extra_geojson = {"type": "FeatureCollection", "features": extra_features}
+
+        # ── Compute statistics per year × band ──
+        from collections import defaultdict
+        year_band_values = defaultdict(lambda: defaultdict(list))
+        all_years = set()
+
+        for f in point_features:
+            p = f.get("properties", {})
+            year = p.get(temporal_field)
+            val = p.get(value_field)
+            band = p.get(band_field, "Hors bande")
+            if year is not None and val is not None:
+                try:
+                    year = int(year)
+                    val = float(val)
+                    all_years.add(year)
+                    year_band_values[year][band].append(val)
+                except (ValueError, TypeError):
+                    pass
+
+        years_list = sorted(all_years) or [2024]
+
+        stats = {}
+        for year in years_list:
+            year_stats = {}
+            for band, values in year_band_values[year].items():
+                values_sorted = sorted(values)
+                n = len(values_sorted)
+                year_stats[band] = {
+                    "count": n,
+                    "median_m2": round(values_sorted[n // 2], 0) if n else 0,
+                    "mean_m2": round(sum(values) / n, 0) if n else 0,
+                    "min_m2": round(min(values), 0) if n else 0,
+                    "max_m2": round(max(values), 0) if n else 0,
+                }
+            stats[str(year)] = year_stats
+
+        # ── Canvas center ──
+        canvas = self.iface.mapCanvas() if self.iface else None
+        center = [0, 0]
+        zoom_level = 13
+        if canvas:
+            ext = canvas.extent()
+            tr_view = QgsCoordinateTransform(project.crs(), crs_4326, project)
+            ext_4326 = tr_view.transformBoundingBox(ext)
+            center = [
+                (ext_4326.yMinimum() + ext_4326.yMaximum()) / 2,
+                (ext_4326.xMinimum() + ext_4326.xMaximum()) / 2,
+            ]
+
+        # ── Load and fill template ──
+        template_path = Path("/app/templates/web/leaflet_temporal_template.html")
+        if not template_path.exists():
+            return {"error": "Temporal template not found at /app/templates/web/leaflet_temporal_template.html"}
+
+        template = template_path.read_text(encoding="utf-8")
+
+        html = template.replace("{{TITLE}}", title)
+        html = html.replace("{{CENTER}}", json.dumps(center))
+        html = html.replace("{{ZOOM}}", str(zoom_level))
+        html = html.replace("{{TRANSACTIONS_JSON}}", json.dumps(transactions_geojson, default=str))
+        html = html.replace("{{BANDS_JSON}}", json.dumps(bands_geojson, default=str))
+        html = html.replace("{{SUBMERSION_JSON}}", json.dumps(extra_geojson, default=str))
+        html = html.replace("{{YEARS_JSON}}", json.dumps(years_list))
+        html = html.replace("{{STATS_JSON}}", json.dumps(stats, default=str))
+        html = html.replace("{{ZONE_NAME}}", zone_name)
+
+        # Write output
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_path).write_text(html, encoding="utf-8")
+
+        size = Path(output_path).stat().st_size
+        fname = Path(output_path).name
+
+        return {
+            "success": True,
+            "path": output_path,
+            "download_url": f"http://localhost:8080/api/files/{fname}",
+            "size": size,
+            "title": title,
+            "zone": zone_name,
+            "years": years_list,
+            "total_points": len(point_features),
+            "bands": len(band_features),
+            "extra_polygons": len(extra_features),
+            "stats_summary": stats,
+        }
+
     # ── File Management ──────────────────────────────────────────
 
     @staticmethod
@@ -1153,6 +2153,222 @@ class QGISBridge:
         return {
             "success": True, "path": output_path, "name": name, "size": size,
             "download_url": f"http://localhost:8080/api/files/{name}",
+        }
+
+    # ── QField Export ────────────────────────────────────────────
+
+    def _action_export_qfield(self, params: dict) -> dict:
+        """Export current project as a QField-ready ZIP package.
+
+        Creates a portable package containing:
+        - .qgz project with relative GPKG sources
+        - All vector layers materialized as individual GPKGs
+        - Optional editable Observations layer with form widgets
+        """
+        import zipfile
+        import shutil
+        import re as _re
+
+        project = QgsProject.instance()
+        project_name = params.get("project_name", project.baseName() or "qfield_project")
+        # Sanitize project name
+        project_name = _re.sub(r'[^\w\-]', '_', project_name).strip('_') or "qfield_project"
+        include_obs = params.get("include_observations_layer", True)
+        max_feat = params.get("max_features_per_layer", 50000)
+
+        ts = int(time.time())
+        pkg_dir = f"/data/qfield_{project_name}_{ts}"
+        data_dir = os.path.join(pkg_dir, "data")
+        os.makedirs(data_dir, exist_ok=True)
+
+        # ── 1. Materialize each vector layer → GPKG ──────────────
+        exported_layers = {}  # layer_id → {original_name, gpkg_name, features}
+        used_names = set()
+
+        for layer in project.mapLayers().values():
+            if not isinstance(layer, QgsVectorLayer):
+                continue
+            if layer.featureCount() == 0:
+                continue
+
+            # Generate unique GPKG filename
+            base = _re.sub(r'[^\w\-]', '_', layer.name()).strip('_').lower() or "layer"
+            gpkg_name = base + ".gpkg"
+            counter = 1
+            while gpkg_name in used_names:
+                gpkg_name = f"{base}_{counter}.gpkg"
+                counter += 1
+            used_names.add(gpkg_name)
+            gpkg_path = os.path.join(data_dir, gpkg_name)
+
+            options = QgsVectorFileWriter.SaveVectorOptions()
+            options.driverName = "GPKG"
+            options.fileEncoding = "UTF-8"
+            error = QgsVectorFileWriter.writeAsVectorFormatV3(
+                layer, gpkg_path, project.transformContext(), options
+            )
+            if error[0] == QgsVectorFileWriter.WriterError.NoError:
+                exported_layers[layer.id()] = {
+                    "original_name": layer.name(),
+                    "gpkg_name": gpkg_name,
+                    "features": layer.featureCount(),
+                }
+
+        if not exported_layers:
+            shutil.rmtree(pkg_dir, ignore_errors=True)
+            return {"error": "No vector layers with features to export"}
+
+        # ── 2. Create editable Observations layer ─────────────────
+        obs_layer = None
+        if include_obs:
+            obs_path = os.path.join(data_dir, "observations.gpkg")
+            obs_fields = QgsFields()
+            obs_fields.append(QgsField("id", QVariant.Int))
+            obs_fields.append(QgsField("titre", QVariant.String, len=200))
+            obs_fields.append(QgsField("description", QVariant.String, len=2000))
+            obs_fields.append(QgsField("categorie", QVariant.String, len=50))
+            obs_fields.append(QgsField("date_observation", QVariant.String, len=20))
+            obs_fields.append(QgsField("photo", QVariant.String, len=500))
+            obs_fields.append(QgsField("priorite", QVariant.String, len=20))
+
+            # Determine CRS — use project CRS or fallback EPSG:4326
+            crs = project.crs() if project.crs().isValid() else QgsCoordinateReferenceSystem("EPSG:4326")
+
+            writer = QgsVectorFileWriter(
+                obs_path, "UTF-8", obs_fields,
+                QgsWkbTypes.Point, crs, "GPKG"
+            )
+            if writer.hasError() != QgsVectorFileWriter.WriterError.NoError:
+                include_obs = False
+            else:
+                del writer  # Flush & close
+
+                # Load the layer back to configure widgets
+                obs_layer = QgsVectorLayer(obs_path, "Observations", "ogr")
+                if obs_layer.isValid():
+                    # titre — TextEdit
+                    idx = obs_layer.fields().indexOf("titre")
+                    if idx >= 0:
+                        obs_layer.setEditorWidgetSetup(idx, QgsEditorWidgetSetup("TextEdit", {}))
+
+                    # description — TextEdit multiline
+                    idx = obs_layer.fields().indexOf("description")
+                    if idx >= 0:
+                        obs_layer.setEditorWidgetSetup(idx, QgsEditorWidgetSetup("TextEdit", {"IsMultiline": True}))
+
+                    # categorie — ValueMap dropdown
+                    idx = obs_layer.fields().indexOf("categorie")
+                    if idx >= 0:
+                        obs_layer.setEditorWidgetSetup(idx, QgsEditorWidgetSetup("ValueMap", {
+                            "map": [
+                                {"Anomalie": "anomalie"},
+                                {"Point d'interet": "poi"},
+                                {"Mesure terrain": "mesure"},
+                                {"Risque identifie": "risque"},
+                                {"Autre": "autre"},
+                            ]
+                        }))
+
+                    # date_observation — DateTime
+                    idx = obs_layer.fields().indexOf("date_observation")
+                    if idx >= 0:
+                        obs_layer.setEditorWidgetSetup(idx, QgsEditorWidgetSetup("DateTime", {
+                            "display_format": "yyyy-MM-dd HH:mm",
+                            "field_format": "yyyy-MM-dd HH:mm:ss",
+                            "calendar_popup": True,
+                        }))
+
+                    # photo — ExternalResource (camera/gallery in QField)
+                    idx = obs_layer.fields().indexOf("photo")
+                    if idx >= 0:
+                        obs_layer.setEditorWidgetSetup(idx, QgsEditorWidgetSetup("ExternalResource", {
+                            "DocumentViewer": 1,
+                            "RelativeStorage": 1,
+                            "StorageMode": 0,
+                            "FileWidget": True,
+                            "FileWidgetFilter": "Images (*.jpg *.jpeg *.png)",
+                        }))
+
+                    # priorite — ValueMap dropdown
+                    idx = obs_layer.fields().indexOf("priorite")
+                    if idx >= 0:
+                        obs_layer.setEditorWidgetSetup(idx, QgsEditorWidgetSetup("ValueMap", {
+                            "map": [
+                                {"Haute": "haute"},
+                                {"Moyenne": "moyenne"},
+                                {"Basse": "basse"},
+                            ]
+                        }))
+
+                else:
+                    include_obs = False
+                    obs_layer = None
+
+        # ── 3. Write .qgz with rewritten sources ─────────────────
+        # Save original sources for restoration
+        original_sources = {}
+        for lid, info in exported_layers.items():
+            layer = project.mapLayer(lid)
+            if layer:
+                original_sources[lid] = (layer.source(), layer.providerType())
+
+        # Rewrite sources to relative GPKG paths
+        for lid, info in exported_layers.items():
+            layer = project.mapLayer(lid)
+            if layer:
+                layer.setDataSource(
+                    f"./data/{info['gpkg_name']}",
+                    layer.name(), "ogr"
+                )
+
+        # Add observations layer to project temporarily
+        obs_added = False
+        if include_obs and obs_layer and obs_layer.isValid():
+            obs_layer.setDataSource("./data/observations.gpkg", "Observations", "ogr")
+            project.addMapLayer(obs_layer, True)
+            obs_added = True
+
+        # Write the portable project
+        qgz_path = os.path.join(pkg_dir, f"{project_name}.qgz")
+        project.write(qgz_path)
+
+        # Restore original sources
+        for lid, (src, prov) in original_sources.items():
+            layer = project.mapLayer(lid)
+            if layer:
+                layer.setDataSource(src, layer.name(), prov)
+
+        # Remove temporary observations layer
+        if obs_added and obs_layer:
+            project.removeMapLayer(obs_layer.id())
+
+        # ── 4. Create ZIP archive ─────────────────────────────────
+        zip_name = f"{project_name}_qfield.zip"
+        zip_path = f"/data/{zip_name}"
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for root, _dirs, files in os.walk(pkg_dir):
+                for f in files:
+                    full = os.path.join(root, f)
+                    arcname = os.path.relpath(full, pkg_dir)
+                    zf.write(full, arcname)
+
+        # Cleanup temp directory
+        shutil.rmtree(pkg_dir, ignore_errors=True)
+
+        zip_size = os.path.getsize(zip_path)
+        total_features = sum(info["features"] for info in exported_layers.values())
+
+        return {
+            "success": True,
+            "path": zip_path,
+            "download_url": f"http://localhost:8080/api/files/{zip_name}",
+            "size_bytes": zip_size,
+            "size_mb": round(zip_size / 1024 / 1024, 1),
+            "project_name": project_name,
+            "layers_exported": len(exported_layers),
+            "total_features": total_features,
+            "has_observations_layer": include_obs,
+            "layers": {lid: info["original_name"] for lid, info in exported_layers.items()},
         }
 
     # ── Data Source Catalog ──────────────────────────────────────

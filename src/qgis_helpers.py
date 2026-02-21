@@ -826,6 +826,8 @@ def download_wfs_ogr(url, typename, bbox_4326=None, output_path=None,
     cmd = [
         "ogr2ogr", "-f", "GPKG", dl_path,
         f"WFS:{url}", typename,
+        "-nln", typename_short,  # strip namespace prefix (e.g. ms:LAYER → LAYER)
+        "-forceNullable",  # allow NULL gml_id (Georisques WFS omits it)
         "-spat", str(bbox_4326[0]), str(bbox_4326[1]),
                 str(bbox_4326[2]), str(bbox_4326[3]),
         "-spat_srs", "EPSG:4326",
@@ -884,4 +886,146 @@ def download_wfs_ogr(url, typename, bbox_4326=None, output_path=None,
     result["path"] = output_path
     result["cached"] = False
     result["download_size_mb"] = round(os.path.getsize(output_path) / 1048576, 2)
+    return result
+
+
+# ── Overpass API (OpenStreetMap data) ─────────────────────────
+
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_TIMEOUT = 60
+
+
+def overpass_query(tags, bbox_4326=None, name=None):
+    """Query OpenStreetMap data via the Overpass API.
+
+    Args:
+        tags: dict like {"amenity": "school"} or string like "amenity=school"
+              or raw Overpass QL if it starts with '[' or 'node' or 'way'
+        bbox_4326: [xmin, ymin, xmax, ymax] in EPSG:4326. Auto from study zone if omitted.
+        name: Display name for the resulting layer (auto-generated if omitted)
+
+    Returns:
+        dict with layer_id, name, feature_count, etc. or {"error": ...}
+
+    Example:
+        helpers.overpass_query({"amenity": "school"})
+        helpers.overpass_query({"shop": "supermarket"}, name="Supermarchés")
+        helpers.overpass_query("highway=cycleway", name="Pistes cyclables")
+    """
+    # Parse tags
+    if isinstance(tags, str):
+        if tags.startswith("[") or tags.startswith("node") or tags.startswith("way"):
+            # Raw Overpass QL — use as-is
+            raw_query = tags
+        else:
+            # Simple key=value format
+            parts = tags.split("=", 1)
+            if len(parts) == 2:
+                tags = {parts[0].strip(): parts[1].strip()}
+            else:
+                return {"error": f"Cannot parse tags: {tags}. Use dict or 'key=value' format."}
+
+    # Get bbox
+    if bbox_4326 is None:
+        zone = get_study_zone()
+        if zone.get("bbox_4326"):
+            bbox_4326 = zone["bbox_4326"]
+        else:
+            # Fallback: canvas extent
+            bbox_4326 = bbox_from_canvas()
+            if not bbox_4326:
+                return {"error": "No bbox provided and no study zone set. Call set_study_zone first or provide bbox_4326."}
+
+    # Build Overpass QL
+    if isinstance(tags, dict):
+        # Build from dict
+        tag_filters = "".join(f'["{k}"="{v}"]' for k, v in tags.items())
+        bbox_str = f"{bbox_4326[1]},{bbox_4326[0]},{bbox_4326[3]},{bbox_4326[2]}"
+        raw_query = f"""[out:json][timeout:{OVERPASS_TIMEOUT}];
+(
+  node{tag_filters}({bbox_str});
+  way{tag_filters}({bbox_str});
+  relation{tag_filters}({bbox_str});
+);
+out body;
+>;
+out skel qt;"""
+        if not name:
+            name = " + ".join(f"{k}={v}" for k, v in tags.items())
+
+    if not name:
+        name = "OSM Query"
+
+    # Execute query
+    try:
+        data = urllib.parse.urlencode({"data": raw_query}).encode()
+        req = urllib.request.Request(OVERPASS_URL, data=data, method="POST")
+        req.add_header("User-Agent", "BigQgisMCP/1.0")
+        resp = urllib.request.urlopen(req, timeout=OVERPASS_TIMEOUT + 10)
+        result_json = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        return {"error": f"Overpass API error: {e.code} {e.reason}"}
+    except Exception as e:
+        return {"error": f"Overpass query failed: {e}"}
+
+    elements = result_json.get("elements", [])
+    if not elements:
+        return {"error": "No results from Overpass API for this query and area.",
+                "query_preview": raw_query[:200]}
+
+    # Convert to GeoJSON
+    nodes = {e["id"]: e for e in elements if e["type"] == "node"}
+    features = []
+
+    for el in elements:
+        props = el.get("tags", {})
+        props["osm_id"] = el["id"]
+        props["osm_type"] = el["type"]
+
+        if el["type"] == "node" and "lat" in el:
+            features.append({
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [el["lon"], el["lat"]]},
+                "properties": props,
+            })
+        elif el["type"] == "way" and "nodes" in el:
+            coords = []
+            for nid in el["nodes"]:
+                n = nodes.get(nid)
+                if n and "lat" in n:
+                    coords.append([n["lon"], n["lat"]])
+            if len(coords) >= 2:
+                # Closed way = polygon
+                if coords[0] == coords[-1] and len(coords) >= 4:
+                    geom = {"type": "Polygon", "coordinates": [coords]}
+                else:
+                    geom = {"type": "LineString", "coordinates": coords}
+                features.append({
+                    "type": "Feature",
+                    "geometry": geom,
+                    "properties": props,
+                })
+
+    if not features:
+        return {"error": "Overpass returned elements but none could be converted to GeoJSON.",
+                "element_count": len(elements)}
+
+    # Write GeoJSON to temp file
+    geojson = {"type": "FeatureCollection", "features": features}
+    cache_dir = Path("/data/cache")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = name.replace(" ", "_").replace("/", "_")[:50]
+    output_path = str(cache_dir / f"osm_{safe_name}_{int(time.time())}.geojson")
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(geojson, f)
+
+    # Load as QGIS layer
+    layer = QgsVectorLayer(output_path, name, "ogr")
+    if not layer.isValid():
+        return {"error": f"Failed to load GeoJSON: {output_path}"}
+
+    result = _finalize_layer(layer)
+    result["path"] = output_path
+    result["osm_elements"] = len(elements)
+    result["features_converted"] = len(features)
     return result

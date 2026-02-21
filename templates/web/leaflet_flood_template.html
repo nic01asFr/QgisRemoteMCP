@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>{{TITLE}}</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/nouislider@15/dist/nouislider.min.css">
+<script src="https://cdn.jsdelivr.net/npm/nouislider@15/dist/nouislider.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 0; font-family: 'Segoe UI', Arial, sans-serif; }
+  #map { position: absolute; top: 0; bottom: 0; left: 0; right: 0; }
+
+  .map-title {
+    position: absolute; top: 10px; left: 60px; z-index: 1000;
+    background: rgba(255,255,255,0.95); padding: 10px 18px;
+    border-radius: 6px; font-size: 17px; font-weight: 700;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.15); color: #1a1a2e;
+    max-width: 500px;
+  }
+  .map-title small {
+    display: block; font-size: 11px; font-weight: 400;
+    color: #666; margin-top: 2px;
+  }
+
+  /* Slider panel */
+  .slider-panel {
+    position: absolute; bottom: 30px; left: 60px; right: 60px; z-index: 1000;
+    background: rgba(255,255,255,0.96); padding: 16px 24px 24px;
+    border-radius: 8px; box-shadow: 0 2px 12px rgba(0,0,0,0.18);
+    max-width: 700px;
+  }
+  .slider-header {
+    display: flex; align-items: center; gap: 12px; margin-bottom: 12px;
+  }
+  .slider-header h3 {
+    margin: 0; font-size: 14px; color: #1a1a2e; flex: 1;
+  }
+  .slider-value {
+    font-size: 22px; font-weight: 700; color: #0055a4;
+    min-width: 65px; text-align: right;
+  }
+  .play-btn {
+    background: #0055a4; color: white; border: none;
+    border-radius: 50%; width: 34px; height: 34px;
+    cursor: pointer; font-size: 14px; display: flex;
+    align-items: center; justify-content: center;
+    transition: background 0.2s;
+  }
+  .play-btn:hover { background: #003d7a; }
+  .play-btn.playing { background: #c0392b; }
+  #water-slider { margin: 0 8px; }
+  .noUi-connect { background: #0077be; }
+  .noUi-tooltip {
+    font-size: 11px; padding: 2px 6px;
+    background: #0055a4; color: white; border: none;
+  }
+  .noUi-pips { font-size: 10px; color: #666; }
+  .noUi-value { margin-top: 2px; }
+
+  /* Stats panel */
+  .stats-panel {
+    background: rgba(255,255,255,0.96); padding: 12px 16px;
+    border-radius: 6px; box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+    font-size: 12px; min-width: 200px;
+  }
+  .stats-panel h4 {
+    margin: 0 0 8px 0; font-size: 13px; color: #1a1a2e;
+    border-bottom: 2px solid #0077be; padding-bottom: 4px;
+  }
+  .stat-row {
+    display: flex; justify-content: space-between;
+    padding: 3px 0; border-bottom: 1px solid #eee;
+  }
+  .stat-row:last-child { border-bottom: none; }
+  .stat-label { color: #555; }
+  .stat-value { font-weight: 600; color: #1a1a2e; }
+  .stat-value.danger { color: #c0392b; }
+  .stat-value.warning { color: #e67e22; }
+
+  /* Legend */
+  .legend-panel {
+    background: rgba(255,255,255,0.96); padding: 10px 14px;
+    border-radius: 6px; box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+    font-size: 11px; line-height: 1.8;
+  }
+  .legend-panel h4 {
+    margin: 0 0 6px 0; font-size: 12px; color: #1a1a2e;
+  }
+  .legend-row { display: flex; align-items: center; gap: 6px; }
+  .legend-swatch {
+    width: 16px; height: 12px; border-radius: 2px;
+    border: 1px solid rgba(0,0,0,0.15); flex-shrink: 0;
+  }
+  .legend-circle {
+    width: 10px; height: 10px; border-radius: 50%;
+    border: 1px solid rgba(0,0,0,0.2); flex-shrink: 0;
+  }
+
+  .info-footer {
+    position: absolute; bottom: 5px; right: 10px; z-index: 900;
+    background: rgba(255,255,255,0.7); padding: 2px 8px;
+    border-radius: 3px; font-size: 9px; color: #888;
+  }
+</style>
+</head>
+<body>
+
+<div class="map-title">
+  {{TITLE}}
+  <small>Directive Inondation — Données Georisques TRI | Simulation de montée des eaux</small>
+</div>
+<div id="map"></div>
+<div class="info-footer">BigQgisMCP | Georisques, IGN, OpenStreetMap</div>
+
+<!-- Slider panel -->
+<div class="slider-panel" id="slider-panel">
+  <div class="slider-header">
+    <button class="play-btn" id="play-btn" title="Animation">&#9654;</button>
+    <h3>Hauteur d'eau simulée</h3>
+    <div class="slider-value" id="slider-value">0.0 m</div>
+  </div>
+  <div id="water-slider"></div>
+</div>
+
+<script>
+(function() {
+  // ── Data ──
+  var center = {{CENTER}};
+  var zoom = {{ZOOM}};
+  var floodData = {{FLOOD_JSON}};
+  var buildingsData = {{BUILDINGS_JSON}};
+  var sensitiveData = {{SENSITIVE_JSON}};
+  var maxHeight = {{MAX_HEIGHT}};
+  var zoneName = "{{ZONE_NAME}}";
+
+  // ── Map ──
+  var map = L.map('map', { zoomControl: true }).setView(center, zoom);
+
+  L.tileLayer('https://cartodb-basemaps-a.global.ssl.fastly.net/light_all/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap contributors &copy; CARTO'
+  }).addTo(map);
+
+  // ── Panes for z-ordering ──
+  map.createPane('flood'); map.getPane('flood').style.zIndex = 400;
+  map.createPane('buildings'); map.getPane('buildings').style.zIndex = 450;
+  map.createPane('sensitive'); map.getPane('sensitive').style.zIndex = 460;
+
+  // ── Color functions ──
+  function floodColor(htMax) {
+    return htMax > 2.0 ? 'rgba(10,30,120,0.55)' :
+           htMax > 1.0 ? 'rgba(30,70,180,0.45)' :
+           htMax > 0.5 ? 'rgba(60,120,210,0.35)' :
+                         'rgba(100,170,240,0.25)';
+  }
+
+  function buildingColor(depth) {
+    if (depth <= 0) return '#cccccc';
+    if (depth < 0.5) return '#ffffb2';
+    if (depth < 1.0) return '#fecc5c';
+    if (depth < 1.5) return '#fd8d3c';
+    if (depth < 2.0) return '#f03b20';
+    return '#bd0026';
+  }
+
+  // ── Flood layer (all hidden initially) ──
+  var floodLayer = null;
+  if (floodData && floodData.features && floodData.features.length > 0) {
+    floodLayer = L.geoJSON(floodData, {
+      pane: 'flood',
+      interactive: false,
+      style: function() {
+        return { fillColor: '#0077be', fillOpacity: 0, stroke: false, weight: 0 };
+      }
+    }).addTo(map);
+  }
+
+  // ── Buildings layer ──
+  var buildingsLayer = null;
+  var bounds = L.latLngBounds();
+  if (buildingsData && buildingsData.features && buildingsData.features.length > 0) {
+    buildingsLayer = L.geoJSON(buildingsData, {
+      pane: 'buildings',
+      style: function() {
+        return { fillColor: '#cccccc', fillOpacity: 0.6, weight: 0.5, color: '#999', opacity: 0.8 };
+      },
+      onEachFeature: function(feature, layer) {
+        var p = feature.properties;
+        var mwh = p.max_water_height || 0;
+        var popup = '<b>' + (p.usage_1 || p.nature || 'Bâtiment') + '</b>';
+        if (mwh > 0) {
+          popup += '<br>Hauteur max submersion: <b style="color:#c0392b">' + mwh.toFixed(1) + ' m</b>';
+        } else {
+          popup += '<br><span style="color:#27ae60">Hors zone inondable</span>';
+        }
+        layer.bindPopup(popup, { maxWidth: 250 });
+      }
+    }).addTo(map);
+    try {
+      var bb = buildingsLayer.getBounds();
+      if (bb.isValid()) bounds.extend(bb);
+    } catch(e) {}
+  }
+
+  // ── Sensitive facilities ──
+  var sensitiveLayer = null;
+  if (sensitiveData && sensitiveData.features && sensitiveData.features.length > 0) {
+    sensitiveLayer = L.geoJSON(sensitiveData, {
+      pane: 'sensitive',
+      pointToLayer: function(feature, latlng) {
+        return L.circleMarker(latlng, {
+          radius: 7, fillColor: '#ff8c00', color: '#b35900',
+          weight: 2, fillOpacity: 0.9
+        });
+      },
+      onEachFeature: function(feature, layer) {
+        var p = feature.properties;
+        layer.bindPopup(
+          '<b>&#9888; ' + (p.nom_si_ext || 'Établissement sensible') + '</b>' +
+          '<br>Catégorie: ' + (p.categorie || '?'),
+          { maxWidth: 250 }
+        );
+      }
+    }).addTo(map);
+  }
+
+  // Fit bounds
+  if (floodLayer) {
+    try {
+      var fb = floodLayer.getBounds();
+      if (fb.isValid()) bounds.extend(fb);
+    } catch(e) {}
+  }
+  if (bounds.isValid()) {
+    map.fitBounds(bounds, { padding: [40, 40] });
+  }
+
+  // ── Stats control ──
+  var statsCtrl = L.control({ position: 'topright' });
+  statsCtrl.onAdd = function() {
+    var div = L.DomUtil.create('div', 'stats-panel');
+    div.id = 'stats-div';
+    L.DomEvent.disableClickPropagation(div);
+    return div;
+  };
+  statsCtrl.addTo(map);
+
+  // ── Legend control ──
+  var legendCtrl = L.control({ position: 'bottomright' });
+  legendCtrl.onAdd = function() {
+    var div = L.DomUtil.create('div', 'legend-panel');
+    div.innerHTML =
+      '<h4>Légende</h4>' +
+      '<div class="legend-row"><span class="legend-swatch" style="background:rgba(100,170,240,0.5)"></span> Inondation &lt; 0.5m</div>' +
+      '<div class="legend-row"><span class="legend-swatch" style="background:rgba(60,120,210,0.6)"></span> Inondation 0.5 - 1m</div>' +
+      '<div class="legend-row"><span class="legend-swatch" style="background:rgba(30,70,180,0.7)"></span> Inondation 1 - 2m</div>' +
+      '<div class="legend-row"><span class="legend-swatch" style="background:rgba(10,30,120,0.8)"></span> Inondation &gt; 2m</div>' +
+      '<hr style="margin:4px 0;border-color:#ddd">' +
+      '<div class="legend-row"><span class="legend-swatch" style="background:#cccccc"></span> Bâtiment hors zone</div>' +
+      '<div class="legend-row"><span class="legend-swatch" style="background:#ffffb2"></span> Exposé &lt; 0.5m</div>' +
+      '<div class="legend-row"><span class="legend-swatch" style="background:#fecc5c"></span> Exposé 0.5 - 1m</div>' +
+      '<div class="legend-row"><span class="legend-swatch" style="background:#fd8d3c"></span> Exposé 1 - 1.5m</div>' +
+      '<div class="legend-row"><span class="legend-swatch" style="background:#f03b20"></span> Exposé 1.5 - 2m</div>' +
+      '<div class="legend-row"><span class="legend-swatch" style="background:#bd0026"></span> Exposé &gt; 2m</div>' +
+      (sensitiveData && sensitiveData.features.length > 0 ?
+        '<hr style="margin:4px 0;border-color:#ddd"><div class="legend-row"><span class="legend-circle" style="background:#ff8c00"></span> Ét. sensible (école, hôpital)</div>' : '');
+    L.DomEvent.disableClickPropagation(div);
+    return div;
+  };
+  legendCtrl.addTo(map);
+
+  // ── Update functions ──
+  function updateAll(waterHeight) {
+    // Update flood zones
+    var floodedArea = 0;
+    if (floodLayer) {
+      floodLayer.eachLayer(function(layer) {
+        var p = layer.feature.properties;
+        if (p.ht_min !== undefined && parseFloat(p.ht_min) < waterHeight) {
+          var htMax = parseFloat(p.ht_max) || 0;
+          layer.setStyle({
+            fillColor: floodColor(htMax),
+            fillOpacity: Math.min(0.15 + waterHeight * 0.15, 0.6),
+            stroke: true, weight: 0.5,
+            color: 'rgba(20,50,150,0.4)'
+          });
+          floodedArea += (p.area_ha || 0);
+        } else {
+          layer.setStyle({ fillOpacity: 0, stroke: false });
+        }
+      });
+    }
+
+    // Update buildings
+    var exposedCount = 0;
+    var totalBuildings = 0;
+    var sensExposed = 0;
+    if (buildingsLayer) {
+      buildingsLayer.eachLayer(function(layer) {
+        totalBuildings++;
+        var mwh = layer.feature.properties.max_water_height || 0;
+        if (mwh > 0 && waterHeight > 0 && waterHeight >= parseFloat(layer.feature.properties.ht_min_exposure || 0)) {
+          var effectiveDepth = Math.min(waterHeight, mwh);
+          layer.setStyle({
+            fillColor: buildingColor(effectiveDepth),
+            fillOpacity: 0.85,
+            weight: 1, color: '#333', opacity: 0.9
+          });
+          exposedCount++;
+        } else {
+          layer.setStyle({
+            fillColor: '#cccccc', fillOpacity: 0.6,
+            weight: 0.5, color: '#999', opacity: 0.8
+          });
+        }
+      });
+    }
+
+    // Count sensitive facilities exposed
+    if (sensitiveLayer) {
+      sensitiveLayer.eachLayer(function(layer) {
+        var mwh = layer.feature.properties.max_water_height || 0;
+        if (mwh > 0 && waterHeight >= (layer.feature.properties.ht_min_exposure || 0)) {
+          sensExposed++;
+          layer.setStyle({ fillColor: '#ff0000', color: '#8b0000', radius: 9, fillOpacity: 1 });
+        } else {
+          layer.setStyle({ fillColor: '#ff8c00', color: '#b35900', radius: 7, fillOpacity: 0.9 });
+        }
+      });
+    }
+
+    // Update stats
+    var pct = totalBuildings > 0 ? (exposedCount / totalBuildings * 100).toFixed(1) : '0.0';
+    var statsDiv = document.getElementById('stats-div');
+    var dangerClass = exposedCount > 0 ? (pct > 10 ? 'danger' : 'warning') : '';
+    statsDiv.innerHTML =
+      '<h4>&#128202; Statistiques — ' + zoneName + '</h4>' +
+      '<div class="stat-row"><span class="stat-label">Hauteur d\'eau</span><span class="stat-value" style="color:#0055a4">' + waterHeight.toFixed(1) + ' m</span></div>' +
+      '<div class="stat-row"><span class="stat-label">Surface inondée</span><span class="stat-value">' + floodedArea.toFixed(1) + ' ha</span></div>' +
+      '<div class="stat-row"><span class="stat-label">Bâtiments exposés</span><span class="stat-value ' + dangerClass + '">' + exposedCount + ' / ' + totalBuildings + ' (' + pct + '%)</span></div>' +
+      (sensExposed > 0 ? '<div class="stat-row"><span class="stat-label">Ét. sensibles exposés</span><span class="stat-value danger">' + sensExposed + '</span></div>' : '') +
+      '<div style="font-size:10px;color:#999;margin-top:6px">Source: Georisques — Directive Inondation TRI</div>';
+
+    // Slider value display
+    document.getElementById('slider-value').textContent = waterHeight.toFixed(1) + ' m';
+    document.getElementById('slider-value').style.color =
+      waterHeight > 2 ? '#bd0026' : waterHeight > 1 ? '#f03b20' : waterHeight > 0.5 ? '#e67e22' : '#0055a4';
+  }
+
+  // ── noUiSlider ──
+  var sliderEl = document.getElementById('water-slider');
+  var sliderMax = Math.max(maxHeight, 2.0);
+  // Round up to nearest 0.5
+  sliderMax = Math.ceil(sliderMax * 2) / 2;
+
+  var pipValues = [];
+  for (var v = 0; v <= sliderMax; v += 0.5) pipValues.push(Math.round(v * 10) / 10);
+
+  noUiSlider.create(sliderEl, {
+    start: [0],
+    step: 0.1,
+    range: { min: 0, max: sliderMax },
+    tooltips: false,
+    pips: {
+      mode: 'values',
+      values: pipValues,
+      density: 20,
+      format: { to: function(v) { return v.toFixed(1) + 'm'; } }
+    }
+  });
+
+  L.DomEvent.disableClickPropagation(document.getElementById('slider-panel'));
+  L.DomEvent.disableScrollPropagation(document.getElementById('slider-panel'));
+
+  sliderEl.noUiSlider.on('update', function(values) {
+    var wh = parseFloat(values[0]);
+    updateAll(wh);
+  });
+
+  // ── Animation ──
+  var animId = null;
+  var lastStep = 0;
+  var STEP_MS = 250;
+  var STEP_SIZE = 0.1;
+  var playBtn = document.getElementById('play-btn');
+
+  function animStep(ts) {
+    if (ts - lastStep >= STEP_MS) {
+      lastStep = ts;
+      var cur = parseFloat(sliderEl.noUiSlider.get());
+      var next = Math.round((cur + STEP_SIZE) * 10) / 10;
+      if (next > sliderMax) {
+        stopAnim();
+        return;
+      }
+      sliderEl.noUiSlider.set(next);
+    }
+    animId = requestAnimationFrame(animStep);
+  }
+
+  function startAnim() {
+    if (animId) return;
+    // Reset to 0 if at max
+    var cur = parseFloat(sliderEl.noUiSlider.get());
+    if (cur >= sliderMax) sliderEl.noUiSlider.set(0);
+    lastStep = performance.now();
+    animId = requestAnimationFrame(animStep);
+    playBtn.innerHTML = '&#9646;&#9646;';
+    playBtn.classList.add('playing');
+  }
+
+  function stopAnim() {
+    if (animId) { cancelAnimationFrame(animId); animId = null; }
+    playBtn.innerHTML = '&#9654;';
+    playBtn.classList.remove('playing');
+  }
+
+  playBtn.addEventListener('click', function() {
+    animId ? stopAnim() : startAnim();
+  });
+
+  // Initial state
+  updateAll(0);
+
+})();
+</script>
+</body>
+</html>

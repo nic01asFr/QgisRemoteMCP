@@ -1,0 +1,105 @@
+{
+  "id": "pression_fonciere_cotiere",
+  "name": "Pression foncière côtière (analyse temporelle DVF)",
+  "description": "Analyse de la pression foncière sur le littoral : évolution des prix immobiliers (DVF 2020-2024) par bandes de proximité côtière (0-500m, 500m-1km, 1-2km, 2-5km), croisement avec le risque de submersion marine. Produit une carte PDF A3 et une carte web interactive avec curseur annuel et animation.",
+  "tags": ["foncier", "DVF", "littoral", "pression foncière", "temporel", "immobilier", "côtier"],
+  "parameters": {
+    "zone": {
+      "type": "string",
+      "required": true,
+      "description": "Commune côtière (ex: 'Sète', 'Palavas-les-Flots', 'La Grande-Motte', 'Carnon')"
+    }
+  },
+  "steps": [
+    {
+      "id": "zone",
+      "tool": "set_study_zone",
+      "params": {"target": "$zone"},
+      "description": "Définir la zone d'étude"
+    },
+    {
+      "id": "basemap",
+      "tool": "smart_load",
+      "params": {"id": "cartodb_positron"},
+      "description": "Fond de carte clair"
+    },
+    {
+      "id": "buildings",
+      "tool": "smart_load",
+      "params": {"id": "bdtopo_batiments"},
+      "description": "Bâtiments BD TOPO"
+    },
+    {
+      "id": "submersion",
+      "tool": "smart_load",
+      "params": {"id": "tri_submersion_marine_t100"},
+      "description": "Submersion marine centennale (proxy côte + risque climatique). Peut être vide si la commune n'est pas dans un TRI côtier."
+    },
+    {
+      "id": "hydro",
+      "tool": "smart_load",
+      "params": {"id": "bdtopo_hydro_surfaces"},
+      "description": "Surfaces hydrographiques (mer, étangs) — fallback pour définir le littoral"
+    },
+    {
+      "id": "dvf_load",
+      "tool": "execute_python",
+      "description": "Charger les transactions DVF (2020-2024) depuis data.gouv.fr pour la commune",
+      "code": "import csv, io, urllib.request\nfrom qgis.core import (QgsVectorLayer, QgsFeature, QgsPointXY, QgsGeometry,\n                        QgsField, QgsExpressionContextUtils)\nfrom qgis.PyQt.QtCore import QVariant\n\nscope = QgsExpressionContextUtils.projectScope(project)\nzone_name = scope.variable('study_zone_name')\ncommune_info = helpers.search_commune(zone_name)\nif 'error' in commune_info:\n    result['error'] = f'Commune introuvable : {zone_name}'\nelse:\n    code = commune_info['code']\n    dept = code[:2] if len(code) == 5 else code[:3]\n    dvf_layer = QgsVectorLayer('Point?crs=EPSG:4326', 'DVF Transactions', 'memory')\n    pr = dvf_layer.dataProvider()\n    pr.addAttributes([\n        QgsField('year', QVariant.Int),\n        QgsField('price', QVariant.Double),\n        QgsField('surface', QVariant.Double),\n        QgsField('price_m2', QVariant.Double),\n        QgsField('type_local', QVariant.String),\n        QgsField('date_mutation', QVariant.String),\n        QgsField('nature_mutation', QVariant.String),\n    ])\n    dvf_layer.updateFields()\n    features = []\n    yearly = {}\n    for year in range(2020, 2025):\n        url = f'https://files.data.gouv.fr/geo-dvf/latest/csv/{year}/communes/{dept}/{code}.csv'\n        try:\n            resp = urllib.request.urlopen(url, timeout=30)\n            text = resp.read().decode('utf-8')\n            reader = csv.DictReader(io.StringIO(text))\n            count = 0\n            for r in reader:\n                lat = r.get('latitude', '')\n                lon = r.get('longitude', '')\n                price = r.get('valeur_fonciere', '')\n                surface = r.get('surface_reelle_bati', '') or r.get('surface_terrain', '')\n                if not (lat and lon and price and surface):\n                    continue\n                try:\n                    lat_f, lon_f = float(lat), float(lon)\n                    price_f = float(price)\n                    surface_f = float(surface)\n                except (ValueError, TypeError):\n                    continue\n                if surface_f <= 0 or price_f <= 0:\n                    continue\n                pm2 = price_f / surface_f\n                if pm2 < 100 or pm2 > 50000:\n                    continue\n                feat = QgsFeature()\n                feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon_f, lat_f)))\n                feat.setAttributes([year, price_f, surface_f, round(pm2, 0),\n                                   r.get('type_local', ''), r.get('date_mutation', ''),\n                                   r.get('nature_mutation', '')])\n                features.append(feat)\n                count += 1\n            yearly[year] = count\n        except Exception as e:\n            yearly[year] = f'Erreur: {e}'\n    pr.addFeatures(features)\n    dvf_layer.updateExtents()\n    project.addMapLayer(dvf_layer)\n    result['total_transactions'] = len(features)\n    result['yearly_counts'] = yearly\n    result['commune_code'] = code\n    result['success'] = True"
+    },
+    {
+      "id": "bands",
+      "tool": "execute_python",
+      "description": "Créer les bandes de proximité côtière (0-500m, 500m-1km, 1-2km, 2-5km)",
+      "code": "import processing, json\nfrom qgis.core import (QgsVectorLayer, QgsFeature, QgsField, QgsGeometry,\n                        QgsCoordinateTransform, QgsCoordinateReferenceSystem,\n                        QgsExpressionContextUtils, QgsRectangle)\nfrom qgis.PyQt.QtCore import QVariant\n\ndef find(keyword):\n    return [l for l in project.mapLayers().values()\n            if isinstance(l, QgsVectorLayer) and keyword in l.name().lower() and l.featureCount() > 0]\n\ncrs_2154 = QgsCoordinateReferenceSystem('EPSG:2154')\ncoast_geom = None\n\n# 1. Try submersion marine as coast proxy\nsub = find('submersion') or find('alea_synt_03')\nif sub:\n    dissolved = processing.run('native:dissolve', {'INPUT': sub[0], 'OUTPUT': 'memory:'})['OUTPUT']\n    tr = QgsCoordinateTransform(dissolved.crs(), crs_2154, project)\n    for feat in dissolved.getFeatures():\n        g = QgsGeometry(feat.geometry())\n        g.transform(tr)\n        coast_geom = g if coast_geom is None else coast_geom.combine(g)\n\n# 2. Fallback: hydro surfaces with Mer/Ocean\nif not coast_geom:\n    hydro = find('surface') or find('hydro')\n    if hydro:\n        for feat in hydro[0].getFeatures():\n            nature = str(feat.attribute('nature') or '').lower()\n            if any(kw in nature for kw in ['mer', 'ocean', 'littoral', 'etang']):\n                tr = QgsCoordinateTransform(hydro[0].crs(), crs_2154, project)\n                g = QgsGeometry(feat.geometry())\n                g.transform(tr)\n                coast_geom = g if coast_geom is None else coast_geom.combine(g)\n\nif not coast_geom:\n    result['error'] = 'Aucun proxy littoral trouve. Verifier submersion marine ou surfaces hydro.'\nelse:\n    # Study zone bbox for clipping\n    scope = QgsExpressionContextUtils.projectScope(project)\n    bbox_str = scope.variable('study_zone_bbox_2154')\n    if bbox_str:\n        coords = json.loads(bbox_str)\n        clip_rect = QgsGeometry.fromRect(QgsRectangle(coords[0], coords[1], coords[2], coords[3]))\n        # Extend clip rect by 5km to allow full bands\n        clip_rect = clip_rect.buffer(5000, 15)\n    else:\n        clip_rect = coast_geom.buffer(6000, 15)\n\n    bands_layer = QgsVectorLayer('Polygon?crs=EPSG:2154', 'Bandes cotieres', 'memory')\n    pr = bands_layer.dataProvider()\n    pr.addAttributes([\n        QgsField('band_label', QVariant.String),\n        QgsField('band_min_m', QVariant.Int),\n        QgsField('band_max_m', QVariant.Int),\n        QgsField('band_id', QVariant.Int),\n    ])\n    bands_layer.updateFields()\n\n    band_defs = [(0, 500, '0 - 500m', 1), (500, 1000, '500m - 1km', 2),\n                 (1000, 2000, '1 - 2km', 3), (2000, 5000, '2 - 5km', 4)]\n    for min_m, max_m, label, bid in band_defs:\n        outer = coast_geom.buffer(max_m, 25)\n        if min_m > 0:\n            inner = coast_geom.buffer(min_m, 25)\n            ring = outer.difference(inner)\n        else:\n            ring = outer\n        clipped = ring.intersection(clip_rect)\n        if not clipped.isEmpty():\n            feat = QgsFeature()\n            feat.setGeometry(clipped)\n            feat.setAttributes([label, min_m, max_m, bid])\n            pr.addFeature(feat)\n\n    bands_layer.updateExtents()\n    project.addMapLayer(bands_layer)\n    result['bands_created'] = bands_layer.featureCount()\n    result['success'] = True"
+    },
+    {
+      "id": "assign",
+      "tool": "execute_python",
+      "description": "Assigner chaque transaction DVF à une bande côtière et calculer les statistiques",
+      "code": "from qgis.core import (QgsVectorLayer, QgsCoordinateTransform, QgsSpatialIndex,\n                        QgsGeometry, QgsField)\nfrom qgis.PyQt.QtCore import QVariant\n\ndef find(keyword):\n    return [l for l in project.mapLayers().values()\n            if isinstance(l, QgsVectorLayer) and keyword in l.name().lower() and l.featureCount() > 0]\n\ndvf = find('dvf')\nbands = find('bande')\n\nif not dvf:\n    result['error'] = 'Couche DVF non trouvee'\nelif not bands:\n    result['warning'] = 'Pas de bandes cotieres. Assignation ignoree.'\n    result['success'] = True\nelse:\n    dvf_layer = dvf[0]\n    bands_layer = bands[0]\n\n    dvf_layer.startEditing()\n    if dvf_layer.fields().indexOf('coastal_band') < 0:\n        dvf_layer.addAttribute(QgsField('coastal_band', QVariant.String))\n    if dvf_layer.fields().indexOf('band_id') < 0:\n        dvf_layer.addAttribute(QgsField('band_id', QVariant.Int))\n    dvf_layer.updateFields()\n\n    band_idx = QgsSpatialIndex(bands_layer.getFeatures())\n    band_features = {f.id(): f for f in bands_layer.getFeatures()}\n    tr = QgsCoordinateTransform(dvf_layer.crs(), bands_layer.crs(), project)\n\n    cb_idx = dvf_layer.fields().indexOf('coastal_band')\n    bi_idx = dvf_layer.fields().indexOf('band_id')\n\n    stats = {}\n    for feat in dvf_layer.getFeatures():\n        geom = QgsGeometry(feat.geometry())\n        geom.transform(tr)\n        year = feat['year']\n        pm2 = feat['price_m2']\n        assigned_band = 'Hors bande'\n        assigned_id = 0\n        candidates = band_idx.intersects(geom.boundingBox())\n        for cid in candidates:\n            if cid in band_features and geom.within(band_features[cid].geometry()):\n                assigned_band = band_features[cid]['band_label']\n                assigned_id = band_features[cid]['band_id']\n                break\n        dvf_layer.changeAttributeValue(feat.id(), cb_idx, assigned_band)\n        dvf_layer.changeAttributeValue(feat.id(), bi_idx, assigned_id)\n        if year not in stats:\n            stats[year] = {}\n        if assigned_band not in stats[year]:\n            stats[year][assigned_band] = []\n        stats[year][assigned_band].append(pm2)\n\n    dvf_layer.commitChanges()\n\n    summary = {}\n    for year, bands_data in sorted(stats.items()):\n        ys = {}\n        for band, prices in bands_data.items():\n            ps = sorted(prices)\n            n = len(ps)\n            ys[band] = {\n                'count': n,\n                'median_m2': round(ps[n // 2], 0) if n else 0,\n                'mean_m2': round(sum(prices) / n, 0) if n else 0\n            }\n        summary[str(year)] = ys\n    result['stats_by_year_band'] = summary\n    result['success'] = True"
+    },
+    {
+      "id": "style",
+      "tool": "execute_python",
+      "description": "Styliser les couches : DVF par prix/m², bandes côtières, submersion, bâtiments",
+      "code": "from qgis.core import (QgsGraduatedSymbolRenderer, QgsRendererRange,\n                        QgsFillSymbol, QgsMarkerSymbol, QgsSingleSymbolRenderer,\n                        QgsVectorLayer, QgsCoordinateTransform,\n                        QgsCategorizedSymbolRenderer, QgsRendererCategory)\n\ndef find(keyword):\n    return [l for l in project.mapLayers().values()\n            if isinstance(l, QgsVectorLayer) and keyword in l.name().lower()]\n\n# DVF points — graduated by price_m2 (green→yellow→red)\ndvf = find('dvf')\nif dvf:\n    layer = dvf[0]\n    idx = layer.fields().indexOf('price_m2')\n    max_val = layer.maximumValue(idx) or 10000\n    ranges_def = [\n        (0, 1500, '102,187,106,200', '< 1500'),\n        (1500, 2500, '200,230,80,200', '1500-2500'),\n        (2500, 3500, '253,216,53,200', '2500-3500'),\n        (3500, 5000, '251,140,0,200', '3500-5000'),\n        (5000, 8000, '229,57,53,200', '5000-8000'),\n        (8000, max(int(max_val) + 1, 8001), '183,28,28,200', '> 8000'),\n    ]\n    renderer_ranges = []\n    for low, high, color, label in ranges_def:\n        sym = QgsMarkerSymbol.createSimple({\n            'name': 'circle', 'color': color,\n            'outline_color': '50,50,50,150', 'size': '2.8'\n        })\n        renderer_ranges.append(QgsRendererRange(low, high, sym, label + ' EUR/m2'))\n    renderer = QgsGraduatedSymbolRenderer('price_m2', renderer_ranges)\n    layer.setRenderer(renderer)\n    layer.triggerRepaint()\n\n# Coastal bands — categorized (blue gradient, dashed outlines)\nbands = find('bande')\nif bands:\n    cats = []\n    band_styles = {\n        '0 - 500m': ('0,70,150,45', '0,50,120'),\n        '500m - 1km': ('20,100,180,35', '20,80,150'),\n        '1 - 2km': ('50,140,210,25', '40,110,180'),\n        '2 - 5km': ('90,170,230,18', '70,140,200'),\n    }\n    for label, (fill, outline) in band_styles.items():\n        sym = QgsFillSymbol.createSimple({\n            'color': fill, 'outline_color': outline, 'outline_width': '0.4',\n            'outline_style': 'dash'\n        })\n        cats.append(QgsRendererCategory(label, sym, label))\n    renderer = QgsCategorizedSymbolRenderer('band_label', cats)\n    bands[0].setRenderer(renderer)\n    bands[0].triggerRepaint()\n\n# Submersion marine — light red\nsub = find('submersion') or find('alea_synt_03')\nif sub:\n    sym = QgsFillSymbol.createSimple({\n        'color': '255,100,100,35', 'outline_color': '200,50,50,80', 'outline_width': '0.3'\n    })\n    sub[0].setRenderer(QgsSingleSymbolRenderer(sym))\n    sub[0].triggerRepaint()\n\n# Buildings — light gray\nfor l in project.mapLayers().values():\n    if isinstance(l, QgsVectorLayer) and 'timent' in l.name() and 'dvf' not in l.name().lower():\n        sym = QgsFillSymbol.createSimple({\n            'color': '200,200,200,80', 'outline_color': '160,160,160,50', 'outline_width': '0.1'\n        })\n        l.setRenderer(QgsSingleSymbolRenderer(sym))\n        l.triggerRepaint()\n\n# Zoom to DVF extent\nif dvf:\n    canvas = iface.mapCanvas()\n    tr = QgsCoordinateTransform(dvf[0].crs(), project.crs(), project)\n    canvas.setExtent(tr.transformBoundingBox(dvf[0].extent()))\n    canvas.zoomByFactor(1.2)\n    canvas.refresh()\n\nresult['success'] = True"
+    },
+    {
+      "id": "layout",
+      "tool": "apply_layout_template",
+      "params": {
+        "template": "a3_landscape",
+        "variables": {"title": "Pression foncière côtière — $zone", "subtitle": "DVF 2020-2024 | Proximité littorale et submersion marine (Georisques)"}
+      },
+      "description": "Mise en page A3"
+    },
+    {
+      "id": "export",
+      "tool": "export_pdf",
+      "params": {"layout": "Export A3 Landscape"},
+      "description": "Export PDF"
+    },
+    {
+      "id": "temporal_web",
+      "tool": "export_temporal_map",
+      "params": {
+        "point_layer_keyword": "dvf",
+        "band_layer_keyword": "bande",
+        "extra_polygon_keywords": ["submersion"],
+        "temporal_field": "year",
+        "value_field": "price_m2",
+        "band_field": "coastal_band",
+        "include_fields": ["year", "price", "surface", "price_m2", "type_local", "date_mutation", "coastal_band"]
+      },
+      "description": "Export carte web interactive avec curseur annuel (2020-2024) et animation"
+    }
+  ],
+  "outputs": [
+    "PDF carte de pression foncière côtière A3",
+    "Carte web interactive avec curseur annuel (2020-2024) et animation",
+    "Couche 'DVF Transactions' avec prix/m² et année",
+    "Couche 'Bandes côtières' (0-500m, 500m-1km, 1-2km, 2-5km)",
+    "Statistiques : prix/m² médian par bande côtière et par année"
+  ]
+}

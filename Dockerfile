@@ -124,6 +124,8 @@ COPY datasources.json /app/
 COPY setup_qgis_connections.py /app/
 COPY src/ /app/src/
 COPY skills/ /app/skills/
+COPY templates/ /app/templates/
+COPY recipes/ /app/recipes/
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY entrypoint.sh /app/
 

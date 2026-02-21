@@ -22,6 +22,7 @@ ready-made functions for common GIS operations.
 | `helpers.bbox_from_canvas()` | Get canvas extent in EPSG:4326 |
 | `helpers.zoom_to(extent_or_address)` | Zoom (bbox, point dict, or address) |
 | `helpers.load_catalog_source(id, bbox)` | Load from datasources.json by ID |
+| `helpers.overpass_query(tags, bbox)` | Query OpenStreetMap via Overpass API |
 
 ## Common Patterns
 
@@ -102,6 +103,40 @@ for lon, lat in points:
 result["profile"] = profile
 ```
 
+### Query OpenStreetMap (Overpass API)
+```python
+# By tag dict (amenity=school within study zone)
+schools = helpers.overpass_query({"amenity": "school"})
+result["schools"] = schools
+
+# By string key=value
+supermarkets = helpers.overpass_query("shop=supermarket", name="Supermarchés")
+result["supermarkets"] = supermarkets
+
+# Multiple tags
+pharmacies = helpers.overpass_query({"amenity": "pharmacy"})
+
+# With explicit bbox (default: uses study zone)
+cycleways = helpers.overpass_query(
+    {"highway": "cycleway"},
+    bbox_4326=[3.8, 43.5, 4.0, 43.7],
+    name="Pistes cyclables"
+)
+
+# Common OSM tags:
+# amenity: school, hospital, pharmacy, restaurant, cafe, parking
+# shop: supermarket, bakery, convenience
+# highway: cycleway, footway, primary, secondary
+# building: yes, residential, commercial
+# leisure: park, playground, sports_centre
+# tourism: hotel, museum, viewpoint
+```
+
+Returns: `{"layer_id", "name", "feature_count", "osm_elements", "path"}`
+
+Overpass downloads data from OpenStreetMap. Auto-uses the study zone bbox
+if not provided. Data is saved as GeoJSON in `/data/cache/`.
+
 ## Error Handling
 
 All helpers return `{"error": "..."}` on failure instead of raising exceptions.
@@ -116,7 +151,7 @@ else:
 ```
 
 Network requests timeout after 15 seconds. The BAN API and Geo API are
-generally reliable for French addresses.
+generally reliable for French addresses. Overpass API has a 60s timeout.
 
 ## Notes
 
@@ -124,4 +159,5 @@ generally reliable for French addresses.
 - WFS helpers auto-derive bbox from canvas if not provided
 - `zoom_to()` accepts a bbox list, a point dict, or an address string
 - `create_point_layer()` auto-detects field types from the first point
+- `overpass_query()` auto-uses the study zone bbox if not provided
 - Helpers are available only in `execute_python`, not in other tools

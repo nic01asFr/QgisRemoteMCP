@@ -311,6 +311,33 @@ result["exposed_buildings"] = exposed["OUTPUT"].featureCount()
 project.addMapLayer(exposed["OUTPUT"])
 ```
 
+## Recipes (Pre-Built Workflows)
+
+Instead of building workflows from scratch, use recipes for common analyses:
+
+```
+list_recipes()
+→ densite_bati, urbanisme_general, risque_inondation, occupation_sol
+
+get_recipe(id="densite_bati", zone="Montpellier")
+→ Step-by-step instructions using set_study_zone, smart_load, run_processing, etc.
+```
+
+Recipes handle the full pipeline: data loading → analysis → styling → layout → PDF export.
+See `skill://recipes` for details.
+
+## OpenStreetMap Data (Overpass)
+
+For data not in BD TOPO (shops, schools, cycleways, etc.), use the Overpass helper:
+
+```python
+# In execute_python:
+schools = helpers.overpass_query({"amenity": "school"})
+cycleways = helpers.overpass_query("highway=cycleway", name="Pistes cyclables")
+```
+
+Auto-uses the study zone bbox. See `skill://helpers` for full docs.
+
 ## Common Pitfalls
 
 1. **Forgot set_study_zone**: smart_load returns "No study zone set" error. Always define the zone first.

@@ -1,0 +1,91 @@
+{
+  "id": "urbanisme_general",
+  "name": "Analyse urbaine générale",
+  "description": "Vue d'ensemble urbaine : bâtiments, routes, espaces verts, hydrographie. Style par catégorie avec mise en page cartographique.",
+  "tags": ["urbanisme", "vue d'ensemble", "bâtiments", "routes"],
+  "parameters": {
+    "zone": {
+      "type": "string",
+      "required": true,
+      "description": "Commune ou adresse"
+    }
+  },
+  "steps": [
+    {
+      "id": "zone",
+      "tool": "set_study_zone",
+      "params": {"target": "$zone"},
+      "description": "Définir la zone d'étude"
+    },
+    {
+      "id": "basemap",
+      "tool": "smart_load",
+      "params": {"id": "cartodb_positron"},
+      "description": "Fond de carte clair"
+    },
+    {
+      "id": "buildings",
+      "tool": "smart_load",
+      "params": {"id": "bdtopo_batiments"},
+      "description": "Bâtiments (BD TOPO)"
+    },
+    {
+      "id": "roads",
+      "tool": "smart_load",
+      "params": {"id": "bdtopo_routes"},
+      "description": "Routes (BD TOPO)"
+    },
+    {
+      "id": "vegetation",
+      "tool": "smart_load",
+      "params": {"id": "bdtopo_vegetation"},
+      "description": "Végétation (BD TOPO)"
+    },
+    {
+      "id": "hydro",
+      "tool": "smart_load",
+      "params": {"id": "bdtopo_hydrographie"},
+      "description": "Cours d'eau (BD TOPO)"
+    },
+    {
+      "id": "style_buildings",
+      "tool": "execute_python",
+      "description": "Styliser les bâtiments (gris foncé, contour fin)",
+      "code": "from qgis.core import QgsFillSymbol, QgsSingleSymbolRenderer\nbat = [l for l in project.mapLayers().values() if 'atiment' in l.name()]\nif bat:\n    sym = QgsFillSymbol.createSimple({'color': '180,180,180,200', 'outline_color': '100,100,100', 'outline_width': '0.2'})\n    bat[0].setRenderer(QgsSingleSymbolRenderer(sym))\n    bat[0].triggerRepaint()\n    result['styled'] = 'buildings'\nresult['success'] = True"
+    },
+    {
+      "id": "style_roads",
+      "tool": "execute_python",
+      "description": "Styliser les routes (gris, largeur variable)",
+      "code": "from qgis.core import QgsLineSymbol, QgsSingleSymbolRenderer\nroutes = [l for l in project.mapLayers().values() if 'oute' in l.name() or 'Route' in l.name()]\nif routes:\n    sym = QgsLineSymbol.createSimple({'color': '80,80,80', 'width': '0.4'})\n    routes[0].setRenderer(QgsSingleSymbolRenderer(sym))\n    routes[0].triggerRepaint()\n    result['styled'] = 'roads'\nresult['success'] = True"
+    },
+    {
+      "id": "style_vegetation",
+      "tool": "execute_python",
+      "description": "Styliser la végétation (vert semi-transparent)",
+      "code": "from qgis.core import QgsFillSymbol, QgsSingleSymbolRenderer\nveg = [l for l in project.mapLayers().values() if 'égétation' in l.name() or 'egetation' in l.name()]\nif veg:\n    sym = QgsFillSymbol.createSimple({'color': '100,180,80,140', 'outline_color': '60,120,40', 'outline_width': '0.2'})\n    veg[0].setRenderer(QgsSingleSymbolRenderer(sym))\n    veg[0].triggerRepaint()\n    result['styled'] = 'vegetation'\nresult['success'] = True"
+    },
+    {
+      "id": "style_hydro",
+      "tool": "execute_python",
+      "description": "Styliser les cours d'eau (bleu)",
+      "code": "from qgis.core import QgsLineSymbol, QgsSingleSymbolRenderer\nhydro = [l for l in project.mapLayers().values() if 'eau' in l.name() or 'hydro' in l.name().lower()]\nif hydro:\n    sym = QgsLineSymbol.createSimple({'color': '65,105,225', 'width': '0.8'})\n    hydro[0].setRenderer(QgsSingleSymbolRenderer(sym))\n    hydro[0].triggerRepaint()\n    result['styled'] = 'hydro'\nresult['success'] = True"
+    },
+    {
+      "id": "layout",
+      "tool": "apply_layout_template",
+      "params": {
+        "template": "a3_landscape",
+        "variables": {"title": "Analyse urbaine — $zone", "subtitle": "Bâtiments, voirie, végétation, hydrographie — BD TOPO IGN"}
+      },
+      "description": "Mise en page A3"
+    },
+    {
+      "id": "export",
+      "tool": "export_pdf",
+      "params": {"layout": "Export A3 Landscape"},
+      "description": "Export PDF"
+    }
+  ],
+  "outputs": ["PDF A3 avec vue urbaine complète", "Couches stylisées : bâtiments, routes, végétation, hydrographie"]
+}

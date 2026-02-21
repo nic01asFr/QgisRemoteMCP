@@ -479,6 +479,121 @@ TOOLS = [
             "required": ["layer_id"]
         }
     },
+    # ── Layout templates ──────────────────────────────────────────
+    {
+        "name": "list_layout_templates",
+        "description": "List available print layout templates (A3 landscape, A4 portrait, etc.).",
+        "inputSchema": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+        "name": "apply_layout_template",
+        "description": "Apply a pre-configured print layout template (.qpt) with dynamic labels. Variables like title, subtitle are set as project variables and resolved via QGIS expressions [% @title %]. Use export_pdf after this to generate the PDF.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "template": {"type": "string", "description": "Template ID: 'a3_landscape' or 'a4_portrait'"},
+                "variables": {"type": "object", "description": "Variables to set: {title, subtitle, ...}. 'study_zone_name' is auto-set by set_study_zone.", "default": {}},
+                "name": {"type": "string", "description": "Layout name override", "default": ""}
+            },
+            "required": ["template"]
+        }
+    },
+    # ── Web map export ────────────────────────────────────────────
+    {
+        "name": "export_web_map",
+        "description": "Export visible vector layers as an interactive Leaflet HTML page. GeoJSON inline, popup attributes, legend with toggle. Returns a download URL.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Map title (default: project title)", "default": ""},
+                "max_features": {"type": "integer", "description": "Max features per layer (default 5000)", "default": 5000},
+                "output_path": {"type": "string", "description": "Output path (default: /data/webmap_<timestamp>.html)", "default": ""}
+            },
+            "required": []
+        }
+    },
+    # ── Interactive flood map ─────────────────────────────────────
+    {
+        "name": "export_flood_map",
+        "description": "Export an interactive flood simulation as a standalone Leaflet HTML page. Requires ISO_HT (water depth) and building layers loaded. Pre-computes building exposure by spatial intersection. The HTML includes a water height slider with play/pause animation, dynamic statistics, and graduated color legends. Best used after running the risque_inondation recipe.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Map title (default: 'Simulation inondation — <zone>')", "default": ""},
+                "max_features": {"type": "integer", "description": "Max features per layer (default 10000)", "default": 10000},
+                "output_path": {"type": "string", "description": "Output path (default: /data/flood_map_<timestamp>.html)", "default": ""},
+                "include_fields": {"type": "array", "items": {"type": "string"}, "description": "Field names to include in GeoJSON (reduces file size). Omit to include all fields.", "default": []}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "export_temporal_map",
+        "description": "Export an interactive temporal analysis as a standalone Leaflet HTML page. Shows point data (e.g. property transactions) with a year slider, color-coded by value, with optional spatial bands (e.g. coastal proximity) and animated playback. Pre-computes per-year statistics. Best used after running a temporal recipe (e.g. pression_fonciere_cotiere).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Map title", "default": ""},
+                "max_features": {"type": "integer", "description": "Max point features to export", "default": 15000},
+                "output_path": {"type": "string", "description": "Output file path (auto-generated if empty)", "default": ""},
+                "point_layer_keyword": {"type": "string", "description": "Keyword to find point layer", "default": "dvf"},
+                "band_layer_keyword": {"type": "string", "description": "Keyword to find band polygons", "default": "bande"},
+                "extra_polygon_keywords": {"type": "array", "items": {"type": "string"}, "description": "Keywords for extra polygon layers", "default": ["submersion"]},
+                "temporal_field": {"type": "string", "description": "Field name for time dimension", "default": "year"},
+                "value_field": {"type": "string", "description": "Field name for the value to color-code", "default": "price_m2"},
+                "band_field": {"type": "string", "description": "Field name for spatial band assignment", "default": "coastal_band"},
+                "include_fields": {"type": "array", "items": {"type": "string"}, "description": "Field names to include in GeoJSON output", "default": []}
+            },
+            "required": []
+        }
+    },
+    # ── QField Export ──────────────────────────────────────────────
+    {
+        "name": "export_qfield",
+        "description": "Export the current QGIS project as a QField-ready package (ZIP). Contains .qgz with relative GPKG sources + all vector layers materialized as individual GPKGs. Optionally includes an editable Observations layer with QField-compatible form widgets (dropdowns, date picker, camera/photo) for field data collection.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_name": {"type": "string", "description": "Name for the exported project (default: current project name)"},
+                "include_observations_layer": {"type": "boolean", "description": "Add an editable Observations layer for field data collection (default: true)", "default": True},
+                "max_features_per_layer": {"type": "integer", "description": "Max features per exported layer (default: 50000)", "default": 50000}
+            },
+            "required": []
+        }
+    },
+    # ── Recipes ───────────────────────────────────────────────────
+    {
+        "name": "list_recipes",
+        "description": "List available workflow recipes. Recipes are step-by-step guides for common GIS analyses (building density, urban analysis, flood risk, land cover). Execute them by calling get_recipe then following each step.",
+        "inputSchema": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+        "name": "get_recipe",
+        "description": "Get a specific recipe with parameters resolved. Returns ordered steps to execute using existing tools (set_study_zone, smart_load, run_processing, etc.). Follow each step sequentially.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Recipe ID (e.g. 'densite_bati')"},
+                "zone": {"type": "string", "description": "Study area (commune name or address)", "default": ""},
+                "grid_size": {"type": "number", "description": "Grid cell size in meters (for density recipes)", "default": 500}
+            },
+            "required": ["id"]
+        }
+    },
+    {
+        "name": "run_recipe",
+        "description": "Execute a complete recipe automatically in one shot. Runs all steps sequentially (zone setup → data loading → analysis → styling → layout → export). Much faster than executing steps manually. Use list_recipes to see available recipes. Returns per-step results and a final screenshot.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Recipe ID (e.g. 'risque_inondation', 'densite_bati')"},
+                "zone": {"type": "string", "description": "Study area (commune name or address, e.g. 'Béziers', 'Montpellier')"},
+                "grid_size": {"type": "number", "description": "Grid cell size in meters (for density recipes)", "default": 500},
+                "new_project": {"type": "boolean", "description": "Start a fresh project before running (default true)", "default": True}
+            },
+            "required": ["id", "zone"]
+        }
+    },
 ]
 
 
@@ -495,6 +610,7 @@ RESOURCES = [
     {"uri": "skill://data-sources", "name": "Data Sources", "description": "French national datasets reference.", "mimeType": "text/plain"},
     {"uri": "skill://helpers", "name": "Python Helpers", "description": "Ready-made Python functions for execute_python (geocode, add_wfs, zoom_to, etc.).", "mimeType": "text/plain"},
     {"uri": "skill://smart-loading", "name": "Smart Loading Pipeline", "description": "Guided data loading: set_study_zone + smart_load (ogr2ogr + GeoPackage). CRS handling, caching, best practices.", "mimeType": "text/plain"},
+    {"uri": "skill://recipes", "name": "Recipes Guide", "description": "Workflow recipes: reproducible step-by-step GIS analyses. Use list_recipes + get_recipe.", "mimeType": "text/plain"},
     {"uri": "skill://qgis-status", "name": "QGIS Status", "description": "Current QGIS instance status.", "mimeType": "text/plain"},
 ]
 
@@ -506,6 +622,7 @@ SKILL_MAP = {
     "skill://data-sources": "data_sources",
     "skill://helpers": "helpers",
     "skill://smart-loading": "smart_loading",
+    "skill://recipes": "recipes",
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -626,9 +743,33 @@ def _auto_screenshot() -> list:
     return []
 
 
+def _extract_context(response: dict) -> list:
+    """Extract _context from bridge response and format as a compact text block.
+    Returns a list with one text content item, or empty list if no context."""
+    ctx = response.pop("_context", None)
+    if not ctx:
+        return []
+    zone = ctx.get("study_zone") or "none"
+    phase = ctx.get("phase", "?")
+    layers = ctx.get("layers", [])
+    rasters = ctx.get("raster_count", 0)
+    hint = ctx.get("hint", "")
+    vec_count = len(layers)
+    total = vec_count + rasters
+    parts = [f"phase={phase}", f"zone={zone}", f"{total} layers ({vec_count} vector, {rasters} raster)"]
+    if ctx.get("has_layouts"):
+        parts.append("layouts=yes")
+    line = " | ".join(parts)
+    text = f"\n--- Context: {line}"
+    if hint:
+        text += f"\n    Hint: {hint}"
+    return [{"type": "text", "text": text}]
+
+
 def _text(response, **kwargs) -> list:
-    """Format a bridge response as MCP text content."""
-    return [{"type": "text", "text": json.dumps(response, default=str, **kwargs)}]
+    """Format a bridge response as MCP text content, extracting _context if present."""
+    ctx_content = _extract_context(response)
+    return [{"type": "text", "text": json.dumps(response, default=str, **kwargs)}] + ctx_content
 
 
 def _error(message: str) -> dict:
@@ -978,6 +1119,201 @@ def _tool_set_layer_visibility(arguments: dict) -> dict:
     return {"content": _text(response) + _auto_screenshot()}
 
 
+# ── Layout templates ──────────────────────────────────────────
+
+def _tool_list_layout_templates(arguments: dict) -> dict:
+    response = qgis_command("list_layout_templates", {})
+    return {"content": _text(response, indent=2)}
+
+
+def _tool_apply_layout_template(arguments: dict) -> dict:
+    err = _validate_required(arguments, "template")
+    if err:
+        return _error(err)
+    params = {"template_id": arguments["template"]}
+    if arguments.get("variables"):
+        params["variables"] = arguments["variables"]
+    if arguments.get("name"):
+        params["name"] = arguments["name"]
+    response = qgis_command("apply_layout_template", params)
+    return {"content": _text(response, indent=2) + _auto_screenshot()}
+
+
+# ── Web map export ────────────────────────────────────────────
+
+def _tool_export_web_map(arguments: dict) -> dict:
+    params = {}
+    if arguments.get("title"):
+        params["title"] = arguments["title"]
+    if arguments.get("max_features"):
+        params["max_features"] = arguments["max_features"]
+    if arguments.get("output_path"):
+        params["output_path"] = arguments["output_path"]
+    response = qgis_command("export_web_map", params)
+    return {"content": _text(response, indent=2)}
+
+
+# ── Interactive flood map ─────────────────────────────────────
+
+def _tool_export_flood_map(arguments: dict) -> dict:
+    params = {}
+    if arguments.get("title"):
+        params["title"] = arguments["title"]
+    if arguments.get("max_features"):
+        params["max_features"] = arguments["max_features"]
+    if arguments.get("output_path"):
+        params["output_path"] = arguments["output_path"]
+    if arguments.get("include_fields"):
+        params["include_fields"] = arguments["include_fields"]
+    response = qgis_command("export_flood_map", params, timeout=SOCKET_TIMEOUT_LONG)
+    return {"content": _text(response, indent=2)}
+
+
+def _tool_export_temporal_map(arguments: dict) -> dict:
+    params = {}
+    for key in ("title", "max_features", "output_path", "point_layer_keyword",
+                "band_layer_keyword", "extra_polygon_keywords", "temporal_field",
+                "value_field", "band_field", "include_fields"):
+        if arguments.get(key):
+            params[key] = arguments[key]
+    response = qgis_command("export_temporal_map", params, timeout=SOCKET_TIMEOUT_LONG)
+    return {"content": _text(response, indent=2)}
+
+
+def _tool_export_qfield(arguments: dict) -> dict:
+    params = {}
+    for key in ("project_name", "include_observations_layer", "max_features_per_layer"):
+        if key in arguments:
+            params[key] = arguments[key]
+    response = qgis_command("export_qfield", params, timeout=SOCKET_TIMEOUT_LONG)
+    return {"content": _text(response, indent=2)}
+
+
+# ── Recipes ───────────────────────────────────────────────────
+
+def _tool_list_recipes(arguments: dict) -> dict:
+    response = qgis_command("list_recipes", {})
+    return {"content": _text(response, indent=2)}
+
+
+def _tool_get_recipe(arguments: dict) -> dict:
+    err = _validate_required(arguments, "id")
+    if err:
+        return _error(err)
+    params = {"id": arguments["id"]}
+    # Forward all extra params for recipe substitution
+    for key in ("zone", "grid_size", "max_features"):
+        if arguments.get(key):
+            params[key] = arguments[key]
+    response = qgis_command("get_recipe", params)
+    return {"content": _text(response, indent=2)}
+
+
+# ── Run recipe (automated execution) ─────────────────────────
+
+# Actions that need longer timeouts (WFS downloads, heavy exports)
+_LONG_TIMEOUT_ACTIONS = frozenset({
+    "smart_load", "export_flood_map", "export_web_map", "export_temporal_map", "export_qfield", "execute_python",
+})
+
+
+def _tool_run_recipe(arguments: dict) -> dict:
+    """Execute a complete recipe in one shot — all steps sequentially."""
+    err = _validate_required(arguments, "id", "zone")
+    if err:
+        return _error(err)
+
+    recipe_id = arguments["id"]
+    zone = arguments["zone"]
+
+    # 1. Optionally start a new project
+    if arguments.get("new_project", True):
+        qgis_command("new_project", {"title": f"{recipe_id} — {zone}"})
+
+    # 2. Get the resolved recipe (with $zone substituted)
+    recipe_params = {"id": recipe_id, "zone": zone}
+    if arguments.get("grid_size"):
+        recipe_params["grid_size"] = arguments["grid_size"]
+
+    recipe_resp = qgis_command("get_recipe", recipe_params)
+    if "error" in recipe_resp:
+        return _error(f"Recipe not found: {recipe_resp['error']}")
+
+    steps = recipe_resp.get("steps", [])
+    total = len(steps)
+
+    # 3. Execute each step sequentially
+    step_results = []
+    stopped = False
+
+    for i, step in enumerate(steps):
+        step_id = step.get("id", f"step_{i}")
+        action = step.get("tool", "")
+        description = step.get("description", "")
+        params = dict(step.get("params", {}))
+
+        # Special handling: execute_python has 'code' at step level
+        if action == "execute_python":
+            params["code"] = step.get("code", "")
+            params.setdefault("timeout", 180)
+
+        # Special handling: apply_layout_template uses template_id in bridge
+        if action == "apply_layout_template" and "template" in params:
+            params["template_id"] = params.pop("template")
+
+        # Determine timeout
+        timeout = SOCKET_TIMEOUT_LONG if action in _LONG_TIMEOUT_ACTIONS else SOCKET_TIMEOUT
+
+        # Execute
+        resp = qgis_command(action, params, timeout=timeout)
+        success = "error" not in resp
+
+        step_result = {
+            "step": f"{i + 1}/{total}",
+            "id": step_id,
+            "tool": action,
+            "description": description,
+            "success": success,
+        }
+
+        if not success:
+            step_result["error"] = resp.get("error", "Unknown error")
+        else:
+            # Include key metrics from response (keep it compact)
+            for key in ("feature_count", "layer_id", "name", "path",
+                        "download_url", "size", "stats"):
+                if key in resp:
+                    step_result[key] = resp[key]
+            # For execute_python, include the result dict
+            if action == "execute_python" and "result" in resp:
+                step_result["result"] = resp["result"]
+
+        step_results.append(step_result)
+
+        # Stop on critical failure (zone setup must succeed)
+        if not success and action == "set_study_zone":
+            stopped = True
+            break
+
+    # 4. Build summary
+    succeeded = sum(1 for r in step_results if r["success"])
+    failed = sum(1 for r in step_results if not r["success"])
+
+    response = {
+        "recipe": recipe_id,
+        "zone": zone,
+        "total_steps": total,
+        "executed": len(step_results),
+        "succeeded": succeeded,
+        "failed": failed,
+        "stopped_early": stopped,
+        "steps": step_results,
+        "outputs": recipe_resp.get("outputs", []),
+    }
+
+    return {"content": _text(response, indent=2) + _auto_screenshot()}
+
+
 # ── Dispatch table ────────────────────────────────────────────
 
 TOOL_HANDLERS = {
@@ -1012,6 +1348,15 @@ TOOL_HANDLERS = {
     "smart_load": _tool_smart_load,
     "set_layer_style": _tool_set_layer_style,
     "set_layer_visibility": _tool_set_layer_visibility,
+    "list_layout_templates": _tool_list_layout_templates,
+    "apply_layout_template": _tool_apply_layout_template,
+    "export_web_map": _tool_export_web_map,
+    "export_flood_map": _tool_export_flood_map,
+    "export_temporal_map": _tool_export_temporal_map,
+    "export_qfield": _tool_export_qfield,
+    "list_recipes": _tool_list_recipes,
+    "get_recipe": _tool_get_recipe,
+    "run_recipe": _tool_run_recipe,
 }
 
 
@@ -1069,6 +1414,7 @@ Use these instead of writing boilerplate. Read skill://helpers for full docs and
 - `helpers.set_study_zone(target, buffer_km)` — Define study zone, store in project variables
 - `helpers.get_study_zone()` — Read stored study zone (name, bbox_4326, bbox_2154)
 - `helpers.download_wfs_ogr(url, typename, bbox_4326)` — Download WFS as local GPKG via ogr2ogr
+- `helpers.overpass_query(tags, bbox_4326)` — Query OpenStreetMap via Overpass API. tags: dict like {{"amenity": "school"}} or string "amenity=school". Auto-uses study zone bbox.
 
 ## Data catalog (pre-configured French national sources — free, no API key)
 - **list_datasources** — Browse available sources: IGN orthophotos, Plan IGN, BD TOPO (buildings, roads, rivers, communes...), OSM, cadastre, DEM, BAN geocoding, Panoramax. Filter by category or search.
@@ -1087,13 +1433,29 @@ Use these instead of writing boilerplate. Read skill://helpers for full docs and
 - **set_layer_style** — Apply single color, categorized (by field), or graduated (ranges) symbology.
 - **set_layer_visibility** — Show/hide a layer in the layer tree.
 
+## Layout templates & export
+- **list_layout_templates** — List available print layout templates.
+- **apply_layout_template** — Apply a pre-configured template (a3_landscape, a4_portrait) with dynamic labels. Variables (title, subtitle) are set as QGIS project variables resolved via expressions. Then use export_pdf to generate the PDF.
+- **export_web_map** — Export visible vector layers as interactive Leaflet HTML. GeoJSON inline, popups, toggle legend. Returns download URL.
+- **export_flood_map** — Export an interactive flood simulation HTML. Water height slider, play/pause animation, building exposure by color, dynamic stats. Requires ISO_HT + building layers loaded (use risque_inondation recipe first).
+
+## Recipes (reproducible workflows)
+- **list_recipes** — Browse workflow recipes: building density, urban analysis, flood risk, land cover.
+- **get_recipe** — Get a recipe with parameters resolved. Returns step-by-step instructions to follow manually.
+- **run_recipe** — Execute a complete recipe automatically in one shot! Runs all steps (zone → data → analysis → style → export) without manual intervention. Much faster than step-by-step.
+- When a user asks for a common analysis, check recipes first! Prefer run_recipe(id=..., zone="...") for fully automated execution. Use get_recipe only when you need to inspect or customize individual steps.
+
 ## Workflow pattern
 1. **get_project_info** → understand current layers, CRS, layouts, extents
-2. **Add data** — use add_from_catalog for French national data, add_layer for custom URIs, upload_file for user files
+2. **Add data** — set_study_zone + smart_load for French data, add_layer for custom URIs, upload_file for user files
 3. **Act** — run_processing, execute_python, zoom_to → each returns screenshot
 4. **Style** — set_layer_style, set_layer_visibility
-5. **Verify** the screenshot — describe what you see
-6. **Deliver** — export_layer, download_project, export_pdf, download_file
+5. **Layout** — apply_layout_template (a3_landscape, a4_portrait)
+6. **Verify** the screenshot — describe what you see
+7. **Deliver** — export_pdf, export_web_map, export_flood_map, export_layer, download_project
+
+## Workflow context
+Every mutating tool response includes a context line with: current phase (setup/analysis/cartography/export), study zone, layer count, and a hint for the next action. Use this to stay oriented.
 
 ## Important
 - Screenshots are 1280x720 of the full QGIS desktop (menus, panels, map canvas, layer tree).

@@ -1,0 +1,79 @@
+{
+  "id": "densite_bati",
+  "name": "Carte de densité du bâti",
+  "description": "Analyse de densité des bâtiments par grille hexagonale avec rendu cartographique gradué. Produit une carte PDF avec mise en page professionnelle.",
+  "tags": ["urbanisme", "densité", "bâtiments", "grille"],
+  "parameters": {
+    "zone": {
+      "type": "string",
+      "required": true,
+      "description": "Commune ou adresse (ex: 'Montpellier', 'Sète', 'Gare de Lyon, Paris')"
+    },
+    "grid_size": {
+      "type": "number",
+      "default": 500,
+      "unit": "m",
+      "description": "Taille de maille de la grille hexagonale en mètres"
+    }
+  },
+  "steps": [
+    {
+      "id": "zone",
+      "tool": "set_study_zone",
+      "params": {"target": "$zone"},
+      "description": "Définir la zone d'étude"
+    },
+    {
+      "id": "basemap",
+      "tool": "smart_load",
+      "params": {"id": "cartodb_positron"},
+      "description": "Ajouter le fond de carte clair"
+    },
+    {
+      "id": "buildings",
+      "tool": "smart_load",
+      "params": {"id": "bdtopo_batiments"},
+      "description": "Télécharger les bâtiments (BD TOPO). Peut prendre 30-60s selon la zone."
+    },
+    {
+      "id": "grid",
+      "tool": "execute_python",
+      "description": "Créer une grille hexagonale couvrant la zone d'étude",
+      "code": "import processing, json\nfrom qgis.core import QgsExpressionContextUtils\n\nscope = QgsExpressionContextUtils.projectScope(project)\nbbox_str = scope.variable('study_zone_bbox_2154')\nif not bbox_str:\n    result['error'] = 'No study zone set'\nelse:\n    coords = json.loads(bbox_str)\n    extent = f'{coords[0]},{coords[2]},{coords[1]},{coords[3]} [EPSG:2154]'\n    grid = processing.run('native:creategrid', {\n        'TYPE': 4,\n        'EXTENT': extent,\n        'HSPACING': $grid_size,\n        'VSPACING': $grid_size,\n        'HOVERLAY': 0,\n        'VOVERLAY': 0,\n        'CRS': 'EPSG:2154',\n        'OUTPUT': 'memory:'\n    })\n    grid_layer = grid['OUTPUT']\n    grid_layer.setName('Grille hexagonale')\n    project.addMapLayer(grid_layer)\n    result['grid_features'] = grid_layer.featureCount()\n    result['success'] = True"
+    },
+    {
+      "id": "centroids",
+      "tool": "execute_python",
+      "description": "Calculer les centroïdes des bâtiments pour le comptage",
+      "code": "import processing\nbat = [l for l in project.mapLayers().values() if 'timent' in l.name() or 'BATIMENT' in l.name()]\nif not bat:\n    result['error'] = 'Building layer not found'\nelse:\n    centroids = processing.run('native:centroids', {\n        'INPUT': bat[0],\n        'ALL_PARTS': False,\n        'OUTPUT': 'memory:'\n    })\n    cl = centroids['OUTPUT']\n    cl.setName('Centroides batiments')\n    project.addMapLayer(cl)\n    result['centroids'] = cl.featureCount()\n    result['success'] = True"
+    },
+    {
+      "id": "count",
+      "tool": "execute_python",
+      "description": "Compter les bâtiments par cellule hexagonale et filtrer les cellules vides",
+      "code": "import processing\ngrid = [l for l in project.mapLayers().values() if 'Grille' in l.name()][0]\ncentroids = [l for l in project.mapLayers().values() if 'Centroide' in l.name()][0]\n\ndensity = processing.run('native:countpointsinpolygon', {\n    'POLYGONS': grid,\n    'POINTS': centroids,\n    'FIELD': 'nb_batiments',\n    'OUTPUT': 'memory:'\n})\ndl = density['OUTPUT']\ndl.setName('Densite bati')\n# Filter out empty cells for cleaner visualization\ndl.setSubsetString('nb_batiments > 0')\nproject.addMapLayer(dl)\n\n# Remove intermediate layers\nfor name in ['Grille hexagonale', 'Centroides batiments']:\n    for l in project.mapLayersByName(name):\n        project.removeMapLayer(l)\n\n# Hide raw buildings layer\nfor l in project.mapLayers().values():\n    if 'timent' in l.name() and 'Densite' not in l.name():\n        node = project.layerTreeRoot().findLayer(l)\n        if node: node.setItemVisibilityChecked(False)\n\nresult['density_features'] = dl.featureCount()\nresult['success'] = True"
+    },
+    {
+      "id": "style",
+      "tool": "execute_python",
+      "description": "Appliquer une symbologie graduée séquentielle sur nb_batiments",
+      "code": "from qgis.core import QgsGraduatedSymbolRenderer, QgsRendererRange, QgsFillSymbol\n\nlayer = [l for l in project.mapLayers().values() if 'Densite' in l.name()][0]\n\n# Compute stats for auto-ranges\nidx = layer.fields().indexOf('nb_batiments')\nmax_val = layer.maximumValue(idx)\n\nif max_val and max_val > 0:\n    # Professional green sequential ramp (RGBA format)\n    breaks = [\n        (1, max(10, int(max_val*0.1)), '200,230,201,200', '< 10%'),\n        (max(10, int(max_val*0.1)), max(30, int(max_val*0.25)), '120,198,163,200', '10-25%'),\n        (max(30, int(max_val*0.25)), max(80, int(max_val*0.5)), '65,171,93,200', '25-50%'),\n        (max(80, int(max_val*0.5)), max(200, int(max_val*0.75)), '35,132,67,210', '50-75%'),\n        (max(200, int(max_val*0.75)), int(max_val)+1, '0,90,50,220', '75-100%'),\n    ]\n    ranges = []\n    for low, high, color, label in breaks:\n        sym = QgsFillSymbol.createSimple({'color': color, 'outline_color': '50,50,50,120', 'outline_width': '0.15'})\n        ranges.append(QgsRendererRange(low, high, sym, label))\n    renderer = QgsGraduatedSymbolRenderer('nb_batiments', ranges)\n    layer.setRenderer(renderer)\n    layer.triggerRepaint()\n    result['ranges'] = len(ranges)\n    result['max_val'] = max_val\n\n# Zoom to density layer with CRS transform\nfrom qgis.core import QgsCoordinateTransform\ncanvas = iface.mapCanvas()\ntr = QgsCoordinateTransform(layer.crs(), project.crs(), project)\next_proj = tr.transformBoundingBox(layer.extent())\ncanvas.setExtent(ext_proj)\ncanvas.zoomByFactor(1.1)\ncanvas.refresh()\n\nresult['success'] = True"
+    },
+    {
+      "id": "layout",
+      "tool": "apply_layout_template",
+      "params": {
+        "template": "a3_landscape",
+        "variables": {"title": "Densité du bâti — $zone", "subtitle": "Grille hexagonale $grid_size m — BD TOPO IGN"}
+      },
+      "description": "Appliquer la mise en page A3 paysage"
+    },
+    {
+      "id": "export",
+      "tool": "export_pdf",
+      "params": {"layout": "Export A3 Landscape"},
+      "description": "Exporter en PDF"
+    }
+  ],
+  "outputs": ["PDF mise en page A3", "Couche 'Densité bâti' avec champ nb_batiments"]
+}

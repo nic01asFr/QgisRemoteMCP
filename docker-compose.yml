@@ -55,6 +55,8 @@ services:
       - ./setup_qgis_connections.py:/app/setup_qgis_connections.py:ro
       - ./src:/app/src:ro
       - ./skills:/app/skills:ro
+      - ./templates:/app/templates:ro
+      - ./recipes:/app/recipes:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped

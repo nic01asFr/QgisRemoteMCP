@@ -114,7 +114,31 @@ layer.triggerRepaint()
 
 ## Print Layouts
 
+### Using layout templates (recommended)
+
+Pre-configured templates with dynamic labels. Fastest way to get a
+professional layout:
+
+```
+# Via MCP tools:
+apply_layout_template(template="a3_landscape", variables={"title": "Densité bâti — Montpellier", "subtitle": "Grille 500m"})
+export_pdf(layout="Export A3 Landscape")
+```
+
+Available templates:
+- `a3_landscape` — A3 paysage (420x297mm): carte, titre, légende, échelle, flèche nord, sources
+- `a4_portrait` — A4 portrait (210x297mm): carte, titre, légende en bas
+
+Dynamic labels use QGIS expressions:
+- `[% @title %]` — from `variables.title`
+- `[% @subtitle %]` — from `variables.subtitle`
+- `[% @study_zone_name %]` — auto-set by `set_study_zone`
+- `[% format_date(now(), 'dd/MM/yyyy') %]` — current date
+
 ### Create a layout programmatically
+
+For custom layouts beyond templates:
+
 ```python
 from qgis.core import (QgsLayoutItemMap, QgsLayoutItemLabel, QgsLayoutItemLegend,
                         QgsLayoutItemScaleBar, QgsPrintLayout, QgsLayoutPoint,
@@ -177,3 +201,23 @@ SEQ_RED   = ["#fee5d9", "#fcae91", "#fb6a4a", "#de2d26", "#a50f15"]
 # Diverging (good-neutral-bad)
 DIV_RYG = ["#d73027", "#fc8d59", "#fee08b", "#d9ef8b", "#91cf60", "#1a9850"]
 ```
+
+## Web Map Export
+
+Export visible vector layers as an interactive Leaflet HTML page:
+
+```
+# Via MCP tool:
+export_web_map(title="Analyse urbaine — Montpellier")
+# → {"path": "/data/webmap_1234.html", "download_url": "http://localhost:8080/api/files/webmap_1234.html", "layers_exported": 4}
+```
+
+The exported HTML is standalone (no server required):
+- Leaflet 1.9 via CDN
+- GeoJSON data inline (per layer, up to 5000 features each)
+- OSM basemap
+- Popups with feature attributes
+- Interactive legend with layer toggle
+- Colors extracted from QGIS renderer
+
+Useful for sharing analysis results via email or embedding in reports.

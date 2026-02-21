@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>{{TITLE}}</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/nouislider@15/dist/nouislider.min.css">
+<script src="https://cdn.jsdelivr.net/npm/nouislider@15/dist/nouislider.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 0; font-family: 'Segoe UI', Arial, sans-serif; }
+  #map { position: absolute; top: 0; bottom: 0; left: 0; right: 0; }
+
+  .map-title {
+    position: absolute; top: 10px; left: 60px; z-index: 1000;
+    background: rgba(255,255,255,0.95); padding: 10px 18px;
+    border-radius: 6px; font-size: 17px; font-weight: 700;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.15); color: #1a1a2e;
+    max-width: 520px;
+  }
+  .map-title small {
+    display: block; font-size: 11px; font-weight: 400;
+    color: #666; margin-top: 2px;
+  }
+
+  /* Slider panel */
+  .slider-panel {
+    position: absolute; bottom: 30px; left: 60px; right: 60px; z-index: 1000;
+    background: rgba(255,255,255,0.96); padding: 16px 24px 24px;
+    border-radius: 8px; box-shadow: 0 2px 12px rgba(0,0,0,0.18);
+    max-width: 600px;
+  }
+  .slider-header {
+    display: flex; align-items: center; gap: 12px; margin-bottom: 12px;
+  }
+  .slider-header h3 {
+    margin: 0; font-size: 14px; color: #1a1a2e; flex: 1;
+  }
+  .slider-value {
+    font-size: 26px; font-weight: 700; color: #0055a4;
+    min-width: 60px; text-align: right;
+  }
+  .play-btn {
+    background: #0055a4; color: white; border: none;
+    border-radius: 50%; width: 34px; height: 34px;
+    cursor: pointer; font-size: 14px; display: flex;
+    align-items: center; justify-content: center;
+    transition: background 0.2s;
+  }
+  .play-btn:hover { background: #003d7a; }
+  .play-btn.playing { background: #c0392b; }
+  #year-slider { margin: 0 8px; }
+  .noUi-connect { background: #0077be; }
+  .noUi-tooltip {
+    font-size: 11px; padding: 2px 6px;
+    background: #0055a4; color: white; border: none;
+  }
+  .noUi-pips { font-size: 11px; color: #444; font-weight: 600; }
+  .noUi-value { margin-top: 2px; }
+
+  /* Stats panel */
+  .stats-panel {
+    background: rgba(255,255,255,0.96); padding: 12px 16px;
+    border-radius: 6px; box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+    font-size: 12px; min-width: 260px; max-width: 320px;
+  }
+  .stats-panel h4 {
+    margin: 0 0 8px 0; font-size: 13px; color: #1a1a2e;
+    border-bottom: 2px solid #0077be; padding-bottom: 4px;
+  }
+  .stat-row {
+    display: flex; justify-content: space-between;
+    padding: 3px 0; border-bottom: 1px solid #eee;
+  }
+  .stat-row:last-child { border-bottom: none; }
+  .stat-label { color: #555; }
+  .stat-value { font-weight: 600; color: #1a1a2e; text-align: right; }
+  .trend-up { color: #c0392b; }
+  .trend-down { color: #27ae60; }
+
+  /* Legend */
+  .legend-panel {
+    background: rgba(255,255,255,0.96); padding: 10px 14px;
+    border-radius: 6px; box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+    font-size: 11px; line-height: 1.8;
+  }
+  .legend-panel h4 {
+    margin: 0 0 6px 0; font-size: 12px; color: #1a1a2e;
+  }
+  .legend-row { display: flex; align-items: center; gap: 6px; }
+  .legend-circle {
+    width: 10px; height: 10px; border-radius: 50%;
+    border: 1px solid rgba(0,0,0,0.2); flex-shrink: 0;
+  }
+  .legend-swatch {
+    width: 16px; height: 12px; border-radius: 2px;
+    border: 1px solid rgba(0,0,0,0.15); flex-shrink: 0;
+  }
+
+  .info-footer {
+    position: absolute; bottom: 5px; right: 10px; z-index: 900;
+    background: rgba(255,255,255,0.7); padding: 2px 8px;
+    border-radius: 3px; font-size: 9px; color: #888;
+  }
+</style>
+</head>
+<body>
+
+<div class="map-title">
+  {{TITLE}}
+  <small>DVF 2019-2024 | Pression fonciere et proximite littorale</small>
+</div>
+<div id="map"></div>
+<div class="info-footer">BigQgisMCP | DVF (DGFiP via cquest.org), IGN, Georisques</div>
+
+<!-- Slider panel -->
+<div class="slider-panel" id="slider-panel">
+  <div class="slider-header">
+    <button class="play-btn" id="play-btn" title="Animation">&#9654;</button>
+    <h3>Transactions immobilieres</h3>
+    <div class="slider-value" id="slider-value">2024</div>
+  </div>
+  <div id="year-slider"></div>
+</div>
+
+<script>
+(function() {
+  // ── Data (injected by bridge) ──
+  var center = {{CENTER}};
+  var zoom = {{ZOOM}};
+  var transactionsData = {{TRANSACTIONS_JSON}};
+  var bandsData = {{BANDS_JSON}};
+  var submersionData = {{SUBMERSION_JSON}};
+  var years = {{YEARS_JSON}};
+  var preStats = {{STATS_JSON}};
+  var zoneName = "{{ZONE_NAME}}";
+
+  // ── Map ──
+  var map = L.map('map', { zoomControl: true }).setView(center, zoom);
+  L.tileLayer('https://cartodb-basemaps-a.global.ssl.fastly.net/light_all/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap &copy; CARTO'
+  }).addTo(map);
+
+  // ── Panes for z-ordering ──
+  map.createPane('bands'); map.getPane('bands').style.zIndex = 400;
+  map.createPane('submersion'); map.getPane('submersion').style.zIndex = 410;
+  map.createPane('points'); map.getPane('points').style.zIndex = 450;
+
+  // ── Color functions ──
+  function priceColor(pm2) {
+    if (pm2 < 1500) return '#66bb6a';
+    if (pm2 < 2500) return '#c8e650';
+    if (pm2 < 3500) return '#fdd835';
+    if (pm2 < 5000) return '#fb8c00';
+    if (pm2 < 8000) return '#e53935';
+    return '#b71c1c';
+  }
+
+  function priceRadius(pm2) {
+    if (pm2 < 2000) return 4;
+    if (pm2 < 4000) return 5;
+    if (pm2 < 6000) return 6;
+    return 7;
+  }
+
+  var bandColors = {
+    '0 - 500m':    { fill: 'rgba(0,70,150,0.18)',  line: 'rgba(0,50,120,0.5)' },
+    '500m - 1km':  { fill: 'rgba(20,100,180,0.12)', line: 'rgba(20,80,150,0.4)' },
+    '1 - 2km':     { fill: 'rgba(50,140,210,0.08)', line: 'rgba(40,110,180,0.3)' },
+    '2 - 5km':     { fill: 'rgba(90,170,230,0.05)', line: 'rgba(70,140,200,0.2)' }
+  };
+
+  // ── Static layers ──
+  var bounds = L.latLngBounds();
+
+  // Coastal bands
+  if (bandsData && bandsData.features && bandsData.features.length > 0) {
+    L.geoJSON(bandsData, {
+      pane: 'bands',
+      style: function(f) {
+        var bc = bandColors[f.properties.band_label] || { fill: 'transparent', line: '#ccc' };
+        return { fillColor: bc.fill, fillOpacity: 1, weight: 1.5, color: bc.line, dashArray: '6,4' };
+      },
+      onEachFeature: function(f, layer) {
+        layer.bindPopup('<b>Bande ' + f.properties.band_label + '</b>');
+      }
+    }).addTo(map);
+  }
+
+  // Submersion marine
+  if (submersionData && submersionData.features && submersionData.features.length > 0) {
+    L.geoJSON(submersionData, {
+      pane: 'submersion',
+      interactive: false,
+      style: function() {
+        return { fillColor: 'rgba(220,60,60,0.12)', fillOpacity: 1, weight: 0.8, color: 'rgba(180,40,40,0.3)' };
+      }
+    }).addTo(map);
+  }
+
+  // ── DVF points layer — filtered by year ──
+  var pointsLayer = null;
+
+  function formatPrice(v) {
+    if (v >= 1000000) return (v / 1000000).toFixed(1) + ' M\u20ac';
+    if (v >= 1000) return Math.round(v / 1000) + ' k\u20ac';
+    return Math.round(v) + ' \u20ac';
+  }
+
+  function updateYear(year) {
+    if (pointsLayer) map.removeLayer(pointsLayer);
+
+    var filtered = {
+      type: 'FeatureCollection',
+      features: transactionsData.features.filter(function(f) { return f.properties.year === year; })
+    };
+
+    pointsLayer = L.geoJSON(filtered, {
+      pane: 'points',
+      pointToLayer: function(f, latlng) {
+        var pm2 = f.properties.price_m2 || 0;
+        return L.circleMarker(latlng, {
+          radius: priceRadius(pm2),
+          fillColor: priceColor(pm2),
+          color: '#333', weight: 0.6, fillOpacity: 0.85
+        });
+      },
+      onEachFeature: function(f, layer) {
+        var p = f.properties;
+        var pm2 = p.price_m2 || 0;
+        layer.bindPopup(
+          '<b>' + (p.type_local || 'Bien') + '</b>' +
+          '<br>Prix : <b>' + formatPrice(p.price || 0) + '</b>' +
+          '<br>Surface : ' + (p.surface || '?') + ' m\u00b2' +
+          '<br>Prix/m\u00b2 : <b style="color:' + priceColor(pm2) + '">' + Math.round(pm2).toLocaleString('fr') + ' \u20ac/m\u00b2</b>' +
+          '<br>Bande : ' + (p.coastal_band || 'Hors bande') +
+          '<br>Date : ' + (p.date_mutation || year),
+          { maxWidth: 280 }
+        );
+      }
+    }).addTo(map);
+
+    // Fit bounds on first load
+    try {
+      var pb = pointsLayer.getBounds();
+      if (pb.isValid() && !bounds.isValid()) {
+        bounds.extend(pb);
+        map.fitBounds(bounds, { padding: [50, 50] });
+      }
+    } catch(e) {}
+
+    updateStats(year);
+    document.getElementById('slider-value').textContent = year;
+  }
+
+  // ── Stats panel ──
+  function updateStats(year) {
+    var stats = preStats[String(year)] || {};
+    var prevStats = preStats[String(year - 1)] || {};
+    var div = document.getElementById('stats-div');
+
+    var html = '<h4>' + zoneName + ' \u2014 ' + year + '</h4>';
+
+    var bandOrder = ['0 - 500m', '500m - 1km', '1 - 2km', '2 - 5km', 'Hors bande'];
+    var totalCount = 0, totalWeighted = 0;
+
+    bandOrder.forEach(function(band) {
+      var s = stats[band];
+      if (!s || s.count === 0) return;
+      totalCount += s.count;
+      totalWeighted += s.median_m2 * s.count;
+
+      var trend = '';
+      var ps = prevStats[band];
+      if (ps && ps.median_m2 > 0) {
+        var pct = ((s.median_m2 - ps.median_m2) / ps.median_m2 * 100).toFixed(1);
+        var num = parseFloat(pct);
+        if (num > 0) trend = ' <span class="trend-up">\u25b2+' + pct + '%</span>';
+        else if (num < 0) trend = ' <span class="trend-down">\u25bc' + pct + '%</span>';
+        else trend = ' \u25cf';
+      }
+
+      html += '<div class="stat-row">' +
+        '<span class="stat-label">' + band + '</span>' +
+        '<span class="stat-value">' + s.median_m2.toLocaleString('fr') + ' \u20ac/m\u00b2 <small>(' + s.count + ')</small>' + trend + '</span>' +
+        '</div>';
+    });
+
+    if (totalCount > 0) {
+      var globalMedian = Math.round(totalWeighted / totalCount);
+      html += '<hr style="margin:5px 0;border-color:#ddd">';
+      html += '<div class="stat-row"><span class="stat-label"><b>Ensemble</b></span>' +
+        '<span class="stat-value"><b>' + totalCount + '</b> transactions, moy. <b>' +
+        globalMedian.toLocaleString('fr') + ' \u20ac/m\u00b2</b></span></div>';
+    } else {
+      html += '<div style="color:#999;padding:8px 0">Aucune transaction cette ann\u00e9e</div>';
+    }
+
+    html += '<div style="font-size:9px;color:#aaa;margin-top:6px">Source : DVF (DGFiP) via cquest.org \u2014 Georisques</div>';
+    div.innerHTML = html;
+  }
+
+  // ── Stats control ──
+  var statsCtrl = L.control({ position: 'topright' });
+  statsCtrl.onAdd = function() {
+    var div = L.DomUtil.create('div', 'stats-panel');
+    div.id = 'stats-div';
+    L.DomEvent.disableClickPropagation(div);
+    return div;
+  };
+  statsCtrl.addTo(map);
+
+  // ── Legend control ──
+  var legendCtrl = L.control({ position: 'bottomright' });
+  legendCtrl.onAdd = function() {
+    var div = L.DomUtil.create('div', 'legend-panel');
+    div.innerHTML =
+      '<h4>Prix / m\u00b2</h4>' +
+      '<div class="legend-row"><span class="legend-circle" style="background:#66bb6a"></span> &lt; 1 500 \u20ac</div>' +
+      '<div class="legend-row"><span class="legend-circle" style="background:#c8e650"></span> 1 500 \u2013 2 500 \u20ac</div>' +
+      '<div class="legend-row"><span class="legend-circle" style="background:#fdd835"></span> 2 500 \u2013 3 500 \u20ac</div>' +
+      '<div class="legend-row"><span class="legend-circle" style="background:#fb8c00"></span> 3 500 \u2013 5 000 \u20ac</div>' +
+      '<div class="legend-row"><span class="legend-circle" style="background:#e53935"></span> 5 000 \u2013 8 000 \u20ac</div>' +
+      '<div class="legend-row"><span class="legend-circle" style="background:#b71c1c"></span> &gt; 8 000 \u20ac</div>' +
+      '<hr style="margin:4px 0;border-color:#ddd">' +
+      '<div class="legend-row"><span class="legend-swatch" style="background:rgba(0,70,150,0.25)"></span> 0 \u2013 500m du littoral</div>' +
+      '<div class="legend-row"><span class="legend-swatch" style="background:rgba(20,100,180,0.18)"></span> 500m \u2013 1km</div>' +
+      '<div class="legend-row"><span class="legend-swatch" style="background:rgba(50,140,210,0.12)"></span> 1 \u2013 2km</div>' +
+      '<div class="legend-row"><span class="legend-swatch" style="background:rgba(90,170,230,0.08)"></span> 2 \u2013 5km</div>' +
+      (submersionData && submersionData.features.length > 0 ?
+        '<hr style="margin:4px 0;border-color:#ddd"><div class="legend-row"><span class="legend-swatch" style="background:rgba(220,60,60,0.2)"></span> Submersion marine T100</div>' : '');
+    L.DomEvent.disableClickPropagation(div);
+    return div;
+  };
+  legendCtrl.addTo(map);
+
+  // ── noUiSlider (year) ──
+  var sliderEl = document.getElementById('year-slider');
+  var minYear = years[0];
+  var maxYear = years[years.length - 1];
+
+  noUiSlider.create(sliderEl, {
+    start: [maxYear],
+    step: 1,
+    range: { min: minYear, max: maxYear },
+    tooltips: false,
+    pips: {
+      mode: 'values',
+      values: years,
+      density: 100,
+      format: { to: function(v) { return Math.round(v); } }
+    }
+  });
+
+  L.DomEvent.disableClickPropagation(document.getElementById('slider-panel'));
+  L.DomEvent.disableScrollPropagation(document.getElementById('slider-panel'));
+
+  sliderEl.noUiSlider.on('update', function(values) {
+    updateYear(Math.round(parseFloat(values[0])));
+  });
+
+  // ── Animation ──
+  var animId = null;
+  var lastStep = 0;
+  var STEP_MS = 1500;
+  var playBtn = document.getElementById('play-btn');
+
+  function animStep(ts) {
+    if (ts - lastStep >= STEP_MS) {
+      lastStep = ts;
+      var cur = Math.round(parseFloat(sliderEl.noUiSlider.get()));
+      var next = cur + 1;
+      if (next > maxYear) {
+        stopAnim();
+        return;
+      }
+      sliderEl.noUiSlider.set(next);
+    }
+    animId = requestAnimationFrame(animStep);
+  }
+
+  function startAnim() {
+    if (animId) return;
+    var cur = Math.round(parseFloat(sliderEl.noUiSlider.get()));
+    if (cur >= maxYear) sliderEl.noUiSlider.set(minYear);
+    lastStep = performance.now();
+    animId = requestAnimationFrame(animStep);
+    playBtn.innerHTML = '&#9646;&#9646;';
+    playBtn.classList.add('playing');
+  }
+
+  function stopAnim() {
+    if (animId) { cancelAnimationFrame(animId); animId = null; }
+    playBtn.innerHTML = '&#9654;';
+    playBtn.classList.remove('playing');
+  }
+
+  playBtn.addEventListener('click', function() {
+    animId ? stopAnim() : startAnim();
+  });
+
+  // ── Initial state ──
+  updateYear(maxYear);
+
+})();
+</script>
+</body>
+</html>

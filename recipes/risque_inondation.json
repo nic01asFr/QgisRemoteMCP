@@ -1,0 +1,105 @@
+{
+  "id": "risque_inondation",
+  "name": "Analyse de risque inondation (Directive Inondation)",
+  "description": "Analyse professionnelle du risque inondation utilisant les données réglementaires de la Directive Inondation (Georisques). Charge les vraies enveloppes de crue modélisées (T10, T100, T1000), les hauteurs d'eau, et identifie les bâtiments et établissements sensibles exposés. Produit une carte de vulnérabilité avec statistiques.",
+  "tags": ["risques", "inondation", "TRI", "directive inondation", "Georisques"],
+  "parameters": {
+    "zone": {
+      "type": "string",
+      "required": true,
+      "description": "Commune dans un TRI (ex: 'Béziers', 'Nîmes', 'Montpellier')"
+    }
+  },
+  "steps": [
+    {
+      "id": "zone",
+      "tool": "set_study_zone",
+      "params": {"target": "$zone"},
+      "description": "Définir la zone d'étude"
+    },
+    {
+      "id": "basemap",
+      "tool": "smart_load",
+      "params": {"id": "cartodb_positron"},
+      "description": "Fond de carte clair"
+    },
+    {
+      "id": "flood_t1000",
+      "tool": "smart_load",
+      "params": {"id": "tri_inondation_t1000"},
+      "description": "Zone inondable — crue extrême T1000 (événement millénaire). Peut être vide si la zone n'est pas dans un TRI."
+    },
+    {
+      "id": "flood_t100",
+      "tool": "smart_load",
+      "params": {"id": "tri_inondation_t100"},
+      "description": "Zone inondable — crue centennale T100 (référence réglementaire)"
+    },
+    {
+      "id": "flood_t10",
+      "tool": "smart_load",
+      "params": {"id": "tri_inondation_t10"},
+      "description": "Zone inondable — crue fréquente T10"
+    },
+    {
+      "id": "water_depth",
+      "tool": "smart_load",
+      "params": {"id": "tri_hauteurs_eau_t100"},
+      "description": "Hauteurs d'eau pour la crue centennale (classes ht_min/ht_max en mètres)"
+    },
+    {
+      "id": "buildings",
+      "tool": "smart_load",
+      "params": {"id": "bdtopo_batiments"},
+      "description": "Bâtiments BD TOPO"
+    },
+    {
+      "id": "sensitive",
+      "tool": "smart_load",
+      "params": {"id": "tri_enjeux_sensibles"},
+      "description": "Établissements sensibles en zone inondable (écoles, hôpitaux)"
+    },
+    {
+      "id": "analysis",
+      "tool": "execute_python",
+      "description": "Identifier les bâtiments exposés par période de retour et calculer les statistiques",
+      "code": "import processing\nfrom qgis.core import QgsVectorLayer\n\n# Find layers\ndef find(keyword):\n    return [l for l in project.mapLayers().values() if isinstance(l, QgsVectorLayer) and keyword in l.name().lower()]\n\ndef fix(layer):\n    \"\"\"Fix invalid geometries (common in Georisques WFS data).\"\"\"\n    return processing.run('native:fixgeometries', {'INPUT': layer, 'METHOD': 1, 'OUTPUT': 'memory:'})['OUTPUT']\n\nt100 = find('centennale') or find('t100') or find('alea_synt_01_02')\nbat = find('timent')\n\nif not t100:\n    result['error'] = 'Zone inondable T100 non trouvee. La commune est peut-etre hors TRI.'\nelif not bat:\n    result['error'] = 'Couche batiments non trouvee'\nelse:\n    # Fix geometries before spatial operations (Georisques data often has invalid geom)\n    t100_fixed = fix(t100[0])\n    bat_fixed = fix(bat[0])\n    \n    # Extract buildings in T100 flood zone\n    intersect = processing.run('native:extractbylocation', {\n        'INPUT': bat_fixed,\n        'PREDICATE': [0],\n        'INTERSECT': t100_fixed,\n        'OUTPUT': 'memory:'\n    })\n    exposed = intersect['OUTPUT']\n    exposed.setName('Batiments exposes (T100)')\n    project.addMapLayer(exposed)\n    \n    # Try T10 intersection too\n    t10 = find('frequente') or find('t10') or find('alea_synt_01_01')\n    t10_count = 0\n    if t10:\n        t10_fixed = fix(t10[0])\n        inter10 = processing.run('native:extractbylocation', {\n            'INPUT': bat_fixed,\n            'PREDICATE': [0],\n            'INTERSECT': t10_fixed,\n            'OUTPUT': 'memory:'\n        })\n        t10_layer = inter10['OUTPUT']\n        t10_layer.setName('Batiments exposes (T10)')\n        project.addMapLayer(t10_layer)\n        t10_count = t10_layer.featureCount()\n    \n    # Statistics\n    total = bat[0].featureCount()\n    t100_count = exposed.featureCount()\n    result['stats'] = {\n        'total_batiments': total,\n        'exposes_t10_frequente': t10_count,\n        'exposes_t100_centennale': t100_count,\n        'pct_t100': round(t100_count / max(total, 1) * 100, 1)\n    }\n    result['success'] = True"
+    },
+    {
+      "id": "style",
+      "tool": "execute_python",
+      "description": "Styliser les zones par période de retour (bleu gradué) et bâtiments exposés (rouge)",
+      "code": "from qgis.core import QgsFillSymbol, QgsSingleSymbolRenderer, QgsVectorLayer, QgsCoordinateTransform, QgsCategorizedSymbolRenderer, QgsRendererCategory\n\ndef find(keyword):\n    return [l for l in project.mapLayers().values() if isinstance(l, QgsVectorLayer) and keyword in l.name().lower()]\n\n# Style flood zones — blue gradient by return period (T1000=light, T100=medium, T10=dark)\nstyles = [\n    ('t1000', 'extreme', '150,200,255,60', '80,130,200', 0.2),\n    ('centennale', 't100', '65,105,225,100', '30,60,180', 0.3),\n    ('frequente', 't10', '20,50,160,130', '10,30,120', 0.4),\n]\nfor kw1, kw2, fill, outline, width in styles:\n    layers = find(kw1) or find(kw2)\n    for l in layers:\n        if l.geometryType() == 2 and 'timent' not in l.name().lower():\n            sym = QgsFillSymbol.createSimple({'color': fill, 'outline_color': outline, 'outline_width': str(width)})\n            l.setRenderer(QgsSingleSymbolRenderer(sym))\n            l.triggerRepaint()\n\n# Style water depth by ht_max classes\nht = find('hauteur')\nif ht:\n    cats = []\n    depth_colors = {\n        0.5: ('180,210,255,120', 'H < 0.5m'),\n        1.0: ('100,160,230,150', '0.5 - 1m'),\n        2.0: ('50,100,200,180', '1 - 2m'),\n        999: ('20,50,150,200', '> 2m'),\n    }\n    from qgis.core import QgsGraduatedSymbolRenderer, QgsRendererRange\n    ranges = []\n    for ht_max, (color, label) in depth_colors.items():\n        ht_min = {0.5: 0, 1.0: 0.5, 2.0: 1.0, 999: 2.0}[ht_max]\n        sym = QgsFillSymbol.createSimple({'color': color, 'outline_color': '30,60,150,100', 'outline_width': '0.1'})\n        ranges.append(QgsRendererRange(ht_min, ht_max, sym, label))\n    renderer = QgsGraduatedSymbolRenderer('ht_max', ranges)\n    ht[0].setRenderer(renderer)\n    ht[0].triggerRepaint()\n\n# Style exposed buildings — red\nexposed = find('exposes')\nfor l in exposed:\n    sym = QgsFillSymbol.createSimple({'color': '230,50,50,200', 'outline_color': '150,30,30', 'outline_width': '0.3'})\n    l.setRenderer(QgsSingleSymbolRenderer(sym))\n    l.triggerRepaint()\n\n# Style normal buildings — light gray, hidden by default\nfor l in project.mapLayers().values():\n    if isinstance(l, QgsVectorLayer) and 'timent' in l.name() and 'expos' not in l.name().lower():\n        sym = QgsFillSymbol.createSimple({'color': '200,200,200,100', 'outline_color': '150,150,150', 'outline_width': '0.1'})\n        l.setRenderer(QgsSingleSymbolRenderer(sym))\n        l.triggerRepaint()\n\n# Style sensitive facilities — orange points\nsensitive = find('sensible') or find('enjeux')\nif sensitive:\n    from qgis.core import QgsMarkerSymbol\n    for l in sensitive:\n        sym = QgsMarkerSymbol.createSimple({'name': 'triangle', 'color': '255,140,0,220', 'outline_color': '180,80,0', 'size': '3.5'})\n        l.setRenderer(QgsSingleSymbolRenderer(sym))\n        l.triggerRepaint()\n\n# Zoom to T100 flood zone\nt100 = find('centennale') or find('t100')\nif t100:\n    canvas = iface.mapCanvas()\n    tr = QgsCoordinateTransform(t100[0].crs(), project.crs(), project)\n    canvas.setExtent(tr.transformBoundingBox(t100[0].extent()))\n    canvas.zoomByFactor(1.15)\n    canvas.refresh()\n\nresult['success'] = True"
+    },
+    {
+      "id": "layout",
+      "tool": "apply_layout_template",
+      "params": {
+        "template": "a3_landscape",
+        "variables": {"title": "Risque inondation — $zone", "subtitle": "Directive Inondation — Zones de crue T10/T100/T1000 + hauteurs d'eau (Georisques)"}
+      },
+      "description": "Mise en page A3"
+    },
+    {
+      "id": "export",
+      "tool": "export_pdf",
+      "params": {"layout": "Export A3 Landscape"},
+      "description": "Export PDF"
+    },
+    {
+      "id": "flood_web",
+      "tool": "export_flood_map",
+      "params": {
+        "include_fields": ["usage_1", "nature", "nombre_de_logements", "nombre_d_etages", "hauteur", "nom_si_ext", "categorie", "ht_min", "ht_max", "scenario", "cours_deau"]
+      },
+      "description": "Export carte web interactive avec slider de hauteur d'eau et animation dynamique"
+    }
+  ],
+  "outputs": [
+    "PDF carte de risque inondation professionnelle",
+    "Carte web interactive avec simulation dynamique (slider hauteur d'eau + animation)",
+    "Couche 'Bâtiments exposés (T100)' avec statistiques",
+    "Zones inondables par période de retour (T10, T100, T1000)",
+    "Hauteurs d'eau par classe (< 0.5m, 0.5-1m, 1-2m, > 2m)"
+  ]
+}

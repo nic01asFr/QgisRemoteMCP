@@ -320,6 +320,89 @@
       "description": "Cartes topographiques IGN au 1:25000 (Scan 25)"
     },
 
+    {"_comment": "── Risques naturels (Georisques) ──────────────"},
+
+    {
+      "id": "tri_inondation_t10",
+      "name": "Zones inondables — Crue fréquente (T10)",
+      "category": "environment",
+      "type": "wfs",
+      "url": "https://georisques.gouv.fr/services/di_fxx_2020",
+      "params": {"typename": "ms:ALEA_SYNT_01_01FOR_FXX", "srsname": "EPSG:4326", "version": "2.0.0"},
+      "native_crs": "EPSG:2154",
+      "description": "Enveloppes de crue fréquente (période de retour ~10 ans) — Directive Inondation TRI"
+    },
+    {
+      "id": "tri_inondation_t100",
+      "name": "Zones inondables — Crue centennale (T100)",
+      "category": "environment",
+      "type": "wfs",
+      "url": "https://georisques.gouv.fr/services/di_fxx_2020",
+      "params": {"typename": "ms:ALEA_SYNT_01_02MOY_FXX", "srsname": "EPSG:4326", "version": "2.0.0"},
+      "native_crs": "EPSG:2154",
+      "description": "Enveloppes de crue centennale (période de retour ~100 ans) — Directive Inondation TRI"
+    },
+    {
+      "id": "tri_inondation_t1000",
+      "name": "Zones inondables — Crue extrême (T1000)",
+      "category": "environment",
+      "type": "wfs",
+      "url": "https://georisques.gouv.fr/services/di_fxx_2020",
+      "params": {"typename": "ms:ALEA_SYNT_01_04FAI_FXX", "srsname": "EPSG:4326", "version": "2.0.0"},
+      "native_crs": "EPSG:2154",
+      "description": "Enveloppes de crue extrême (période de retour ~1000 ans) — Directive Inondation TRI"
+    },
+    {
+      "id": "tri_hauteurs_eau_t100",
+      "name": "Hauteurs d'eau — Crue centennale (T100)",
+      "category": "environment",
+      "type": "wfs",
+      "url": "https://georisques.gouv.fr/services/di_fxx_2020",
+      "params": {"typename": "ms:ISO_HT_01_02MOY_FXX", "srsname": "EPSG:4326", "version": "2.0.0"},
+      "native_crs": "EPSG:2154",
+      "description": "Classes de hauteur d'eau (ht_min/ht_max en m) pour la crue centennale — Directive Inondation TRI"
+    },
+    {
+      "id": "tri_submersion_marine_t100",
+      "name": "Submersion marine — Centennale (T100)",
+      "category": "environment",
+      "type": "wfs",
+      "url": "https://georisques.gouv.fr/services/di_fxx_2020",
+      "params": {"typename": "ms:ALEA_SYNT_03_02MOY_FXX", "srsname": "EPSG:4326", "version": "2.0.0"},
+      "native_crs": "EPSG:2154",
+      "description": "Enveloppes de submersion marine centennale — Directive Inondation TRI (zones côtières)"
+    },
+    {
+      "id": "tri_ouvrages_protection",
+      "name": "Ouvrages de protection (digues)",
+      "category": "environment",
+      "type": "wfs",
+      "url": "https://georisques.gouv.fr/services/di_fxx_2020",
+      "params": {"typename": "ms:OUV_PROTECTION_FXX", "srsname": "EPSG:4326", "version": "2.0.0"},
+      "native_crs": "EPSG:2154",
+      "description": "Digues et ouvrages de protection contre les inondations — Directive Inondation TRI"
+    },
+    {
+      "id": "tri_enjeux_sensibles",
+      "name": "Enjeux sensibles (hôpitaux, écoles)",
+      "category": "environment",
+      "type": "wfs",
+      "url": "https://georisques.gouv.fr/services/di_fxx_2020",
+      "params": {"typename": "ms:ENJEUX_ETS_SENSIBLES_FXX", "srsname": "EPSG:4326", "version": "2.0.0"},
+      "native_crs": "EPSG:2154",
+      "description": "Établissements sensibles en zone inondable (écoles, hôpitaux, EHPAD) — Directive Inondation TRI"
+    },
+    {
+      "id": "tri_limites",
+      "name": "Périmètres TRI",
+      "category": "environment",
+      "type": "wfs",
+      "url": "https://georisques.gouv.fr/services/di_fxx_2020",
+      "params": {"typename": "ms:LIMITETRI_FXX", "srsname": "EPSG:4326", "version": "2.0.0"},
+      "native_crs": "EPSG:2154",
+      "description": "Périmètres des Territoires à Risques Importants d'inondation (124 TRI en France)"
+    },
+
     {"_comment": "── API supplémentaires ────────────────────────"},
 
     {
@@ -339,6 +422,24 @@
       "url": "https://api.cquest.org/dvf",
       "params": {},
       "description": "Demandes de Valeurs Foncières (transactions immobilières). Endpoint: ?code_commune=30189&annee_mutation=2023"
+    },
+    {
+      "id": "georisques_api",
+      "name": "Georisques API (CatNat, GASPAR)",
+      "category": "api",
+      "type": "api",
+      "url": "https://georisques.gouv.fr/api/v1",
+      "params": {},
+      "description": "Risques naturels et CatNat. Endpoints: /gaspar/catnat/?code_insee=..., /gaspar/risques_communes/?code_insee=..."
+    },
+    {
+      "id": "hubeau_hydrometrie",
+      "name": "Hub'Eau Hydrométrie",
+      "category": "api",
+      "type": "api",
+      "url": "https://hubeau.eaufrance.fr/api/v2/hydrometrie",
+      "params": {},
+      "description": "Stations et mesures hydrologiques. Endpoints: /referentiel/stations?code_commune=..., /observations_tr?code_entite=...&grandeur_hydro=H"
     }
   ]
 }
