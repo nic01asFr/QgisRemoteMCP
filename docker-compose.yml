@@ -17,12 +17,25 @@ services:
   bigqgismcp:
     build: .
     container_name: bigqgismcp
+    # GPU (optional) — Uncomment for CUDA/compute workloads.
+    # QGIS rendering stays on CPU (Xvfb limitation — always uses Mesa/llvmpipe).
+    # Requires NVIDIA Container Toolkit: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
     ports:
       - "${MCP_PORT:-8100}:8100"    # MCP Server
       - "${QGIS_VNC_PORT:-6080}:6080"  # noVNC (QGIS in browser)
       - "8080:8080"                  # REST API
       - "8081:8081"                  # MJPEG stream
     environment:
+      # Uncomment with deploy block above for GPU support
+      # - NVIDIA_VISIBLE_DEVICES=all
+      # - NVIDIA_DRIVER_CAPABILITIES=graphics,compute,utility
       - QGIS_RESOLUTION=${QGIS_RESOLUTION:-1920x1080x24}
       - MCP_PORT=8100
       - VNC_HOST=${VNC_HOST:-localhost}
@@ -30,13 +43,16 @@ services:
       - SAMGEO3_URL=${SAMGEO3_URL:-http://host.docker.internal:8002}
       - DEPTHPRO_URL=${DEPTHPRO_URL:-http://host.docker.internal:8003}
       - PYTHONUNBUFFERED=1
+      # Project to open on startup (path inside container, e.g. /data/myproject.qgz)
+      # If empty or not found, a new default project is created automatically
+      - QGIS_PROJECT=${QGIS_PROJECT:-}
     volumes:
       - ./data:/data
-      - ./projects:/projects
       # Dev: mount source for live editing (restart container to apply)
       - ./main_mcp.py:/app/main_mcp.py:ro
       - ./qgis_app.html:/app/qgis_app.html:ro
       - ./datasources.json:/app/datasources.json:ro
+      - ./setup_qgis_connections.py:/app/setup_qgis_connections.py:ro
       - ./src:/app/src:ro
       - ./skills:/app/skills:ro
     extra_hosts:

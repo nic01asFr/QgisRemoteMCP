@@ -37,20 +37,44 @@ if [ ! -e /tmp/.X11-unix/X99 ]; then
     exit 1
 fi
 
-# ── Verify OpenGL ─────────────────────────────────────────────────
-GL_RENDERER=$(DISPLAY=:99 glxinfo 2>/dev/null | grep "OpenGL renderer" || echo "unknown")
-echo "[BigQgisMCP] OpenGL: ${GL_RENDERER}"
+# ── Rendering: GPU detection & CPU fallback ──────────────────────
+# Check actual OpenGL renderer (not just nvidia-smi, since Xvfb may not use GPU)
+GL_RENDERER=$(DISPLAY=:99 glxinfo 2>/dev/null | grep -i "OpenGL renderer" | head -1 || echo "")
+echo "[BigQgisMCP] OpenGL: ${GL_RENDERER:-unknown}"
 
-# ── Create default QGIS project if none exists ───────────────────
-if [ ! -f /projects/current.qgz ]; then
-    echo "[BigQgisMCP] No project found, will use default"
+if echo "$GL_RENDERER" | grep -qi "nvidia\|geforce\|quadro\|tesla"; then
+    echo "[BigQgisMCP] GPU rendering active (NVIDIA)"
+    export RENDERING_MODE=gpu
+    unset LIBGL_ALWAYS_SOFTWARE
+    unset GALLIUM_DRIVER
+elif command -v nvidia-smi &> /dev/null && nvidia-smi &> /dev/null; then
+    echo "[BigQgisMCP] NVIDIA GPU present but OpenGL uses software renderer"
+    echo "[BigQgisMCP] (Xvfb limitation — GPU available for CUDA/compute only)"
+    export RENDERING_MODE=cpu
+    export LIBGL_ALWAYS_SOFTWARE=1
+    export GALLIUM_DRIVER=llvmpipe
+else
+    echo "[BigQgisMCP] No GPU — Mesa llvmpipe (CPU software rendering)"
+    export RENDERING_MODE=cpu
+    export LIBGL_ALWAYS_SOFTWARE=1
+    export GALLIUM_DRIVER=llvmpipe
 fi
+
+echo "[BigQgisMCP] Rendering mode: ${RENDERING_MODE}"
+
+# ── Ensure /data directory exists ─────────────────────────────────
+mkdir -p /data
+echo "[BigQgisMCP] Working directory: /data"
 
 # ── Ensure socket cleanup ────────────────────────────────────────
 rm -f /tmp/qgis_bridge.sock
 
 # ── Ensure x11vnc sees pure X11 (unset Wayland var entirely) ─────
 unset WAYLAND_DISPLAY
+
+# ── Pre-seed QGIS data source connections ────────────────────────
+echo "[BigQgisMCP] Pre-configuring QGIS connections..."
+python3 /app/setup_qgis_connections.py || echo "[BigQgisMCP] WARNING: Connection setup failed (non-fatal)"
 
 # ── Start all services via supervisord ────────────────────────────
 echo "[BigQgisMCP] Starting supervisord..."

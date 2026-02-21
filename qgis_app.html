@@ -28,16 +28,66 @@
   .canvas-wrapper img { width: 100%; display: block; pointer-events: none; user-select: none; -webkit-user-drag: none; }
   .canvas-wrapper pre { padding: 16px; color: #cdd6f4; font-size: 12px; overflow: auto; white-space: pre-wrap; max-height: 500px; }
 
+  /* ── Drop overlay ─────────────────────────────────────────── */
+  .drop-overlay {
+    display: none; position: absolute; inset: 0; z-index: 100;
+    background: rgba(203, 166, 247, 0.12); border: 2px dashed #cba6f7;
+    justify-content: center; align-items: center;
+    pointer-events: none;
+  }
+  .drop-overlay.visible { display: flex; }
+  .drop-overlay span {
+    background: #181825; color: #cba6f7; padding: 10px 24px; border-radius: 8px;
+    font-size: 13px; font-weight: 600;
+  }
+
+  /* ── File panel ───────────────────────────────────────────── */
   .file-panel { padding: 12px 16px; background: #181825; border-top: 1px solid #313244; display: none; }
   .file-panel.visible { display: block; }
-  .file-panel h3 { font-size: 12px; color: #a6adc8; margin-bottom: 8px; }
-  .file-list { font-size: 11px; max-height: 200px; overflow-y: auto; }
-  .file-item { display: flex; justify-content: space-between; align-items: center; padding: 4px 8px; border-radius: 4px; }
+  .file-panel-header {
+    display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;
+  }
+  .file-panel-header h3 { font-size: 12px; color: #a6adc8; }
+  .file-panel-header .file-count { font-size: 10px; color: #585b70; margin-left: 6px; }
+  .file-panel-header button {
+    padding: 2px 8px; font-size: 10px; border: 1px solid #313244;
+    background: #1e1e2e; color: #a6adc8; border-radius: 4px; cursor: pointer;
+  }
+  .file-panel-header button:hover { background: #313244; }
+
+  .file-section { margin-bottom: 6px; }
+  .file-section-label {
+    font-size: 10px; color: #585b70; text-transform: uppercase; letter-spacing: 0.5px;
+    padding: 4px 8px; border-bottom: 1px solid #313244; margin-bottom: 2px;
+  }
+  .file-list { font-size: 11px; max-height: 240px; overflow-y: auto; }
+  .file-list::-webkit-scrollbar { width: 4px; }
+  .file-list::-webkit-scrollbar-track { background: transparent; }
+  .file-list::-webkit-scrollbar-thumb { background: #45475a; border-radius: 2px; }
+
+  .file-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 8px; border-radius: 4px; transition: background 0.1s;
+  }
   .file-item:hover { background: #313244; }
-  .file-item .fname { color: #89b4fa; }
-  .file-item .fsize { color: #6c7086; }
-  .file-item a { color: #a6e3a1; text-decoration: none; font-size: 10px; margin-left: 8px; }
-  .file-item a:hover { text-decoration: underline; }
+  .file-icon { flex-shrink: 0; width: 16px; text-align: center; font-size: 12px; }
+  .file-name {
+    flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: #89b4fa; cursor: pointer;
+  }
+  .file-name:hover { color: #b4befe; text-decoration: underline; }
+  .file-meta { flex-shrink: 0; font-size: 10px; color: #585b70; white-space: nowrap; }
+  .file-actions { display: flex; gap: 2px; flex-shrink: 0; opacity: 0; transition: opacity 0.15s; }
+  .file-item:hover .file-actions { opacity: 1; }
+  .file-actions button {
+    background: none; border: none; cursor: pointer; padding: 2px 4px;
+    font-size: 12px; border-radius: 3px; color: #a6adc8; transition: all 0.1s;
+  }
+  .file-actions button:hover { background: #45475a; }
+  .file-actions button.dl:hover { color: #a6e3a1; }
+  .file-actions button.del:hover { color: #f38ba8; }
+
+  .file-empty { color: #585b70; padding: 12px 8px; text-align: center; font-size: 11px; }
 
   .info-bar { padding: 6px 16px; font-size: 11px; color: #6c7086; background: #181825; border-top: 1px solid #313244; }
 </style>
@@ -56,20 +106,24 @@
     <button onclick="doProjectInfo()" id="btnInfo">Project Info</button>
     <div class="sep"></div>
     <button onclick="doUpload()" id="btnUpload">Upload File</button>
-    <button onclick="doListFiles()" id="btnFiles">Files</button>
+    <button onclick="toggleFiles()" id="btnFiles">Files</button>
     <div class="spacer"></div>
     <button onclick="openVncPopout()" id="btnPopout" title="Open noVNC in browser">Pop-out</button>
   </div>
 
-  <input type="file" id="fileInput" style="display:none"
+  <input type="file" id="fileInput" style="display:none" multiple
          accept=".shp,.dbf,.shx,.prj,.geojson,.gpkg,.tif,.tiff,.csv,.qgz,.qgs,.zip,.gml,.json,.qml,.sld">
 
   <div class="canvas-wrapper" id="canvasWrapper" tabindex="0">
     <img id="liveImg" alt="QGIS Desktop" style="width:100%;display:block">
+    <div class="drop-overlay" id="dropOverlay"><span>Drop files to upload</span></div>
   </div>
 
   <div class="file-panel" id="filePanel">
-    <h3>Files in container</h3>
+    <div class="file-panel-header">
+      <h3>Files <span class="file-count" id="fileCount"></span></h3>
+      <button onclick="doListFiles()">Refresh</button>
+    </div>
     <div class="file-list" id="fileList"></div>
   </div>
 
@@ -80,6 +134,7 @@
 const VNC_URL    = 'http://localhost:6080/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000';
 const FRAME_URL  = 'http://localhost:8081/frame';
 const INPUT_URL  = 'http://localhost:8080/api/input';
+const API_BASE   = 'http://localhost:8080';
 const DISPLAY_W  = 1920;
 const DISPLAY_H  = 1080;
 
@@ -90,6 +145,31 @@ let liveTimer = null;
 let lastBlobUrl = null;
 let currentMode = 'live';  // 'live', 'screenshot', 'info'
 let useFetchFrames = true;
+let filePanelOpen = false;
+
+// ── File type icons (Unicode) ────────────────────────────────
+const FILE_ICONS = {
+  vector:  '\u{1F310}',  // globe
+  raster:  '\u{1F5BC}',  // framed picture
+  project: '\u{1F4C2}',  // open folder
+  table:   '\u{1F4CA}',  // bar chart
+  doc:     '\u{1F4C4}',  // page
+  style:   '\u{1F3A8}',  // palette
+  archive: '\u{1F4E6}',  // package
+  generic: '\u{1F4CE}',  // paperclip
+};
+
+function fileIcon(name) {
+  const ext = (name.match(/\.[^.]+$/) || [''])[0].toLowerCase();
+  if (['.gpkg','.geojson','.shp','.gml','.kml','.kmz','.gdb'].includes(ext)) return FILE_ICONS.vector;
+  if (['.tif','.tiff','.ecw','.jp2','.img','.asc','.dem'].includes(ext)) return FILE_ICONS.raster;
+  if (['.qgz','.qgs'].includes(ext)) return FILE_ICONS.project;
+  if (['.csv','.json','.jsonl','.xlsx','.xls','.ods','.dbf'].includes(ext)) return FILE_ICONS.table;
+  if (['.pdf','.txt','.md','.html'].includes(ext)) return FILE_ICONS.doc;
+  if (['.qml','.sld'].includes(ext)) return FILE_ICONS.style;
+  if (['.zip','.tar','.gz','.7z'].includes(ext)) return FILE_ICONS.archive;
+  return FILE_ICONS.generic;
+}
 
 // ── MCP Apps Protocol ────────────────────────────────────────
 function initMcpApp() {
@@ -225,7 +305,7 @@ function refreshAfterInput(delayMs) {
     }, delayMs || 150);
 }
 
-// ── X11 Input (mouse/keyboard → xdotool via REST) ───────────
+// ── X11 Input (mouse/keyboard -> xdotool via REST) ───────────
 function getDisplayCoords(e) {
     const img = document.getElementById('liveImg');
     if (!img) return null;
@@ -336,7 +416,7 @@ function setupInteraction() {
         let key = KEY_MAP[e.key] || null;
 
         if (!key) {
-            // Single printable character without modifiers → type it
+            // Single printable character without modifiers -> type it
             if (e.key.length === 1 && !e.ctrlKey && !e.altKey) {
                 sendInput({ type: 'type', text: e.key });
                 refreshAfterInput(150);
@@ -355,6 +435,44 @@ function setupInteraction() {
     wrapper.addEventListener('click', () => wrapper.focus());
 }
 
+// ── Drag-and-drop upload ─────────────────────────────────────
+function setupDragDrop() {
+    const body = document.body;
+    const overlay = document.getElementById('dropOverlay');
+    let dragCounter = 0;
+
+    body.addEventListener('dragenter', (e) => {
+        e.preventDefault();
+        dragCounter++;
+        if (e.dataTransfer.types.includes('Files')) {
+            overlay.classList.add('visible');
+        }
+    });
+
+    body.addEventListener('dragleave', (e) => {
+        e.preventDefault();
+        dragCounter--;
+        if (dragCounter <= 0) {
+            dragCounter = 0;
+            overlay.classList.remove('visible');
+        }
+    });
+
+    body.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'copy';
+    });
+
+    body.addEventListener('drop', async (e) => {
+        e.preventDefault();
+        dragCounter = 0;
+        overlay.classList.remove('visible');
+        const files = Array.from(e.dataTransfer.files);
+        if (files.length === 0) return;
+        await uploadFiles(files);
+    });
+}
+
 // ── Pop-out VNC ──────────────────────────────────────────────
 function openVncPopout() {
     window.open(VNC_URL, '_blank');
@@ -366,7 +484,6 @@ async function doScreenshot() {
     stopLive();
     setAllInactive();
     document.getElementById('btnScreenshot').classList.add('active');
-    hideFiles();
     currentMode = 'screenshot';
     setInfo('Capturing...');
     try {
@@ -389,7 +506,6 @@ async function doProjectInfo() {
     stopLive();
     setAllInactive();
     document.getElementById('btnInfo').classList.add('active');
-    hideFiles();
     currentMode = 'info';
     setInfo('Loading...');
     try {
@@ -398,7 +514,8 @@ async function doProjectInfo() {
         if (txt) {
             let info; try { info = JSON.parse(txt.text); } catch { info = txt.text; }
             document.getElementById('canvasWrapper').innerHTML =
-                '<pre>' + esc(typeof info === 'string' ? info : JSON.stringify(info, null, 2)) + '</pre>';
+                '<pre>' + esc(typeof info === 'string' ? info : JSON.stringify(info, null, 2)) + '</pre>' +
+                '<div class="drop-overlay" id="dropOverlay"><span>Drop files to upload</span></div>';
             setInfo('Project info — click image area to return to live mode');
             updateContext('Project info: ' + (typeof info === 'string' ? info : JSON.stringify(info)));
         }
@@ -408,60 +525,130 @@ async function doProjectInfo() {
 // ── File management ─────────────────────────────────────────
 function doUpload() { document.getElementById('fileInput').click(); }
 
-document.getElementById('fileInput').addEventListener('change', async function(e) {
-    const file = e.target.files[0];
-    if (!file) return;
-    setInfo('Uploading ' + file.name + '...');
-    try {
-        const reader = new FileReader();
-        const b64 = await new Promise((resolve, reject) => {
-            reader.onload = () => resolve(reader.result.split(',')[1]);
-            reader.onerror = reject;
-            reader.readAsDataURL(file);
-        });
-        const result = await callTool('upload_file', { name: file.name, content_base64: b64 });
-        const txt = result?.content?.find(c => c.type === 'text');
-        let info = {};
-        if (txt) { try { info = JSON.parse(txt.text); } catch {} }
-        if (info.success) {
-            setInfo('Uploaded: ' + file.name + ' (' + formatSize(info.size) + ')');
-            updateContext('File uploaded: ' + file.name);
-        } else {
-            setInfo('Upload failed: ' + (info.error || 'unknown error'));
+async function uploadFiles(files) {
+    const total = files.length;
+    let uploaded = 0;
+    for (const file of files) {
+        setInfo('Uploading ' + file.name + (total > 1 ? ' (' + (uploaded + 1) + '/' + total + ')' : '') + '...');
+        try {
+            const reader = new FileReader();
+            const b64 = await new Promise((resolve, reject) => {
+                reader.onload = () => resolve(reader.result.split(',')[1]);
+                reader.onerror = reject;
+                reader.readAsDataURL(file);
+            });
+            const result = await callTool('upload_file', { name: file.name, content_base64: b64 });
+            const txt = result?.content?.find(c => c.type === 'text');
+            let info = {};
+            if (txt) { try { info = JSON.parse(txt.text); } catch {} }
+            if (info.success) {
+                uploaded++;
+                updateContext('File uploaded: ' + file.name);
+            } else {
+                setInfo('Upload failed: ' + file.name + ' — ' + (info.error || 'unknown error'));
+            }
+        } catch (err) {
+            setInfo('Upload failed: ' + file.name + ' — ' + err.message);
         }
-    } catch (err) {
-        setInfo('Upload failed: ' + err.message);
     }
+    if (uploaded > 0) {
+        setInfo('Uploaded ' + uploaded + ' file(s)');
+        if (filePanelOpen) doListFiles();
+    }
+}
+
+document.getElementById('fileInput').addEventListener('change', async function(e) {
+    const files = Array.from(e.target.files);
+    if (files.length === 0) return;
+    await uploadFiles(files);
     e.target.value = '';
 });
+
+function toggleFiles() {
+    const panel = document.getElementById('filePanel');
+    if (filePanelOpen) {
+        panel.classList.remove('visible');
+        filePanelOpen = false;
+    } else {
+        doListFiles();
+    }
+}
 
 async function doListFiles() {
     setInfo('Loading files...');
     try {
         const result = await callTool('list_files', {});
         const txt = result?.content?.find(c => c.type === 'text');
-        if (txt) {
-            let data; try { data = JSON.parse(txt.text); } catch { data = { files: [] }; }
-            const panel = document.getElementById('filePanel');
-            const list = document.getElementById('fileList');
-            if (data.files.length === 0) {
-                list.innerHTML = '<div style="color:#6c7086;padding:8px">No files found</div>';
-            } else {
-                list.innerHTML = data.files.map(f =>
-                    '<div class="file-item">' +
-                    '<span class="fname">' + esc(f.name) + '</span>' +
-                    '<span><span class="fsize">' + formatSize(f.size) + '</span>' +
-                    '<a href="http://localhost:8080/api/files/' + encodeURIComponent(f.name) + '" target="_blank">dl</a>' +
-                    '</span></div>'
-                ).join('');
-            }
-            panel.classList.add('visible');
-            setInfo(data.count + ' file(s)');
+        if (!txt) return;
+        let data; try { data = JSON.parse(txt.text); } catch { data = { files: [] }; }
+
+        const panel = document.getElementById('filePanel');
+        const list = document.getElementById('fileList');
+        const countEl = document.getElementById('fileCount');
+
+        countEl.textContent = '(' + data.count + ')';
+
+        if (data.files.length === 0) {
+            list.innerHTML = '<div class="file-empty">No files — upload or export to get started</div>';
+        } else {
+            list.innerHTML = data.files.map(f => renderFileItem(f, true)).join('');
         }
+
+        panel.classList.add('visible');
+        filePanelOpen = true;
+        setInfo(data.count + ' file(s)');
     } catch (e) { setInfo('Failed: ' + e.message); }
 }
 
-function hideFiles() { document.getElementById('filePanel').classList.remove('visible'); }
+function renderFileItem(f, canDelete) {
+    const icon = fileIcon(f.name);
+    const dlUrl = API_BASE + '/api/files/' + encodeURIComponent(f.name);
+    const modDate = f.modified ? new Date(f.modified * 1000).toLocaleDateString() : '';
+    const deleteBtn = canDelete
+        ? '<button class="del" onclick="doDeleteFile(\'' + esc(f.path).replace(/'/g, "\\'") + '\',\'' + esc(f.name).replace(/'/g, "\\'") + '\')" title="Delete">\u2716</button>'
+        : '';
+    return '<div class="file-item">' +
+        '<span class="file-icon">' + icon + '</span>' +
+        '<span class="file-name" onclick="doDownloadFile(\'' + esc(f.name).replace(/'/g, "\\'") + '\')" title="' + esc(f.path) + '">' + esc(f.name) + '</span>' +
+        '<span class="file-meta">' + formatSize(f.size) + (modDate ? ' &middot; ' + modDate : '') + '</span>' +
+        '<span class="file-actions">' +
+            '<button class="dl" onclick="doDownloadFile(\'' + esc(f.name).replace(/'/g, "\\'") + '\')" title="Download">\u2B07</button>' +
+            deleteBtn +
+        '</span>' +
+        '</div>';
+}
+
+function doDownloadFile(name) {
+    const url = API_BASE + '/api/files/' + encodeURIComponent(name);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    a.target = '_blank';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setInfo('Downloading ' + name);
+}
+
+async function doDeleteFile(path, name) {
+    if (!confirm('Delete ' + name + '?')) return;
+    setInfo('Deleting ' + name + '...');
+    try {
+        const result = await callTool('delete_file', { path: path });
+        const txt = result?.content?.find(c => c.type === 'text');
+        let info = {};
+        if (txt) { try { info = JSON.parse(txt.text); } catch {} }
+        if (info.success) {
+            setInfo('Deleted: ' + name);
+            updateContext('File deleted: ' + name);
+            doListFiles();
+        } else {
+            setInfo('Delete failed: ' + (info.error || 'unknown error'));
+        }
+    } catch (err) {
+        setInfo('Delete failed: ' + err.message);
+    }
+}
 
 // ── Return to live mode on canvas click (when in screenshot/info mode) ──
 document.getElementById('canvasWrapper').addEventListener('click', function() {
@@ -469,7 +656,8 @@ document.getElementById('canvasWrapper').addEventListener('click', function() {
         // Restore canvas structure if it was replaced by <pre>
         const wrapper = document.getElementById('canvasWrapper');
         if (!document.getElementById('liveImg')) {
-            wrapper.innerHTML = '<img id="liveImg" alt="QGIS Desktop" style="width:100%;display:block">';
+            wrapper.innerHTML = '<img id="liveImg" alt="QGIS Desktop" style="width:100%;display:block">' +
+                '<div class="drop-overlay" id="dropOverlay"><span>Drop files to upload</span></div>';
         }
         startLive();
     }
@@ -482,7 +670,7 @@ function setAllInactive() {
     });
 }
 function setInfo(t) { document.getElementById('infoBar').textContent = t; }
-function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function formatSize(bytes) {
     if (bytes < 1024) return bytes + ' B';
     if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
@@ -491,6 +679,7 @@ function formatSize(bytes) {
 
 // ── Init ─────────────────────────────────────────────────────
 setupInteraction();
+setupDragDrop();
 initMcpApp();
 </script>
 </body>

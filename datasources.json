@@ -91,6 +91,7 @@
       "type": "wfs",
       "url": "https://data.geopf.fr/wfs/ows",
       "params": {"typename": "BDTOPO_V3:batiment", "srsname": "EPSG:4326"},
+      "native_crs": "EPSG:2154",
       "description": "Tous les bâtiments de la BD TOPO v3"
     },
     {
@@ -100,6 +101,7 @@
       "type": "wfs",
       "url": "https://data.geopf.fr/wfs/ows",
       "params": {"typename": "BDTOPO_V3:troncon_de_route", "srsname": "EPSG:4326"},
+      "native_crs": "EPSG:2154",
       "description": "Segments routiers de la BD TOPO v3"
     },
     {
@@ -109,6 +111,7 @@
       "type": "wfs",
       "url": "https://data.geopf.fr/wfs/ows",
       "params": {"typename": "BDTOPO_V3:commune", "srsname": "EPSG:4326"},
+      "native_crs": "EPSG:2154",
       "description": "Communes françaises de la BD TOPO v3"
     },
     {
@@ -118,6 +121,7 @@
       "type": "wfs",
       "url": "https://data.geopf.fr/wfs/ows",
       "params": {"typename": "BDTOPO_V3:cours_d_eau", "srsname": "EPSG:4326"},
+      "native_crs": "EPSG:2154",
       "description": "Rivières et ruisseaux de la BD TOPO v3"
     },
     {
@@ -127,6 +131,7 @@
       "type": "wfs",
       "url": "https://data.geopf.fr/wfs/ows",
       "params": {"typename": "BDTOPO_V3:zone_de_vegetation", "srsname": "EPSG:4326"},
+      "native_crs": "EPSG:2154",
       "description": "Zones de végétation de la BD TOPO v3"
     },
     {
@@ -136,6 +141,7 @@
       "type": "wfs",
       "url": "https://data.geopf.fr/wfs/ows",
       "params": {"typename": "BDTOPO_V3:troncon_de_voie_ferree", "srsname": "EPSG:4326"},
+      "native_crs": "EPSG:2154",
       "description": "Réseau ferroviaire de la BD TOPO v3"
     },
     {
@@ -145,6 +151,7 @@
       "type": "wfs",
       "url": "https://data.geopf.fr/wfs/ows",
       "params": {"typename": "BDTOPO_V3:surface_hydrographique", "srsname": "EPSG:4326"},
+      "native_crs": "EPSG:2154",
       "description": "Plans d'eau et surfaces hydrographiques"
     },
     {
@@ -173,6 +180,165 @@
       "url": "https://data.geopf.fr/altimetrie",
       "params": {},
       "description": "Calcul d'altitude pour un point ou un profil. REST API."
+    },
+
+    {"_comment": "── Environnement ──────────────────────────────"},
+    {"_comment": "Natura 2000 (SIC/ZPS) and ZNIEFF (1/2) WFS sources removed: typenames appear in GetCapabilities but GetFeature returns 'Feature type unknown'. INPN services unavailable (migration + cyberattaque 2025)."},
+
+    {
+      "id": "corine_land_cover",
+      "name": "Corine Land Cover 2018",
+      "category": "environment",
+      "type": "wms",
+      "url": "https://data.geopf.fr/wms-r",
+      "params": {"layers": "LANDCOVER.CLC18_FR", "format": "image/png", "crs": "EPSG:3857"},
+      "description": "Occupation du sol Corine Land Cover 2018 (Europe)"
+    },
+
+    {"_comment": "── Administrative supplémentaire ─────────────"},
+
+    {
+      "id": "admin_express_communes",
+      "name": "Admin Express — Communes",
+      "category": "administrative",
+      "type": "wfs",
+      "url": "https://data.geopf.fr/wfs/ows",
+      "params": {"typename": "ADMINEXPRESS-COG-CARTO.LATEST:commune", "srsname": "EPSG:4326"},
+      "native_crs": "EPSG:2154",
+      "description": "Limites communales Admin Express COG (IGN)"
+    },
+    {
+      "id": "admin_express_departements",
+      "name": "Admin Express — Départements",
+      "category": "administrative",
+      "type": "wfs",
+      "url": "https://data.geopf.fr/wfs/ows",
+      "params": {"typename": "ADMINEXPRESS-COG-CARTO.LATEST:departement", "srsname": "EPSG:4326"},
+      "native_crs": "EPSG:2154",
+      "description": "Limites départementales Admin Express COG (IGN)"
+    },
+    {
+      "id": "admin_express_regions",
+      "name": "Admin Express — Régions",
+      "category": "administrative",
+      "type": "wfs",
+      "url": "https://data.geopf.fr/wfs/ows",
+      "params": {"typename": "ADMINEXPRESS-COG-CARTO.LATEST:region", "srsname": "EPSG:4326"},
+      "native_crs": "EPSG:2154",
+      "description": "Limites régionales Admin Express COG (IGN)"
+    },
+    {
+      "id": "rpg",
+      "name": "RPG (Parcelles agricoles)",
+      "category": "administrative",
+      "type": "wfs",
+      "url": "https://data.geopf.fr/wfs/ows",
+      "params": {"typename": "RPG.LATEST:parcelles_graphiques", "srsname": "EPSG:4326"},
+      "native_crs": "EPSG:2154",
+      "description": "Registre Parcellaire Graphique — parcelles agricoles et cultures"
+    },
+
+    {"_comment": "── BD TOPO supplémentaire ────────────────────"},
+
+    {
+      "id": "bdtopo_poi",
+      "name": "Points d'Intérêt (BD TOPO)",
+      "category": "topography",
+      "type": "wfs",
+      "url": "https://data.geopf.fr/wfs/ows",
+      "params": {"typename": "BDTOPO_V3:construction_ponctuelle", "srsname": "EPSG:4326"},
+      "native_crs": "EPSG:2154",
+      "description": "Constructions ponctuelles (clochers, châteaux d'eau, etc.)"
+    },
+    {
+      "id": "bdtopo_lieu_dit",
+      "name": "Lieux-dits (BD TOPO)",
+      "category": "topography",
+      "type": "wfs",
+      "url": "https://data.geopf.fr/wfs/ows",
+      "params": {"typename": "BDTOPO_V3:lieu_dit_non_habite", "srsname": "EPSG:4326"},
+      "native_crs": "EPSG:2154",
+      "description": "Lieux-dits non habités de la BD TOPO v3"
+    },
+    {
+      "id": "bdtopo_surface_activite",
+      "name": "Surfaces d'activité (BD TOPO)",
+      "category": "topography",
+      "type": "wfs",
+      "url": "https://data.geopf.fr/wfs/ows",
+      "params": {"typename": "BDTOPO_V3:zone_d_activite_ou_d_interet", "srsname": "EPSG:4326"},
+      "native_crs": "EPSG:2154",
+      "description": "Zones d'activité ou d'intérêt (ZI, ZAC, campus, etc.)"
+    },
+    {
+      "id": "bdtopo_equipement_transport",
+      "name": "Équipements de transport (BD TOPO)",
+      "category": "topography",
+      "type": "wfs",
+      "url": "https://data.geopf.fr/wfs/ows",
+      "params": {"typename": "BDTOPO_V3:equipement_de_transport", "srsname": "EPSG:4326"},
+      "native_crs": "EPSG:2154",
+      "description": "Gares, aéroports, ports, parkings (BD TOPO v3)"
+    },
+
+    {"_comment": "── Basemaps internationales ───────────────────"},
+
+    {
+      "id": "esri_world_imagery",
+      "name": "Esri World Imagery",
+      "category": "imagery",
+      "type": "xyz",
+      "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+      "params": {"zmin": "0", "zmax": "19"},
+      "description": "Imagerie satellite mondiale haute résolution (Esri)"
+    },
+    {
+      "id": "esri_world_topo",
+      "name": "Esri World Topographic",
+      "category": "basemap",
+      "type": "xyz",
+      "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
+      "params": {"zmin": "0", "zmax": "19"},
+      "description": "Carte topographique mondiale (Esri)"
+    },
+    {
+      "id": "stamen_terrain",
+      "name": "Stadia Stamen Terrain",
+      "category": "basemap",
+      "type": "xyz",
+      "url": "https://tiles.stadiamaps.com/tiles/stamen_terrain/{z}/{x}/{y}.png",
+      "params": {"zmin": "0", "zmax": "18"},
+      "description": "Fond de carte terrain avec relief ombré (Stamen/Stadia)"
+    },
+    {
+      "id": "ign_scan25",
+      "name": "Scan 25 (Cartes topo IGN)",
+      "category": "basemap",
+      "type": "wms",
+      "url": "https://data.geopf.fr/wms-r",
+      "params": {"layers": "GEOGRAPHICALGRIDSYSTEMS.MAPS", "format": "image/jpeg", "crs": "EPSG:3857"},
+      "description": "Cartes topographiques IGN au 1:25000 (Scan 25)"
+    },
+
+    {"_comment": "── API supplémentaires ────────────────────────"},
+
+    {
+      "id": "geo_api_communes",
+      "name": "Geo API Communes",
+      "category": "api",
+      "type": "api",
+      "url": "https://geo.api.gouv.fr/communes",
+      "params": {},
+      "description": "API officielle des communes françaises. Endpoint: /communes?nom=...&fields=nom,code,population,centre,contour"
+    },
+    {
+      "id": "dvf_api",
+      "name": "DVF (Valeurs Foncières)",
+      "category": "api",
+      "type": "api",
+      "url": "https://api.cquest.org/dvf",
+      "params": {},
+      "description": "Demandes de Valeurs Foncières (transactions immobilières). Endpoint: ?code_commune=30189&annee_mutation=2023"
     }
   ]
 }

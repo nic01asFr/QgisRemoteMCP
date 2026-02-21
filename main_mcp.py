@@ -28,6 +28,7 @@ from starlette.routing import Route
 
 SOCKET_PATH = "/tmp/qgis_bridge.sock"
 SOCKET_TIMEOUT = 60
+SOCKET_TIMEOUT_LONG = 300  # for WFS downloads via ogr2ogr
 SKILLS_DIR = Path("/app/skills")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8100"))
 VNC_PORT = int(os.environ.get("QGIS_VNC_PORT", "6080"))
@@ -48,13 +49,14 @@ sessions: Dict[str, Dict[str, Any]] = {}
 
 # ── QGIS Bridge client ───────────────────────────────────────────
 
-def qgis_command(action: str, params: dict = None) -> dict:
+def qgis_command(action: str, params: dict = None, timeout: int = None) -> dict:
     """Send a command to QGIS bridge via UNIX socket."""
     if not os.path.exists(SOCKET_PATH):
         return {"error": "QGIS bridge not ready. QGIS may still be starting up."}
+    effective_timeout = timeout or SOCKET_TIMEOUT
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(SOCKET_TIMEOUT)
+        sock.settimeout(effective_timeout)
         sock.connect(SOCKET_PATH)
         request = json.dumps({"action": action, "params": params or {}})
         sock.sendall(request.encode())
@@ -68,7 +70,7 @@ def qgis_command(action: str, params: dict = None) -> dict:
         sock.close()
         return json.loads(data.decode())
     except socket.timeout:
-        return {"error": f"QGIS command timed out after {SOCKET_TIMEOUT}s."}
+        return {"error": f"QGIS command timed out after {effective_timeout}s."}
     except ConnectionRefusedError:
         return {"error": "Cannot connect to QGIS. The application may be restarting."}
     except Exception as e:
@@ -120,7 +122,7 @@ TOOLS = [
     },
     {
         "name": "execute_python",
-        "description": "Execute Python/PyQGIS code inside the running QGIS instance. The script has access to qgis.core.*, iface, processing.run(), project = QgsProject.instance(), canvas = iface.mapCanvas(). Store return values in the `result` dict.",
+        "description": "Execute Python/PyQGIS code inside the running QGIS instance. The script has access to qgis.core.*, iface, processing.run(), project = QgsProject.instance(), canvas = iface.mapCanvas(). A `helpers` module is available with ready-made functions: helpers.geocode(addr), helpers.add_wfs(url, typename, bbox), helpers.add_wms(url, layers), helpers.add_wmts(url, layers), helpers.add_xyz(url, name), helpers.zoom_to(target), helpers.create_point_layer(name, points), helpers.load_catalog_source(id), helpers.bbox_from_canvas(), helpers.search_commune(name), helpers.get_elevation(lon, lat). Store return values in the `result` dict. Read skill://helpers for full reference.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -335,7 +337,7 @@ TOOLS = [
     },
     {
         "name": "download_file",
-        "description": "Download a file from the QGIS container. Returns base64 content for files < 5MB, or a download URL for larger files. Restricted to /data/ and /projects/.",
+        "description": "Download a file from the QGIS container. Returns base64 content for files < 5MB, or a download URL for larger files. Restricted to /data/.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -346,12 +348,11 @@ TOOLS = [
     },
     {
         "name": "list_files",
-        "description": "List files in the QGIS container's /data/ and /projects/ directories.",
+        "description": "List files in the QGIS container's /data/ directory.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "pattern": {"type": "string", "description": "Glob pattern (default '*')", "default": "*"},
-                "directories": {"type": "array", "items": {"type": "string"}, "description": "Directories to scan", "default": ["/data", "/projects"]}
+                "pattern": {"type": "string", "description": "Glob pattern (default '*')", "default": "*"}
             },
             "required": []
         }
@@ -380,6 +381,17 @@ TOOLS = [
             "required": []
         }
     },
+    {
+        "name": "delete_file",
+        "description": "Delete a file from the QGIS container. Restricted to /data/.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path (e.g. '/data/export.gpkg')"}
+            },
+            "required": ["path"]
+        }
+    },
     # ── Data catalog tools ───────────────────────────────────────
     {
         "name": "list_datasources",
@@ -402,6 +414,38 @@ TOOLS = [
                 "id": {"type": "string", "description": "Source ID from catalog (e.g. 'osm_xyz', 'bdtopo_batiments')"},
                 "name": {"type": "string", "description": "Override display name", "default": ""},
                 "bbox": {"type": "array", "items": {"type": "number"}, "description": "[xmin, ymin, xmax, ymax] in EPSG:4326 — required for WFS sources"}
+            },
+            "required": ["id"]
+        }
+    },
+    # ── Study zone & smart load ─────────────────────────────────
+    {
+        "name": "set_study_zone",
+        "description": "Define the geographic study area. CALL THIS FIRST before loading WFS data. Geocodes the target, stores bbox in project variables (EPSG:4326 + EPSG:2154), and zooms the canvas. Subsequent smart_load calls auto-use this zone.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Place name, address, or commune. Examples: 'Montpellier', 'Gare de Lyon, Paris', 'Sete'"},
+                "buffer_km": {"type": "number", "description": "Buffer around point in km (default 2)", "default": 2}
+            },
+            "required": ["target"]
+        }
+    },
+    {
+        "name": "get_study_zone",
+        "description": "Get the current study zone (name, bbox in EPSG:4326 and EPSG:2154). Returns the zone set by set_study_zone.",
+        "inputSchema": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+        "name": "smart_load",
+        "description": "Load data from the catalog. WFS sources are downloaded as local GeoPackage via ogr2ogr (automatic pagination, R-tree spatial index, fast for Processing). Raster sources (WMS/WMTS/XYZ) stream as usual. Use set_study_zone first to define the area, or provide a bbox.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Catalog source ID (e.g. 'bdtopo_batiments', 'osm_xyz'). Use list_datasources to see available IDs."},
+                "bbox": {"type": "array", "items": {"type": "number"}, "description": "Optional [xmin,ymin,xmax,ymax] in EPSG:4326. Auto from study zone if not provided."},
+                "max_features": {"type": "integer", "description": "Max features for WFS download (default 10000)", "default": 10000},
+                "name": {"type": "string", "description": "Override display name", "default": ""}
             },
             "required": ["id"]
         }
@@ -449,6 +493,8 @@ RESOURCES = [
     {"uri": "skill://cartography", "name": "Cartography Guide", "description": "Symbology, labels, print layouts.", "mimeType": "text/plain"},
     {"uri": "skill://external-services", "name": "External Services", "description": "Vision services integration (Moondream, SAMGeo3, DepthPro).", "mimeType": "text/plain"},
     {"uri": "skill://data-sources", "name": "Data Sources", "description": "French national datasets reference.", "mimeType": "text/plain"},
+    {"uri": "skill://helpers", "name": "Python Helpers", "description": "Ready-made Python functions for execute_python (geocode, add_wfs, zoom_to, etc.).", "mimeType": "text/plain"},
+    {"uri": "skill://smart-loading", "name": "Smart Loading Pipeline", "description": "Guided data loading: set_study_zone + smart_load (ogr2ogr + GeoPackage). CRS handling, caching, best practices.", "mimeType": "text/plain"},
     {"uri": "skill://qgis-status", "name": "QGIS Status", "description": "Current QGIS instance status.", "mimeType": "text/plain"},
 ]
 
@@ -458,6 +504,8 @@ SKILL_MAP = {
     "skill://cartography": "cartography",
     "skill://external-services": "external_services",
     "skill://data-sources": "data_sources",
+    "skill://helpers": "helpers",
+    "skill://smart-loading": "smart_loading",
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -478,6 +526,14 @@ PROMPTS = [
         "description": "Template for pedestrian crossing audit using street-level imagery.",
         "arguments": [
             {"name": "commune", "description": "Commune name", "required": False},
+        ]
+    },
+    {
+        "name": "workflow_donnees",
+        "description": "Guided workflow for loading and analyzing French geospatial data. Uses smart pipeline (set_study_zone + smart_load) for reliable, fast data loading.",
+        "arguments": [
+            {"name": "zone", "description": "Study area (commune, address, or region)", "required": True},
+            {"name": "theme", "description": "Analysis theme: urbanisme, environnement, transport, agriculture, risques", "required": False},
         ]
     },
 ]
@@ -513,19 +569,52 @@ Services vision : Moondream ({MOONDREAM_URL}), SAMGeo3 ({SAMGEO3_URL}), DepthPro
 7. Couche résultats + style
 8. Rapport PDF"""}]
 
+    elif name == "workflow_donnees":
+        zone = arguments.get("zone", "[à préciser]")
+        theme = arguments.get("theme", "general")
+        theme_layers = {
+            "urbanisme": "bdtopo_batiments, bdtopo_routes, ign_cadastre",
+            "environnement": "bdtopo_hydrographie, bdtopo_vegetation, corine_land_cover",
+            "transport": "bdtopo_routes, bdtopo_voie_ferree, bdtopo_equipement_transport",
+            "agriculture": "rpg, bdtopo_hydrographie, corine_land_cover",
+            "risques": "bdtopo_hydro_surfaces, bdtopo_batiments, ign_dem",
+            "general": "bdtopo_batiments, bdtopo_routes, bdtopo_communes",
+        }
+        layers = theme_layers.get(theme, theme_layers["general"])
+        return [{"type": "text", "text": f"""Workflow données — {zone} ({theme})
+
+Utilise le pipeline smart_load pour charger les données de manière fiable.
+Les WFS sont téléchargés en GeoPackage local (index spatial, Processing rapide).
+
+1. set_study_zone(target="{zone}")
+   → Géocode, stocke bbox 4326+2154, zoom canvas
+
+2. smart_load(id="osm_xyz") — fond de carte
+
+3. Données thématiques ({theme}):
+   {chr(10).join(f'   smart_load(id="{lid.strip()}")' for lid in layers.split(','))}
+
+4. get_screenshot — vérifier que les données sont au bon endroit
+
+5. Analyse Processing adaptée au thème :
+   - urbanisme : densité bâti (creategrid + countpointsinpolygon), distances routes
+   - environnement : buffer cours d'eau, intersection végétation
+   - transport : réseau routier (v.clean), zones de desserte (service area)
+   - agriculture : surfaces par culture (dissolve + area), proximité eau
+   - risques : zones inondables (buffer hydro), bâtiments exposés (intersection)
+
+6. Mise en forme : set_layer_style (graduated/categorized), labels
+
+7. Export : print layout (titre, légende, échelle, sources) → export_pdf
+
+Skills : skill://smart-loading, skill://processing, skill://cartography, skill://data-sources"""}]
+
     return [{"type": "text", "text": f"Unknown prompt: {name}"}]
 
 
 # ══════════════════════════════════════════════════════════════════
 # TOOL EXECUTION
 # ══════════════════════════════════════════════════════════════════
-
-VISUAL_TOOLS = {
-    "execute_python", "new_project", "open_project", "add_layer", "remove_layer",
-    "run_processing", "zoom_to", "mouse_click", "mouse_scroll", "key_press", "mouse_drag",
-    "add_from_catalog", "set_layer_style", "set_layer_visibility",
-}
-
 
 def _auto_screenshot() -> list:
     """Take a screenshot and return it as an MCP image content block.
@@ -537,255 +626,401 @@ def _auto_screenshot() -> list:
     return []
 
 
+def _text(response, **kwargs) -> list:
+    """Format a bridge response as MCP text content."""
+    return [{"type": "text", "text": json.dumps(response, default=str, **kwargs)}]
+
+
+def _error(message: str) -> dict:
+    """Return an MCP error response."""
+    return {"content": [{"type": "text", "text": message}], "isError": True}
+
+
+def _validate_required(arguments: dict, *fields) -> Optional[str]:
+    """Return error message if any required field is missing/empty, else None."""
+    missing = [f for f in fields if not arguments.get(f)]
+    if missing:
+        return f"Missing required parameter(s): {', '.join(missing)}"
+    return None
+
+
+# ── Tool handlers ─────────────────────────────────────────────
+# Each function takes (arguments: dict) and returns an MCP result dict.
+
+def _tool_qgis_desktop_ui(arguments: dict) -> dict:
+    vnc_url = f"http://{VNC_HOST}:{VNC_PORT}/vnc.html?autoconnect=true&resize=scale"
+    return {"content": [{"type": "text", "text": f"QGIS Desktop interface opened.\nVNC URL: {vnc_url}\nThe interactive view is displayed above."}]}
+
+
+def _tool_execute_python(arguments: dict) -> dict:
+    err = _validate_required(arguments, "code")
+    if err:
+        return _error(err)
+    user_timeout = arguments.get("timeout", 60)
+    response = qgis_command("execute_python",
+                            {"code": arguments["code"], "timeout": user_timeout},
+                            timeout=user_timeout + 30)
+    return {"content": _text(response, indent=2) + _auto_screenshot()}
+
+
+def _tool_get_screenshot(arguments: dict) -> dict:
+    width = arguments.get("width", 1280)
+    height = arguments.get("height", 720)
+    response = qgis_command("screenshot", {"width": width, "height": height, "format": "png"})
+    if "error" in response:
+        return {"content": _text(response)}
+    return {"content": [{"type": "image", "data": response.get("image_base64", ""), "mimeType": "image/png"}]}
+
+
+def _tool_get_project_info(arguments: dict) -> dict:
+    response = qgis_command("get_project_info")
+    return {"content": _text(response, indent=2)}
+
+
+def _tool_new_project(arguments: dict) -> dict:
+    title = arguments.get("title", "New Project")
+    crs = arguments.get("crs", "EPSG:2154")
+    response = qgis_command("new_project", {"title": title, "crs": crs})
+    return {"content": _text(response) + _auto_screenshot()}
+
+
+def _tool_open_project(arguments: dict) -> dict:
+    err = _validate_required(arguments, "path")
+    if err:
+        return _error(err)
+    response = qgis_command("open_project", {"path": arguments["path"]})
+    return {"content": _text(response) + _auto_screenshot()}
+
+
+def _tool_save_project(arguments: dict) -> dict:
+    response = qgis_command("save_project", {"path": arguments.get("path", "")})
+    return {"content": _text(response)}
+
+
+def _tool_add_layer(arguments: dict) -> dict:
+    err = _validate_required(arguments, "uri")
+    if err:
+        return _error(err)
+    uri = arguments["uri"]
+    layer_name = arguments.get("name", "layer")
+    layer_type = arguments.get("layer_type", "vector")
+    provider = arguments.get("provider", "")
+    if layer_type == "wfs":
+        response = qgis_command("add_wfs_layer", {"url": uri, "typename": layer_name, "name": layer_name})
+    elif layer_type == "wms":
+        response = qgis_command("add_wms_layer", {"url": uri, "layers": layer_name, "name": layer_name})
+    elif layer_type == "raster":
+        response = qgis_command("add_raster_layer", {"uri": uri, "name": layer_name, "provider": provider or "gdal"})
+    else:
+        response = qgis_command("add_vector_layer", {"uri": uri, "name": layer_name, "provider": provider or "ogr"})
+    return {"content": _text(response) + _auto_screenshot()}
+
+
+def _tool_remove_layer(arguments: dict) -> dict:
+    err = _validate_required(arguments, "layer_id")
+    if err:
+        return _error(err)
+    response = qgis_command("remove_layer", {"layer_id": arguments["layer_id"]})
+    return {"content": _text(response) + _auto_screenshot()}
+
+
+def _tool_get_features(arguments: dict) -> dict:
+    err = _validate_required(arguments, "layer_id")
+    if err:
+        return _error(err)
+    response = qgis_command("get_features", {
+        "layer_id": arguments["layer_id"],
+        "filter": arguments.get("filter", ""),
+        "limit": arguments.get("limit", 100),
+        "include_geometry": arguments.get("include_geometry", True),
+    })
+    return {"content": _text(response, indent=2)}
+
+
+def _tool_run_processing(arguments: dict) -> dict:
+    err = _validate_required(arguments, "algorithm", "parameters")
+    if err:
+        return _error(err)
+    response = qgis_command("run_processing", {
+        "algorithm": arguments["algorithm"],
+        "parameters": arguments["parameters"],
+    })
+    return {"content": _text(response, indent=2) + _auto_screenshot()}
+
+
+def _tool_search_algorithms(arguments: dict) -> dict:
+    response = qgis_command("list_algorithms", {
+        "search": arguments.get("search", ""),
+        "provider": arguments.get("provider", ""),
+        "limit": arguments.get("limit", 20),
+    })
+    return {"content": _text(response, indent=2)}
+
+
+def _tool_zoom_to(arguments: dict) -> dict:
+    params = {}
+    if arguments.get("extent"):
+        params["extent"] = arguments["extent"]
+    elif arguments.get("layer_id"):
+        params["layer_id"] = arguments["layer_id"]
+    response = qgis_command("zoom_to_extent", params)
+    return {"content": _text(response) + _auto_screenshot()}
+
+
+def _tool_export_pdf(arguments: dict) -> dict:
+    err = _validate_required(arguments, "layout")
+    if err:
+        return _error(err)
+    params = {"layout": arguments["layout"]}
+    if arguments.get("output_path"):
+        params["output_path"] = arguments["output_path"]
+    response = qgis_command("export_pdf", params)
+    content = [{"type": "text", "text": json.dumps({k: v for k, v in response.items() if k != "content_base64"}, default=str)}]
+    if response.get("content_base64"):
+        content.append({
+            "type": "resource",
+            "resource": {
+                "uri": f"file://{response.get('path', 'export.pdf')}",
+                "mimeType": response.get("mime_type", "application/pdf"),
+                "blob": response["content_base64"],
+            }
+        })
+    return {"content": content}
+
+
+def _tool_mouse_click(arguments: dict) -> dict:
+    err = _validate_required(arguments, "x", "y")
+    if err:
+        return _error(err)
+    response = qgis_command("mouse_click", {
+        "x": arguments["x"], "y": arguments["y"],
+        "button": arguments.get("button", 1), "double": arguments.get("double", False)
+    })
+    return {"content": _text(response) + _auto_screenshot()}
+
+
+def _tool_mouse_scroll(arguments: dict) -> dict:
+    err = _validate_required(arguments, "x", "y")
+    if err:
+        return _error(err)
+    response = qgis_command("mouse_scroll", {
+        "x": arguments["x"], "y": arguments["y"],
+        "direction": arguments.get("direction", "down"), "clicks": arguments.get("clicks", 3)
+    })
+    return {"content": _text(response) + _auto_screenshot()}
+
+
+def _tool_key_press(arguments: dict) -> dict:
+    err = _validate_required(arguments, "key")
+    if err:
+        return _error(err)
+    response = qgis_command("key_press", {"key": arguments["key"]})
+    return {"content": _text(response) + _auto_screenshot()}
+
+
+def _tool_mouse_drag(arguments: dict) -> dict:
+    err = _validate_required(arguments, "x1", "y1", "x2", "y2")
+    if err:
+        return _error(err)
+    response = qgis_command("mouse_drag", {
+        "x1": arguments["x1"], "y1": arguments["y1"],
+        "x2": arguments["x2"], "y2": arguments["y2"],
+        "button": arguments.get("button", 1)
+    })
+    return {"content": _text(response) + _auto_screenshot()}
+
+
+def _tool_upload_file(arguments: dict) -> dict:
+    err = _validate_required(arguments, "name", "content_base64")
+    if err:
+        return _error(err)
+    response = qgis_command("write_file", {
+        "name": arguments["name"],
+        "content_base64": arguments["content_base64"],
+    })
+    return {"content": _text(response)}
+
+
+def _tool_download_file(arguments: dict) -> dict:
+    err = _validate_required(arguments, "path")
+    if err:
+        return _error(err)
+    response = qgis_command("read_file", {"path": arguments["path"]})
+    if "error" in response:
+        return {"content": _text(response)}
+    content = [{"type": "text", "text": json.dumps({k: v for k, v in response.items() if k != "content_base64"}, default=str)}]
+    if response.get("content_base64"):
+        content.append({
+            "type": "resource",
+            "resource": {
+                "uri": f"file://{response.get('path', '')}",
+                "mimeType": response.get("mime_type", "application/octet-stream"),
+                "blob": response["content_base64"],
+            }
+        })
+    return {"content": content}
+
+
+def _tool_list_files(arguments: dict) -> dict:
+    response = qgis_command("list_files", {"pattern": arguments.get("pattern", "*")})
+    return {"content": _text(response, indent=2)}
+
+
+def _tool_export_layer(arguments: dict) -> dict:
+    err = _validate_required(arguments, "layer_id")
+    if err:
+        return _error(err)
+    response = qgis_command("export_layer", {
+        "layer_id": arguments["layer_id"],
+        "format": arguments.get("format", "GPKG"),
+        "name": arguments.get("name", ""),
+    })
+    return {"content": _text(response)}
+
+
+def _tool_download_project(arguments: dict) -> dict:
+    response = qgis_command("download_project", {"name": arguments.get("name", "project")})
+    return {"content": _text(response)}
+
+
+def _tool_delete_file(arguments: dict) -> dict:
+    err = _validate_required(arguments, "path")
+    if err:
+        return _error(err)
+    response = qgis_command("delete_file", {"path": arguments["path"]})
+    return {"content": _text(response)}
+
+
+def _tool_list_datasources(arguments: dict) -> dict:
+    response = qgis_command("list_datasources", {
+        "category": arguments.get("category", ""),
+        "search": arguments.get("search", ""),
+    })
+    return {"content": _text(response, indent=2)}
+
+
+def _tool_add_from_catalog(arguments: dict) -> dict:
+    err = _validate_required(arguments, "id")
+    if err:
+        return _error(err)
+    params = {"id": arguments["id"]}
+    if arguments.get("name"):
+        params["name"] = arguments["name"]
+    if arguments.get("bbox"):
+        params["bbox"] = arguments["bbox"]
+    response = qgis_command("add_from_catalog", params)
+    content = _text(response)
+    if response.get("success"):
+        content += _auto_screenshot()
+    return {"content": content}
+
+
+def _tool_set_study_zone(arguments: dict) -> dict:
+    err = _validate_required(arguments, "target")
+    if err:
+        return _error(err)
+    params = {"target": arguments["target"]}
+    if arguments.get("buffer_km"):
+        params["buffer_km"] = arguments["buffer_km"]
+    response = qgis_command("set_study_zone", params)
+    return {"content": _text(response, indent=2) + _auto_screenshot()}
+
+
+def _tool_get_study_zone(arguments: dict) -> dict:
+    response = qgis_command("get_study_zone", {})
+    return {"content": _text(response, indent=2)}
+
+
+def _tool_smart_load(arguments: dict) -> dict:
+    err = _validate_required(arguments, "id")
+    if err:
+        return _error(err)
+    params = {"id": arguments["id"]}
+    if arguments.get("bbox"):
+        params["bbox"] = arguments["bbox"]
+    if arguments.get("max_features"):
+        params["max_features"] = arguments["max_features"]
+    if arguments.get("name"):
+        params["name"] = arguments["name"]
+    response = qgis_command("smart_load", params, timeout=SOCKET_TIMEOUT_LONG)
+    content = _text(response, indent=2)
+    if not response.get("error"):
+        content += _auto_screenshot()
+    return {"content": content}
+
+
+def _tool_set_layer_style(arguments: dict) -> dict:
+    err = _validate_required(arguments, "layer_id")
+    if err:
+        return _error(err)
+    style_type = arguments.get("style_type", "single")
+    if style_type in ("categorized", "graduated") and not arguments.get("field"):
+        return _error(f"'{style_type}' style requires a 'field' parameter")
+    response = qgis_command("set_layer_style", {
+        "layer_id": arguments["layer_id"],
+        "style_type": style_type,
+        "color": arguments.get("color", "65,105,225,180"),
+        "field": arguments.get("field", ""),
+        "categories": arguments.get("categories", {}),
+        "ranges": arguments.get("ranges", []),
+    })
+    return {"content": _text(response) + _auto_screenshot()}
+
+
+def _tool_set_layer_visibility(arguments: dict) -> dict:
+    err = _validate_required(arguments, "layer_id")
+    if err:
+        return _error(err)
+    response = qgis_command("set_layer_visibility", {
+        "layer_id": arguments["layer_id"],
+        "visible": arguments.get("visible", True),
+    })
+    return {"content": _text(response) + _auto_screenshot()}
+
+
+# ── Dispatch table ────────────────────────────────────────────
+
+TOOL_HANDLERS = {
+    "qgis_desktop_ui": _tool_qgis_desktop_ui,
+    "execute_python": _tool_execute_python,
+    "get_screenshot": _tool_get_screenshot,
+    "get_project_info": _tool_get_project_info,
+    "new_project": _tool_new_project,
+    "open_project": _tool_open_project,
+    "save_project": _tool_save_project,
+    "add_layer": _tool_add_layer,
+    "remove_layer": _tool_remove_layer,
+    "get_features": _tool_get_features,
+    "run_processing": _tool_run_processing,
+    "search_algorithms": _tool_search_algorithms,
+    "zoom_to": _tool_zoom_to,
+    "export_pdf": _tool_export_pdf,
+    "mouse_click": _tool_mouse_click,
+    "mouse_scroll": _tool_mouse_scroll,
+    "key_press": _tool_key_press,
+    "mouse_drag": _tool_mouse_drag,
+    "upload_file": _tool_upload_file,
+    "download_file": _tool_download_file,
+    "list_files": _tool_list_files,
+    "export_layer": _tool_export_layer,
+    "download_project": _tool_download_project,
+    "delete_file": _tool_delete_file,
+    "list_datasources": _tool_list_datasources,
+    "add_from_catalog": _tool_add_from_catalog,
+    "set_study_zone": _tool_set_study_zone,
+    "get_study_zone": _tool_get_study_zone,
+    "smart_load": _tool_smart_load,
+    "set_layer_style": _tool_set_layer_style,
+    "set_layer_visibility": _tool_set_layer_visibility,
+}
+
+
 def execute_tool(name: str, arguments: dict) -> dict:
-    """Execute a tool and return MCP content result.
-    Visual-modifying tools automatically append a screenshot."""
-
-    if name == "qgis_desktop_ui":
-        vnc_url = f"http://{VNC_HOST}:{VNC_PORT}/vnc.html?autoconnect=true&resize=scale"
-        return {"content": [{"type": "text", "text": f"QGIS Desktop interface opened.\nVNC URL: {vnc_url}\nThe interactive view is displayed above."}]}
-
-    elif name == "execute_python":
-        code = arguments.get("code", "")
-        response = qgis_command("execute_python", {"code": code})
-        content = [{"type": "text", "text": json.dumps(response, indent=2, default=str)}]
-        content += _auto_screenshot()
-        return {"content": content}
-
-    elif name == "get_screenshot":
-        width = arguments.get("width", 1280)
-        height = arguments.get("height", 720)
-        response = qgis_command("screenshot", {"width": width, "height": height, "format": "png"})
-        if "error" in response:
-            return {"content": [{"type": "text", "text": json.dumps(response)}]}
-        image_b64 = response.get("image_base64", "")
-        return {"content": [{"type": "image", "data": image_b64, "mimeType": "image/png"}]}
-
-    elif name == "get_project_info":
-        response = qgis_command("get_project_info")
-        return {"content": [{"type": "text", "text": json.dumps(response, indent=2, default=str)}]}
-
-    elif name == "new_project":
-        title = arguments.get("title", "New Project")
-        crs = arguments.get("crs", "EPSG:2154")
-        response = qgis_command("new_project", {"title": title, "crs": crs})
-        content = [{"type": "text", "text": json.dumps(response)}]
-        content += _auto_screenshot()
-        return {"content": content}
-
-    elif name == "open_project":
-        response = qgis_command("open_project", {"path": arguments.get("path", "")})
-        content = [{"type": "text", "text": json.dumps(response)}]
-        content += _auto_screenshot()
-        return {"content": content}
-
-    elif name == "save_project":
-        response = qgis_command("save_project", {"path": arguments.get("path", "")})
-        return {"content": [{"type": "text", "text": json.dumps(response)}]}
-
-    elif name == "add_layer":
-        uri = arguments.get("uri", "")
-        layer_name = arguments.get("name", "layer")
-        layer_type = arguments.get("layer_type", "vector")
-        provider = arguments.get("provider", "")
-        if layer_type == "wfs":
-            response = qgis_command("add_wfs_layer", {"url": uri, "typename": layer_name, "name": layer_name})
-        elif layer_type == "wms":
-            response = qgis_command("add_wms_layer", {"url": uri, "layers": layer_name, "name": layer_name})
-        elif layer_type == "raster":
-            response = qgis_command("add_raster_layer", {"uri": uri, "name": layer_name, "provider": provider or "gdal"})
-        else:
-            response = qgis_command("add_vector_layer", {"uri": uri, "name": layer_name, "provider": provider or "ogr"})
-        content = [{"type": "text", "text": json.dumps(response)}]
-        content += _auto_screenshot()
-        return {"content": content}
-
-    elif name == "remove_layer":
-        response = qgis_command("remove_layer", {"layer_id": arguments.get("layer_id", "")})
-        content = [{"type": "text", "text": json.dumps(response)}]
-        content += _auto_screenshot()
-        return {"content": content}
-
-    elif name == "get_features":
-        response = qgis_command("get_features", {
-            "layer_id": arguments.get("layer_id", ""),
-            "filter": arguments.get("filter", ""),
-            "limit": arguments.get("limit", 100),
-            "include_geometry": arguments.get("include_geometry", True),
-        })
-        return {"content": [{"type": "text", "text": json.dumps(response, indent=2, default=str)}]}
-
-    elif name == "run_processing":
-        response = qgis_command("run_processing", {
-            "algorithm": arguments.get("algorithm", ""),
-            "parameters": arguments.get("parameters", {}),
-        })
-        content = [{"type": "text", "text": json.dumps(response, indent=2, default=str)}]
-        content += _auto_screenshot()
-        return {"content": content}
-
-    elif name == "search_algorithms":
-        response = qgis_command("list_algorithms", {
-            "search": arguments.get("search", ""),
-            "provider": arguments.get("provider", ""),
-            "limit": arguments.get("limit", 20),
-        })
-        return {"content": [{"type": "text", "text": json.dumps(response, indent=2)}]}
-
-    elif name == "zoom_to":
-        params = {}
-        if arguments.get("extent"):
-            params["extent"] = arguments["extent"]
-        elif arguments.get("layer_id"):
-            params["layer_id"] = arguments["layer_id"]
-        response = qgis_command("zoom_to_extent", params)
-        content = [{"type": "text", "text": json.dumps(response)}]
-        content += _auto_screenshot()
-        return {"content": content}
-
-    elif name == "export_pdf":
-        params = {"layout": arguments.get("layout", "")}
-        if arguments.get("output_path"):
-            params["output_path"] = arguments["output_path"]
-        response = qgis_command("export_pdf", params)
-        content = [{"type": "text", "text": json.dumps({k: v for k, v in response.items() if k != "content_base64"}, default=str)}]
-        if response.get("content_base64"):
-            content.append({
-                "type": "resource",
-                "resource": {
-                    "uri": f"file://{response.get('path', 'export.pdf')}",
-                    "mimeType": response.get("mime_type", "application/pdf"),
-                    "blob": response["content_base64"],
-                }
-            })
-        return {"content": content}
-
-    elif name == "mouse_click":
-        response = qgis_command("mouse_click", {
-            "x": arguments.get("x", 0), "y": arguments.get("y", 0),
-            "button": arguments.get("button", 1), "double": arguments.get("double", False)
-        })
-        content = [{"type": "text", "text": json.dumps(response)}]
-        content += _auto_screenshot()
-        return {"content": content}
-
-    elif name == "mouse_scroll":
-        response = qgis_command("mouse_scroll", {
-            "x": arguments.get("x", 0), "y": arguments.get("y", 0),
-            "direction": arguments.get("direction", "down"), "clicks": arguments.get("clicks", 3)
-        })
-        content = [{"type": "text", "text": json.dumps(response)}]
-        content += _auto_screenshot()
-        return {"content": content}
-
-    elif name == "key_press":
-        response = qgis_command("key_press", {"key": arguments.get("key", "")})
-        content = [{"type": "text", "text": json.dumps(response)}]
-        content += _auto_screenshot()
-        return {"content": content}
-
-    elif name == "mouse_drag":
-        response = qgis_command("mouse_drag", {
-            "x1": arguments.get("x1", 0), "y1": arguments.get("y1", 0),
-            "x2": arguments.get("x2", 0), "y2": arguments.get("y2", 0),
-            "button": arguments.get("button", 1)
-        })
-        content = [{"type": "text", "text": json.dumps(response)}]
-        content += _auto_screenshot()
-        return {"content": content}
-
-    # ── File management tools ────────────────────────────────────
-
-    elif name == "upload_file":
-        response = qgis_command("write_file", {
-            "name": arguments.get("name", ""),
-            "content_base64": arguments.get("content_base64", ""),
-        })
-        return {"content": [{"type": "text", "text": json.dumps(response, default=str)}]}
-
-    elif name == "download_file":
-        response = qgis_command("read_file", {"path": arguments.get("path", "")})
-        if "error" in response:
-            return {"content": [{"type": "text", "text": json.dumps(response)}]}
-        content = [{"type": "text", "text": json.dumps({k: v for k, v in response.items() if k != "content_base64"}, default=str)}]
-        if response.get("content_base64"):
-            content.append({
-                "type": "resource",
-                "resource": {
-                    "uri": f"file://{response.get('path', '')}",
-                    "mimeType": response.get("mime_type", "application/octet-stream"),
-                    "blob": response["content_base64"],
-                }
-            })
-        return {"content": content}
-
-    elif name == "list_files":
-        response = qgis_command("list_files", {
-            "pattern": arguments.get("pattern", "*"),
-            "directories": arguments.get("directories", ["/data", "/projects"]),
-        })
-        return {"content": [{"type": "text", "text": json.dumps(response, indent=2, default=str)}]}
-
-    elif name == "export_layer":
-        response = qgis_command("export_layer", {
-            "layer_id": arguments.get("layer_id", ""),
-            "format": arguments.get("format", "GPKG"),
-            "name": arguments.get("name", ""),
-        })
-        return {"content": [{"type": "text", "text": json.dumps(response, default=str)}]}
-
-    elif name == "download_project":
-        response = qgis_command("download_project", {
-            "name": arguments.get("name", "project"),
-        })
-        return {"content": [{"type": "text", "text": json.dumps(response, default=str)}]}
-
-    # ── Data catalog tools ───────────────────────────────────────
-
-    elif name == "list_datasources":
-        response = qgis_command("list_datasources", {
-            "category": arguments.get("category", ""),
-            "search": arguments.get("search", ""),
-        })
-        return {"content": [{"type": "text", "text": json.dumps(response, indent=2, default=str)}]}
-
-    elif name == "add_from_catalog":
-        params = {"id": arguments.get("id", "")}
-        if arguments.get("name"):
-            params["name"] = arguments["name"]
-        if arguments.get("bbox"):
-            params["bbox"] = arguments["bbox"]
-        response = qgis_command("add_from_catalog", params)
-        content = [{"type": "text", "text": json.dumps(response, default=str)}]
-        if response.get("success"):
-            content += _auto_screenshot()
-        return {"content": content}
-
-    # ── Style tools ──────────────────────────────────────────────
-
-    elif name == "set_layer_style":
-        response = qgis_command("set_layer_style", {
-            "layer_id": arguments.get("layer_id", ""),
-            "style_type": arguments.get("style_type", "single"),
-            "color": arguments.get("color", "65,105,225,180"),
-            "field": arguments.get("field", ""),
-            "categories": arguments.get("categories", {}),
-            "ranges": arguments.get("ranges", []),
-        })
-        content = [{"type": "text", "text": json.dumps(response, default=str)}]
-        content += _auto_screenshot()
-        return {"content": content}
-
-    elif name == "set_layer_visibility":
-        response = qgis_command("set_layer_visibility", {
-            "layer_id": arguments.get("layer_id", ""),
-            "visible": arguments.get("visible", True),
-        })
-        content = [{"type": "text", "text": json.dumps(response, default=str)}]
-        content += _auto_screenshot()
-        return {"content": content}
-
-    return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}], "isError": True}
+    """Execute a tool via dispatch table. Returns MCP content result."""
+    handler = TOOL_HANDLERS.get(name)
+    if not handler:
+        return _error(f"Unknown tool: {name}")
+    return handler(arguments)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -799,8 +1034,17 @@ SERVER_INFO = {
 
 INSTRUCTIONS = f"""You control a live QGIS Desktop instance. Every modifying tool automatically returns a screenshot so you always see the result.
 
+## Recommended workflow for data analysis
+1. **set_study_zone** — Define where: "Montpellier", "Sete", "Gare de Lyon, Paris". Stores bbox in project variables.
+2. **smart_load** — Load data by catalog ID (e.g. 'bdtopo_batiments'). WFS data is downloaded as local GeoPackage with spatial index (fast for Processing). Rasters stream as usual.
+3. **Act** — run_processing, execute_python on local layers (no network delays)
+4. **Verify** — get_screenshot, describe what you see
+5. **Deliver** — export_layer, export_pdf, download_project
+
+IMPORTANT: Always call set_study_zone BEFORE smart_load for WFS sources. Downloaded WFS layers are in EPSG:2154 (Lambert 93) with R-tree spatial index. Results are cached 24h in /data/cache/.
+
 ## Core tools
-- **execute_python** — Run PyQGIS code. Access: iface, project, canvas, processing, QgsProject, QgsVectorLayer, etc. Store outputs in `result` dict.
+- **execute_python** — Run PyQGIS code. Access: iface, project, canvas, processing, QgsProject, QgsVectorLayer, etc. Store outputs in `result` dict. A `helpers` module is injected with ready-made functions (see below).
 - **get_screenshot** — Capture current QGIS desktop (1280x720 PNG). Already included automatically after modifying tools.
 - **add_layer** — Add vector/raster/WFS/WMS layers by URI.
 - **run_processing** — Execute any of 1000+ Processing algorithms (native:buffer, gdal:warp, grass7:v.clean, etc.).
@@ -808,16 +1052,35 @@ INSTRUCTIONS = f"""You control a live QGIS Desktop instance. Every modifying too
 - **mouse_click / mouse_scroll / key_press / mouse_drag** — Direct GUI interaction via xdotool (coordinates in 1920x1080 display pixels).
 - **qgis_desktop_ui** — Open interactive QGIS view in conversation.
 
+## Python helpers (available in execute_python as `helpers`)
+Use these instead of writing boilerplate. Read skill://helpers for full docs and examples.
+- `helpers.geocode(address)` — Geocode French address (BAN API) → {{lon, lat, label, score, bbox}}
+- `helpers.reverse_geocode(lon, lat)` — Reverse geocode
+- `helpers.search_commune(name)` — Search commune info (Geo API)
+- `helpers.get_elevation(lon, lat)` — Altitude from IGN
+- `helpers.add_wfs(url, typename, bbox, name)` — Add WFS layer (auto bbox from canvas if omitted)
+- `helpers.add_wms(url, layers, name)` — Add WMS layer
+- `helpers.add_wmts(url, layers, name)` — Add WMTS tiled layer
+- `helpers.add_xyz(url, name)` — Add XYZ tile layer
+- `helpers.create_point_layer(name, points)` — Memory layer from list of dicts
+- `helpers.zoom_to(target)` — Zoom to bbox, point dict, or address string
+- `helpers.load_catalog_source(id, bbox)` — Load source from datasources.json by ID
+- `helpers.bbox_from_canvas()` — Get current canvas extent in EPSG:4326
+- `helpers.set_study_zone(target, buffer_km)` — Define study zone, store in project variables
+- `helpers.get_study_zone()` — Read stored study zone (name, bbox_4326, bbox_2154)
+- `helpers.download_wfs_ogr(url, typename, bbox_4326)` — Download WFS as local GPKG via ogr2ogr
+
 ## Data catalog (pre-configured French national sources — free, no API key)
 - **list_datasources** — Browse available sources: IGN orthophotos, Plan IGN, BD TOPO (buildings, roads, rivers, communes...), OSM, cadastre, DEM, BAN geocoding, Panoramax. Filter by category or search.
 - **add_from_catalog** — Add a source by ID (e.g. `osm_xyz`, `bdtopo_batiments`). WFS requires a `bbox` [xmin,ymin,xmax,ymax] in EPSG:4326. Raster sources (WMS/WMTS/XYZ) work without bbox.
 
 ## File management
 - **upload_file** — Upload a file (base64) into the QGIS container /data/. Supports shapefiles, GeoJSON, GPKG, CSV, TIFF, project files.
-- **download_file** — Download a file from /data/ or /projects/. Returns base64 for files <5MB, or a download URL for larger files.
-- **list_files** — List files in /data/ and /projects/.
+- **download_file** — Download a file from /data/. Returns base64 for files <5MB, or a download URL for larger files.
+- **list_files** — List files in /data/.
 - **export_layer** — Export a vector layer to GPKG, GeoJSON, Shapefile, or CSV. Saved to /data/.
 - **download_project** — Save the current project as .qgz to /data/.
+- **delete_file** — Delete a file from /data/.
 - **export_pdf** — Export a print layout to PDF. Returns base64 for files <5MB.
 
 ## Styling
@@ -839,6 +1102,9 @@ INSTRUCTIONS = f"""You control a live QGIS Desktop instance. Every modifying too
 - Default CRS is EPSG:2154 (Lambert 93, France). Change via new_project or execute_python if needed.
 - Use skill:// resources for PyQGIS patterns, Processing algorithms, cartography best practices, and data source reference.
 - Files in /data/ are accessible via REST API at http://localhost:8080/api/files/{{filename}}.
+- Python code is syntax-validated before execution — malformed code returns a clean error instead of crashing QGIS.
+- The project is auto-saved to /data/.autosave.qgz before risky operations (execute_python, run_processing, remove_layer, new_project).
+- execute_python has a 30s timeout by default. Pass `timeout` param to adjust.
 
 ## External vision services
 - Moondream (image understanding): {MOONDREAM_URL}

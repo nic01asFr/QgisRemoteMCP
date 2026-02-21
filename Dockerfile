@@ -24,9 +24,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV DISPLAY=:99
 ENV QT_QPA_PLATFORM=xcb
 
-# Software OpenGL (Mesa llvmpipe — works everywhere without GPU)
-ENV LIBGL_ALWAYS_SOFTWARE=1
-ENV GALLIUM_DRIVER=llvmpipe
+# Rendering: GPU or CPU fallback — configured dynamically in entrypoint.sh
+# (LIBGL_ALWAYS_SOFTWARE and GALLIUM_DRIVER set at runtime based on GPU detection)
 ENV LP_NUM_THREADS=4
 
 # Force X11 session (prevent Wayland detection by x11vnc)
@@ -46,7 +45,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fluxbox \
     x11-xserver-utils \
     xdotool \
-    # OpenGL software rendering
+    # OpenGL rendering (Mesa software fallback + NVIDIA runtime support)
     mesa-utils \
     libgl1-mesa-dri \
     libgl1 \
@@ -54,6 +53,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglapi-mesa \
     libegl1 \
     libglu1-mesa \
+    libglvnd0 \
+    libglx-mesa0 \
     # Networking
     websockify \
     curl \
@@ -102,7 +103,7 @@ RUN pip3 install --break-system-packages --no-cache-dir --ignore-installed -r /t
     && rm /tmp/requirements.txt
 
 # ── Directory structure ──────────────────────────────────────────
-RUN mkdir -p /app /data /projects /tmp/qgis \
+RUN mkdir -p /app /data /tmp/qgis \
     && mkdir -p -m 0700 /run/user/0 \
     && mkdir -p \
     /var/log/supervisor \
@@ -120,9 +121,9 @@ COPY main_mcp.py /app/
 COPY qgis_app.html /app/
 COPY maximize_qgis.sh /app/
 COPY datasources.json /app/
+COPY setup_qgis_connections.py /app/
 COPY src/ /app/src/
 COPY skills/ /app/skills/
-COPY projects/ /projects/
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY entrypoint.sh /app/
 

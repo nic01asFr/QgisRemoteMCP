@@ -42,14 +42,15 @@ app.add_middleware(
 )
 
 
-def send_command(action: str, params: dict = None) -> dict:
+def send_command(action: str, params: dict = None, timeout: int = None) -> dict:
     """Send a command to QGIS bridge via UNIX socket."""
     if not os.path.exists(SOCKET_PATH):
         raise HTTPException(503, "QGIS bridge not ready (socket not found)")
 
+    effective_timeout = timeout or SOCKET_TIMEOUT
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(SOCKET_TIMEOUT)
+        sock.settimeout(effective_timeout)
         sock.connect(SOCKET_PATH)
 
         request = json.dumps({"action": action, "params": params or {}})
@@ -68,7 +69,7 @@ def send_command(action: str, params: dict = None) -> dict:
         return json.loads(data.decode())
 
     except socket.timeout:
-        raise HTTPException(504, f"QGIS bridge timeout ({SOCKET_TIMEOUT}s)")
+        raise HTTPException(504, f"QGIS bridge timeout ({effective_timeout}s)")
     except ConnectionRefusedError:
         raise HTTPException(503, "QGIS bridge connection refused")
     except Exception as e:
@@ -125,7 +126,10 @@ async def execute_python(body: dict):
     code = body.get("code", "")
     if not code:
         raise HTTPException(400, "Missing 'code' field")
-    return send_command("execute_python", {"code": code})
+    user_timeout = body.get("timeout", 30)
+    return send_command("execute_python",
+                        {"code": code, "timeout": user_timeout},
+                        timeout=user_timeout + 30)
 
 
 @app.post("/api/processing")
@@ -167,10 +171,10 @@ def _validate_filename(name: str) -> str:
 
 @app.get("/api/files")
 async def list_files(directory: str = "/data", pattern: str = "*"):
-    """List files in /data/ or /projects/."""
-    allowed = ["/data", "/projects"]
+    """List files in /data/."""
+    allowed = ["/data"]
     if directory not in allowed:
-        raise HTTPException(400, f"Directory must be one of: {allowed}")
+        raise HTTPException(400, f"Directory must be /data")
     if not os.path.isdir(directory):
         return {"files": [], "count": 0}
     results = []
