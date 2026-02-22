@@ -14,8 +14,9 @@ An AI assistant controls a live QGIS Desktop — loads data, runs analysis, prod
 - **30+ Pre-configured French Datasets** — BD TOPO, Admin Express, RPG, IGN orthophotos, cadastre, DEM, Corine Land Cover, OSM, Esri. No API key needed.
 - **Full QGIS Desktop** — Live GUI via noVNC. AI and user work on the same instance simultaneously.
 - **1000+ Processing Algorithms** — Native, GDAL, GRASS, SAGA. All accessible via MCP tools.
+- **Automated Recipes** — Pre-built workflows (density analysis, flood risk, land cover, coastal pressure). One command: `run_recipe("risque_inondation", zone="Nimes")`.
+- **Multi-format Export** — PDF layouts, interactive Leaflet maps (standard, flood analysis, temporal), QField mobile packages, Grist collaborative documents.
 - **MCP App** — Interactive QGIS view embedded directly in the conversation (VNC viewer, file upload, keyboard/mouse forwarding).
-- **Guided Workflows** — Theme-based prompts (urbanisme, environnement, transport, agriculture, risques) with step-by-step instructions.
 
 ## Quick Start
 
@@ -71,7 +72,7 @@ The core innovation: a structured pipeline that replaces unreliable live WFS con
 4. smart_load(id="bdtopo_routes")          # Roads (download GPKG)
 5. get_screenshot                           # Verify
 6. run_processing / execute_python          # Analyze
-7. export_pdf                               # Deliver
+7. export_pdf / export_web_map / ...        # Deliver (PDF, HTML, QField, Grist)
 ```
 
 ### Performance (Montpellier, ~10 km bbox)
@@ -147,6 +148,80 @@ All sources are free (IGN open data since July 2021). No API key needed.
 | `panoramax` | Street-level imagery API |
 | `ign_altimetrie` | Elevation API |
 
+## Recipes
+
+Pre-built workflow templates that automate complete analyses — from data loading to styled map export.
+
+| ID | Name | Description |
+|----|------|-------------|
+| `densite_bati` | Building Density | Hex grid density analysis with graduated symbology |
+| `urbanisme_general` | Urban Overview | Buildings, roads, vegetation, hydrology with categorized styles |
+| `risque_inondation` | Flood Risk | Flood zones, building exposure, buffer analysis + interactive web map |
+| `occupation_sol` | Land Cover | Corine Land Cover with categorized symbology |
+| `pression_fonciere_cotiere` | Coastal Land Pressure | DVF transactions 2020-2024, coastal bands + temporal web map |
+
+### Usage
+
+```
+# Automated (all steps in one shot)
+run_recipe(id="risque_inondation", zone="Nimes")
+
+# Manual (follow steps one by one)
+get_recipe(id="densite_bati", zone="Montpellier")
+→ Returns step-by-step instructions to execute individually
+```
+
+## Export Formats
+
+### PDF Layout
+
+Print-ready PDF via QGIS print layouts with pre-built templates (A3 landscape, A4 portrait). Includes title, legend, scalebar, north arrow, and data sources.
+
+```
+apply_layout_template(template="a3_landscape", title="Flood Risk — Nimes")
+export_pdf(layout="a3_landscape")
+```
+
+### Interactive Web Map
+
+Leaflet HTML files with embedded GeoJSON data. Three specialized templates:
+
+| Template | Use case | Features |
+|----------|----------|----------|
+| **Standard** | General map | Layer toggle, popup, legend, basemap selector |
+| **Flood** | Flood risk analysis | Water height slider, building exposure stats, animation |
+| **Temporal** | Time series | Year slider, per-band statistics, trend arrows, animated playback |
+
+### QField Mobile Package
+
+Portable ZIP ready for [QField](https://qfield.org/) mobile data collection:
+
+- `.qgz` project with relative GPKG sources
+- All vector layers materialized as individual GeoPackages
+- Editable **Observations** layer with form widgets (dropdowns, date picker, camera, free text)
+
+```
+export_qfield(project_name="terrain_survey")
+→ /data/terrain_survey_qfield.zip
+```
+
+### Grist Document
+
+Converts QGIS project layers or any HTML map into a [Grist](https://www.getgrist.com/) collaborative document (`.grist`):
+
+- **From project** — Exports visible vector layers as Grist tables with a custom map widget
+- **From HTML** — Universal converter: takes any HTML file containing GeoJSON (flood maps, temporal maps, qgis2web exports) and creates a Grist document with data in tables and the original interactive map as a Grist custom widget
+
+Detected column types: `Choice` (colored dropdowns), `Date` (epoch timestamps), `Ref` (cross-table references). Form-like tables automatically get a Grist Form page.
+
+```
+# From QGIS project
+export_grist(title="Urban Analysis")
+
+# From any HTML with GeoJSON
+export_grist(html_path="/data/flood_map_nimes.html")
+```
+
 ## MCP Tools
 
 ### Smart Loading
@@ -180,17 +255,35 @@ All sources are free (IGN open data since July 2021). No API key needed.
 |------|-------------|
 | `set_layer_style` | Apply single color, categorized, or graduated symbology. |
 | `set_layer_visibility` | Show/hide layers. |
+| `apply_layout_template` | Apply a print layout template (A3 landscape, A4 portrait). |
+| `list_layout_templates` | List available layout templates. |
 
-### Files & Export
+### Recipes
+| Tool | Description |
+|------|-------------|
+| `list_recipes` | Browse available workflow recipes. |
+| `get_recipe` | Get recipe details with parameter substitution. |
+| `run_recipe` | Execute a complete recipe automatically (all steps in one shot). |
+
+### Export
+| Tool | Description |
+|------|-------------|
+| `export_pdf` | Export print layout to PDF. |
+| `export_web_map` | Export visible layers as interactive Leaflet HTML. |
+| `export_flood_map` | Interactive flood analysis HTML (water height slider, building exposure). |
+| `export_temporal_map` | Interactive temporal analysis HTML (year slider, animated playback). |
+| `export_qfield` | QField-ready ZIP package (.qgz + GPKGs + editable Observations layer). |
+| `export_grist` | Grist document from project layers or from any HTML with GeoJSON. |
+| `export_layer` | Export vector layer to GPKG, GeoJSON, Shapefile, CSV. |
+
+### Files
 | Tool | Description |
 |------|-------------|
 | `upload_file` | Upload file (shapefile, GeoJSON, GPKG, CSV, TIFF, project). |
 | `download_file` | Download file from /data/. |
 | `list_files` | List files in /data/. |
-| `export_layer` | Export vector layer to GPKG, GeoJSON, Shapefile, CSV. |
-| `download_project` | Save project as .qgz. |
 | `delete_file` | Delete file from /data/. |
-| `export_pdf` | Export print layout to PDF. |
+| `download_project` | Save project as .qgz. |
 
 ### GUI Interaction
 | Tool | Description |
@@ -211,12 +304,13 @@ Reference documents that guide the AI assistant's expertise:
 
 | Resource URI | Content |
 |-------------|---------|
-| `skill://smart-loading` | **Smart Loading Pipeline** — set_study_zone + smart_load, CRS handling, caching, themes |
+| `skill://smart-loading` | Smart Loading Pipeline — set_study_zone + smart_load, CRS handling, caching |
 | `skill://pyqgis` | PyQGIS scripting patterns & API usage |
 | `skill://processing` | Processing algorithms guide (native, GDAL, GRASS) |
 | `skill://cartography` | Symbology, labels, print layouts, PDF export |
 | `skill://helpers` | Ready-made Python helpers (geocode, add_wfs, zoom_to, create_point_layer...) |
 | `skill://data-sources` | French national datasets reference |
+| `skill://recipes` | Workflow recipes reference |
 | `skill://external-services` | Vision services integration (Moondream, SAMGeo3, DepthPro) |
 | `skill://qgis-status` | Live QGIS instance status |
 
@@ -236,7 +330,9 @@ An interactive QGIS view embedded directly in the Claude conversation:
 - **Keyboard/mouse forwarding** — Full interaction without leaving the chat
 - **MJPEG fallback** — Lightweight stream for quick visual feedback
 
-## Example Workflow
+## Example Workflows
+
+### Manual: Urban Analysis
 
 ```
 User: "Analyse l'urbanisation autour de Montpellier"
@@ -244,34 +340,49 @@ User: "Analyse l'urbanisation autour de Montpellier"
 AI: [set_study_zone("Montpellier")]
     → Geocodes, stores bbox, zooms canvas
 
-    [smart_load("osm_xyz")]
-    → Adds OpenStreetMap basemap
+    [smart_load("osm_xyz")]              → OpenStreetMap basemap
+    [smart_load("bdtopo_batiments")]     → 10,000 buildings as GPKG
+    [smart_load("bdtopo_routes")]        → 5,000 road segments
 
+    [execute_python → density grid]      → 500m hex grid, graduated symbology
+    [apply_layout_template("a3_landscape", title="Densité bâtie — Montpellier")]
+    [export_pdf]                         → /data/densite_montpellier.pdf
+```
+
+### Automated: Flood Risk with Recipe
+
+```
+User: "Analyse le risque inondation à Nîmes"
+
+AI: [run_recipe("risque_inondation", zone="Nimes")]
+    → Executes all steps automatically:
+      1. set_study_zone("Nimes")
+      2. smart_load basemap + buildings + flood zones
+      3. Buffer analysis (50m, 100m, 200m from flood zones)
+      4. Building exposure classification
+      5. Graduated symbology
+    → Returns screenshot + statistics
+
+    [export_flood_map(include_fields=["nature","usage","height"])]
+    → Interactive HTML with water height slider
+
+    [export_grist(html_path="/data/flood_map_nimes.html")]
+    → Grist document with editable tables + embedded map widget
+```
+
+### Field Survey: QField Export
+
+```
+User: "Prépare un relevé terrain pour la commune de Sète"
+
+AI: [set_study_zone("Sète")]
     [smart_load("bdtopo_batiments")]
-    → Downloads 10,000 buildings as GPKG (12 MB, EPSG:2154)
-    → Screenshot shows buildings overlaid on OSM
-
     [smart_load("bdtopo_routes")]
-    → Downloads 5,000 road segments (9 MB)
+    [set_layer_style("Batiments", type="categorized", field="usage")]
 
-    [execute_python → building density grid analysis]
-    → Creates 500m grid, counts buildings per cell
-    → Graduated symbology from green (low) to red (high)
-    → Screenshot shows density heatmap
-
-    [execute_python → create print layout]
-    → Title, legend, scalebar, north arrow, sources
-
-    [export_pdf → /data/urbanisation_montpellier.pdf]
-    → Returns PDF to user
-
-User: [opens noVNC, adjusts map view, adds annotations]
-      "Ajoute les parcelles agricoles autour"
-
-AI: [smart_load("rpg")]
-    → Downloads agricultural parcels
-    → Styles by crop type (categorized)
-    → Screenshot shows urban/agriculture boundary
+    [export_qfield(project_name="releve_sete")]
+    → ZIP with .qgz + GPKGs + Observations layer (camera, dropdowns, date picker)
+    → Ready to load on QField mobile app
 ```
 
 ## External Vision Services
@@ -360,30 +471,43 @@ curl -X POST http://localhost:8080/api/execute \
 
 ```
 BigQgisMCP/
-├── main_mcp.py             # MCP Server (tools, resources, prompts)
+├── main_mcp.py             # MCP Server (40 tools, 10 resources, 3 prompts)
 ├── datasources.json        # 30+ pre-configured data sources catalog
 ├── qgis_app.html           # MCP App (interactive QGIS in conversation)
 ├── src/
-│   ├── qgis_bridge.py      # Runs inside QGIS (UNIX socket bridge)
+│   ├── qgis_bridge.py      # Runs inside QGIS (UNIX socket bridge, 45 actions)
 │   ├── qgis_helpers.py     # Python helpers (geocode, smart loading, etc.)
 │   ├── api_server.py       # FastAPI REST API
 │   └── stream_server.py    # MJPEG stream
-├── skills/
-│   ├── smart_loading.md    # Smart Data Loading Pipeline
-│   ├── pyqgis.md           # PyQGIS scripting reference
-│   ├── processing.md       # Processing algorithms guide
-│   ├── cartography.md      # Styling & print layouts
-│   ├── helpers.md          # Python helpers reference
-│   ├── data_sources.md     # French national datasets
-│   └── external_services.md # Vision services integration
+├── skills/                 # MCP Resources (AI skill documents)
+│   ├── smart_loading.md
+│   ├── pyqgis.md
+│   ├── processing.md
+│   ├── cartography.md
+│   ├── helpers.md
+│   ├── data_sources.md
+│   └── external_services.md
+├── recipes/                # Workflow recipes (JSON)
+│   ├── densite_bati.json
+│   ├── urbanisme_general.json
+│   ├── risque_inondation.json
+│   ├── occupation_sol.json
+│   └── pression_fonciere_cotiere.json
+├── templates/              # Print layout templates (.qpt)
+│   ├── a3_landscape.qpt
+│   ├── a4_portrait.qpt
+│   └── web/                # Leaflet HTML templates
+│       ├── leaflet_template.html
+│       ├── leaflet_flood_template.html
+│       └── leaflet_temporal_template.html
 ├── projects/               # QGIS project files (persisted)
-├── docs/                   # Architecture analysis
-├── Dockerfile              # Single container build
-├── docker-compose.yml      # One service
-├── supervisord.conf        # Process orchestration
-├── entrypoint.sh           # Container startup
-├── requirements.txt        # Python dependencies
-└── CLAUDE.md               # Claude Code instructions
+├── docs/                   # Architecture diagrams
+├── Dockerfile
+├── docker-compose.yml
+├── supervisord.conf
+├── entrypoint.sh
+├── requirements.txt
+└── CLAUDE.md
 ```
 
 ## License
