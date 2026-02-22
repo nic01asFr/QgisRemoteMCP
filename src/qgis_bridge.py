@@ -2386,6 +2386,7 @@ class QGISBridge:
         import sqlite3
         import re as _re
         from collections import defaultdict
+        from qgis.core import QgsExpressionContextUtils, QgsRenderContext
 
         project = QgsProject.instance()
         doc_name = params.get("document_name", project.baseName() or "qgis_export")
@@ -2409,6 +2410,7 @@ class QGISBridge:
         def sanitize_table(name):
             s = _strip_accents(name)
             s = _re.sub(r'[^A-Za-z0-9_]', '_', s).strip('_')
+            s = _re.sub(r'_+', '_', s)  # collapse double underscores
             if not s or s[0].isdigit():
                 s = 'T' + s
             return s or 'Unnamed'
@@ -2416,6 +2418,7 @@ class QGISBridge:
         def sanitize_col(name):
             s = _strip_accents(name)
             s = _re.sub(r'[^A-Za-z0-9_]', '_', s).strip('_')
+            s = _re.sub(r'_+', '_', s)  # collapse double underscores
             if not s or s[0].isdigit():
                 s = 'c' + s
             if s.lower() in ('id', 'manualsort'):
@@ -2461,6 +2464,78 @@ class QGISBridge:
             elif wt == 'CheckBox':
                 return 'Bool', ''
             return None, ''
+
+        def extract_renderer_info(layer):
+            """Extract QGIS renderer info (graduated/categorized/single) as dict."""
+            renderer = layer.renderer()
+            if not renderer:
+                return None
+            rtype = renderer.type()
+            try:
+                if rtype == 'graduatedSymbol':
+                    return {
+                        'type': 'graduated',
+                        'field': renderer.classAttribute(),
+                        'classes': [{
+                            'min': r.lowerValue(), 'max': r.upperValue(),
+                            'color': r.symbol().color().name(),
+                            'label': r.label()
+                        } for r in renderer.ranges()]
+                    }
+                elif rtype == 'categorizedSymbol':
+                    return {
+                        'type': 'categorized',
+                        'field': renderer.classAttribute(),
+                        'categories': [{
+                            'value': str(c.value()) if c.value() != '' else '',
+                            'color': c.symbol().color().name(),
+                            'label': c.label()
+                        } for c in renderer.categories() if c.value() != '']
+                    }
+                elif rtype == 'singleSymbol':
+                    sym = renderer.symbol()
+                    return {'type': 'single', 'color': sym.color().name()}
+            except Exception:
+                pass
+            return None
+
+        def get_feature_color(renderer, feat, ctx):
+            """Get the renderer color for a single feature.
+            Falls back to computing from ranges/categories if symbolsForFeature fails."""
+            if not renderer:
+                return None
+            rtype = renderer.type()
+            try:
+                # Try symbolsForFeature first (works with full render context)
+                symbols = renderer.symbolsForFeature(feat, ctx)
+                if symbols:
+                    return symbols[0].color().name()
+            except Exception:
+                pass
+            # Fallback: compute from renderer definition directly
+            try:
+                if rtype == 'graduatedSymbol':
+                    field = renderer.classAttribute()
+                    val = feat[field]
+                    if val is not None:
+                        for r in renderer.ranges():
+                            if r.lowerValue() <= float(val) <= r.upperValue():
+                                return r.symbol().color().name()
+                        # Above max → last class
+                        ranges = renderer.ranges()
+                        if ranges:
+                            return ranges[-1].symbol().color().name()
+                elif rtype == 'categorizedSymbol':
+                    field = renderer.classAttribute()
+                    val = feat[field]
+                    for cat in renderer.categories():
+                        if str(cat.value()) == str(val):
+                            return cat.symbol().color().name()
+                elif rtype == 'singleSymbol':
+                    return renderer.symbol().color().name()
+            except Exception:
+                pass
+            return None
 
         def coerce(val, gtype):
             if val is None:
@@ -2536,6 +2611,7 @@ class QGISBridge:
 
             geom_type = layer.geometryType()  # 0=Point, 1=Line, 2=Polygon
             is_point = (geom_type == 0)
+            is_line = (geom_type == 1)
             is_polygon = (geom_type == 2)
 
             columns = []  # [{col_id, grist_type, label, widget_options}]
@@ -2562,15 +2638,43 @@ class QGISBridge:
                     {'col_id': 'latitude', 'grist_type': 'Numeric', 'label': 'Latitude', 'widget_options': '', 'original_name': ''},
                     {'col_id': 'longitude', 'grist_type': 'Numeric', 'label': 'Longitude', 'widget_options': '', 'original_name': ''},
                 ]
-            elif is_polygon:
+            elif is_polygon or is_line:
                 geo_cols = [
                     {'col_id': 'centroid_lat', 'grist_type': 'Numeric', 'label': 'Centroid Lat', 'widget_options': '', 'original_name': ''},
                     {'col_id': 'centroid_lon', 'grist_type': 'Numeric', 'label': 'Centroid Lon', 'widget_options': '', 'original_name': ''},
+                    {'col_id': '_geojson', 'grist_type': 'Text', 'label': 'GeoJSON', 'widget_options': '', 'original_name': ''},
                 ]
             columns.extend(geo_cols)
 
+            # Add _color column if layer has a renderer with colors
+            renderer = layer.renderer()
+            has_renderer_colors = renderer is not None and renderer.type() in (
+                'graduatedSymbol', 'categorizedSymbol', 'singleSymbol')
+            if has_renderer_colors:
+                columns.append({
+                    'col_id': '_color', 'grist_type': 'Text',
+                    'label': 'Color', 'widget_options': '', 'original_name': '',
+                })
+
+            # Filter columns if too many (Grist has trouble with 90+ columns)
+            MAX_GRIST_COLS = 30
+            if len(columns) > MAX_GRIST_COLS:
+                _geo_ids = {'latitude', 'longitude', 'centroid_lat', 'centroid_lon', '_geojson', '_color'}
+                _priority_pats = ['nature', 'nom', 'name', 'type', 'usage', 'importance',
+                                  'categorie', 'hauteur', 'date', 'surface', 'titre',
+                                  'description', 'label', 'prix', 'price']
+                geo_keep = [c for c in columns if c['col_id'] in _geo_ids]
+                prio_keep = [c for c in columns if c['col_id'] not in _geo_ids
+                             and any(p in c['col_id'].lower() for p in _priority_pats)]
+                rest = [c for c in columns if c['col_id'] not in _geo_ids
+                        and not any(p in c['col_id'].lower() for p in _priority_pats)]
+                budget = MAX_GRIST_COLS - len(geo_keep) - len(prio_keep)
+                columns = geo_keep + prio_keep + rest[:max(budget, 0)]
+
             # Extract features
+            export_orignames = {c['original_name'] for c in columns if c['original_name']}
             tr = QgsCoordinateTransform(layer.crs(), crs_4326, project)
+            render_ctx = QgsRenderContext() if has_renderer_colors else None
             records = []
             for i, feat in enumerate(layer.getFeatures()):
                 if i >= max_feat:
@@ -2579,10 +2683,18 @@ class QGISBridge:
                 for col in columns:
                     if not col['original_name']:
                         continue
+                    if col['original_name'] not in export_orignames:
+                        continue
                     val = feat[col['original_name']]
                     c_val = coerce(val, col['grist_type'])
                     if c_val is not None:
                         rec[col['col_id']] = c_val
+
+                # Renderer color per feature
+                if has_renderer_colors:
+                    color = get_feature_color(renderer, feat, render_ctx)
+                    if color:
+                        rec['_color'] = color
 
                 geom = feat.geometry()
                 if not geom.isEmpty():
@@ -2593,32 +2705,56 @@ class QGISBridge:
                         pt = geom_copy.asPoint()
                         rec['latitude'] = round(pt.y(), 6)
                         rec['longitude'] = round(pt.x(), 6)
-                    elif is_polygon:
+                    elif is_polygon or is_line:
                         centroid = geom_copy.centroid().asPoint()
                         rec['centroid_lat'] = round(centroid.y(), 6)
                         rec['centroid_lon'] = round(centroid.x(), 6)
+                        try:
+                            rec['_geojson'] = geom_copy.asJson()
+                        except Exception:
+                            pass
                 records.append(rec)
+
+            # Determine geom_type string for CONFIG
+            geom_type_str = 'point' if is_point else ('line' if is_line else ('polygon' if is_polygon else 'other'))
 
             spec = {
                 'table_name': tname, 'columns': columns,
                 'records': records, 'is_point': is_point,
-                'is_polygon': is_polygon, 'source_layer': layer.name(),
-                'has_lat_lon': is_point,
+                'is_line': is_line, 'is_polygon': is_polygon,
+                'source_layer': layer.name(),
+                'has_lat_lon': is_point, 'geom_type': geom_type_str,
+                'layer_obj': layer,
             }
             layer_specs.append(spec)
 
             # Detect special tables
             if is_point and map_table is None and len(records) > 0:
                 map_table = spec
+            # Form table: detect layers with QField-style form widgets or named "observation"
             name_lower = layer.name().lower()
-            if 'observation' in name_lower:
-                obs_table = spec
+            if obs_table is None:
+                has_form_widgets = False
+                for idx in range(layer.fields().count()):
+                    wt = layer.editorWidgetSetup(idx).type()
+                    if wt in ('ValueMap', 'DateTime', 'ExternalResource'):
+                        has_form_widgets = True
+                        break
+                if has_form_widgets or 'observation' in name_lower:
+                    obs_table = spec
             col_ids = [c['col_id'] for c in columns]
             if 'year' in col_ids or 'annee' in col_ids:
                 temporal_table = spec
 
         if not layer_specs:
             return {"error": "No vector layers to export"}
+
+        # Fallback: if no point map_table, use first table with records
+        if map_table is None:
+            for spec in layer_specs:
+                if len(spec['records']) > 0 and spec is not obs_table:
+                    map_table = spec
+                    break
 
         # ── 2. Stats table ────────────────────────────────────
 
@@ -2717,7 +2853,7 @@ class QGISBridge:
 
             # _grist_Tables
             cur.execute(
-                "INSERT INTO _grist_Tables VALUES (?,?,?,0,0,?,0)",
+                "INSERT INTO _grist_Tables VALUES (?,?,?,0,?,0,0)",
                 (table_id_ctr, tname, raw_view_id, raw_section_id)
             )
 
@@ -2850,21 +2986,59 @@ class QGISBridge:
                 ]
             })
 
-            # Map widget — use Custom Widget Builder with embedded HTML
-            # Try to find an existing temporal map HTML export
-            import glob as _glob
-            html_files = sorted(_glob.glob('/data/temporal_map_*.html'), reverse=True)
-            if not html_files:
-                html_files = sorted(_glob.glob('/data/*.html'), reverse=True)
+            # Map widget — generic Leaflet Grist widget with CONFIG injection
+            # Build CONFIG metadata (no data — widget reads from Grist tables)
+            tables_meta = {}
+            for spec in layer_specs:
+                role = 'primary' if spec is map_table else 'secondary'
+                if spec is obs_table:
+                    role = 'form'
+                tables_meta[spec['table_name']] = {
+                    'role': role,
+                    'geomType': spec['geom_type'],
+                }
 
-            if html_files:
-                with open(html_files[0], 'r', encoding='utf-8') as f:
-                    html_content = f.read()
+            renderer_info = {}
+            for spec in layer_specs:
+                ri = extract_renderer_info(spec['layer_obj'])
+                if ri:
+                    renderer_info[spec['table_name']] = ri
+
+            # Canvas center/zoom
+            canvas = self.iface.mapCanvas() if self.iface else None
+            map_center = [0, 0]
+            map_zoom = 13
+            if canvas:
+                ext = canvas.extent()
+                tr_view = QgsCoordinateTransform(project.crs(), crs_4326, project)
+                ext_4326 = tr_view.transformBoundingBox(ext)
+                map_center = [
+                    round((ext_4326.yMinimum() + ext_4326.yMaximum()) / 2, 6),
+                    round((ext_4326.xMinimum() + ext_4326.xMaximum()) / 2, 6),
+                ]
+
+            scope = QgsExpressionContextUtils.projectScope(project)
+            zone_name = scope.variable("study_zone_name") or ""
+
+            config = {
+                'center': map_center,
+                'zoom': map_zoom,
+                'title': doc_name,
+                'zoneName': zone_name,
+                'tables': tables_meta,
+                'primaryTable': map_table['table_name'],
+                'rendererInfo': renderer_info,
+            }
+
+            # Load generic widget template and inject CONFIG
+            grist_template_path = Path("/app/templates/web/leaflet_grist_widget.html")
+            if grist_template_path.exists():
+                html_content = grist_template_path.read_text(encoding="utf-8")
+                html_content = html_content.replace(
+                    '{{CONFIG_JSON}}', json.dumps(config, ensure_ascii=False, default=str))
             else:
-                # Minimal map fallback
-                html_content = '<!DOCTYPE html><html><body><p>No map HTML found. Run export_temporal_map first.</p></body></html>'
+                html_content = '<!DOCTYPE html><html><body><p>Generic Grist widget template not found.</p></body></html>'
 
-            grist_init_js = "grist.ready({ requiredAccess: 'none' });\ngrist.onRecords(table => {\n\n});\ngrist.onRecord(record => {\n\n});"
             custom_view_inner = json.dumps({
                 "mode": "url",
                 "url": None,
@@ -2873,7 +3047,7 @@ class QGISBridge:
                     "url": "https://gristlabs.github.io/grist-widget/buildwidget/",
                     "widgetId": "@berhalak/custom-widget-builder",
                     "published": True,
-                    "accessLevel": "none",
+                    "accessLevel": "full",
                     "renderAfterReady": True,
                     "description": "Build custom widgets with HTML and JavaScript, right inside Grist.",
                     "isGristLabsMaintained": False,
@@ -2884,7 +3058,7 @@ class QGISBridge:
                 "renderAfterReady": True,
                 "widgetId": "@berhalak/custom-widget-builder",
                 "widgetOptions": {
-                    "_js": grist_init_js,
+                    "_js": "",
                     "_html": html_content
                 },
                 "columnsMapping": None
@@ -2896,13 +3070,22 @@ class QGISBridge:
             cur.execute("INSERT INTO _grist_Views VALUES (?,?,'',?)",
                         (map_view_id, 'Carte', layout))
 
-            # Map section
+            # Map section (custom widget)
             cur.execute(
                 "INSERT INTO _grist_Views_section VALUES (?,?,?,?,'Carte','',0,0,'',?,'','','','',0,0,0,'','','')",
                 (map_section_id, tid, map_view_id, 'custom', map_options)
             )
 
-            # Linked table section
+            # Fields for custom widget section — needed for onRecords to include these columns
+            for pos_i, col in enumerate(map_table['columns']):
+                if col['col_id'] in crefs:
+                    field_id_ctr += 1
+                    cur.execute(
+                        "INSERT INTO _grist_Views_section_field VALUES (?,?,?,?,100,'',0,0,'','')",
+                        (field_id_ctr, map_section_id, float(pos_i + 1), crefs[col['col_id']])
+                    )
+
+            # Linked table section (grid below the map)
             cur.execute(
                 "INSERT INTO _grist_Views_section VALUES (?,?,?,?,'Donnees','',0,0,'','','','','','',?,0,0,'','','')",
                 (table_section_id, tid, map_view_id, 'record', map_section_id)

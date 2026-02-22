@@ -1,0 +1,952 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>BigQgisMCP Map</title>
+<script src="https://docs.getgrist.com/grist-plugin-api.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/nouislider@15/dist/nouislider.min.css">
+<script src="https://cdn.jsdelivr.net/npm/nouislider@15/dist/nouislider.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, -apple-system, 'Segoe UI', Arial, sans-serif; background: transparent; }
+  #map { position: absolute; top: 0; bottom: 0; left: 0; right: 0; }
+
+  /* Loading overlay */
+  .loading-overlay {
+    position: absolute; top: 0; left: 0; right: 0; bottom: 0; z-index: 2000;
+    background: rgba(255,255,255,0.9); display: flex; align-items: center;
+    justify-content: center; font-size: 15px; color: #555;
+  }
+  .loading-overlay.hidden { display: none; }
+
+  /* Message overlay */
+  .msg-overlay {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+    z-index: 1500; background: white; padding: 24px 32px; border-radius: 8px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.15); font-size: 14px; color: #333;
+    max-width: 400px; text-align: center;
+  }
+  .msg-overlay.hidden { display: none; }
+
+  /* Title */
+  .map-title {
+    position: absolute; top: 10px; left: 60px; z-index: 1000;
+    background: rgba(255,255,255,0.95); padding: 10px 18px;
+    border-radius: 6px; font-size: 17px; font-weight: 700;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.15); color: #1a1a2e;
+    max-width: 520px;
+  }
+  .map-title small { display: block; font-size: 11px; font-weight: 400; color: #666; margin-top: 2px; }
+
+  /* Slider panel (year or flood) */
+  .slider-panel {
+    position: absolute; bottom: 30px; left: 60px; right: 60px; z-index: 1000;
+    background: rgba(255,255,255,0.96); padding: 16px 24px 24px;
+    border-radius: 8px; box-shadow: 0 2px 12px rgba(0,0,0,0.18);
+    max-width: 600px;
+  }
+  .slider-panel.hidden { display: none; }
+  .slider-header { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+  .slider-header h3 { margin: 0; font-size: 14px; color: #1a1a2e; flex: 1; }
+  .slider-value { font-size: 26px; font-weight: 700; color: #0055a4; min-width: 60px; text-align: right; }
+  .play-btn {
+    background: #0055a4; color: white; border: none; border-radius: 50%;
+    width: 34px; height: 34px; cursor: pointer; font-size: 14px;
+    display: flex; align-items: center; justify-content: center; transition: background 0.2s;
+  }
+  .play-btn:hover { background: #003d7a; }
+  .play-btn.playing { background: #c0392b; }
+  .noUi-connect { background: #0077be; }
+  .noUi-tooltip { font-size: 11px; padding: 2px 6px; background: #0055a4; color: white; border: none; }
+  .noUi-pips { font-size: 11px; color: #444; font-weight: 600; }
+
+  /* Stats panel */
+  .stats-panel {
+    background: rgba(255,255,255,0.96); padding: 12px 16px;
+    border-radius: 6px; box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+    font-size: 12px; min-width: 260px; max-width: 320px;
+  }
+  .stats-panel h4 { margin: 0 0 8px 0; font-size: 13px; color: #1a1a2e; border-bottom: 2px solid #0077be; padding-bottom: 4px; }
+  .stat-row { display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px solid #eee; }
+  .stat-row:last-child { border-bottom: none; }
+  .stat-label { color: #555; }
+  .stat-value { font-weight: 600; color: #1a1a2e; text-align: right; }
+  .trend-up { color: #c0392b; }
+  .trend-down { color: #27ae60; }
+
+  /* Legend */
+  .legend-panel {
+    background: rgba(255,255,255,0.96); padding: 10px 14px;
+    border-radius: 6px; box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+    font-size: 11px; line-height: 1.8; max-width: 220px;
+    max-height: 400px; overflow-y: auto;
+  }
+  .legend-panel h4 { margin: 0 0 6px 0; font-size: 12px; color: #1a1a2e; }
+  .legend-row { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  .legend-row:hover { background: #f3f4f6; border-radius: 3px; }
+  .legend-circle { width: 10px; height: 10px; border-radius: 50%; border: 1px solid rgba(0,0,0,0.2); flex-shrink: 0; }
+  .legend-swatch { width: 16px; height: 12px; border-radius: 2px; border: 1px solid rgba(0,0,0,0.15); flex-shrink: 0; }
+
+  /* Popup */
+  .popup-row { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; border-bottom: 1px solid #f0f0f0; }
+  .popup-row:last-child { border-bottom: none; }
+  .popup-label { color: #888; font-size: 11px; white-space: nowrap; }
+  .popup-value { font-weight: 600; color: #1a1a2e; font-size: 11px; text-align: right; word-break: break-word; }
+</style>
+</head>
+<body>
+
+<div id="loading-overlay" class="loading-overlay">Chargement des donnees...</div>
+<div id="msg-overlay" class="msg-overlay hidden"></div>
+<div id="map"></div>
+
+<!-- Slider panel (hidden by default, shown if temporal or flood data detected) -->
+<div class="slider-panel hidden" id="slider-panel">
+  <div class="slider-header">
+    <button class="play-btn" id="play-btn" title="Animation">&#9654;</button>
+    <h3 id="slider-title">Filtre</h3>
+    <div class="slider-value" id="slider-value"></div>
+  </div>
+  <div id="data-slider"></div>
+</div>
+
+<script>
+(function() {
+// ═══════════════════════════════════════════════════════════
+// CONFIGURATION (injected at export, metadata only — NO data)
+// ═══════════════════════════════════════════════════════════
+var CONFIG = {{CONFIG_JSON}};
+
+// ═══════════════════════════════════════════════════════════
+// GLOBAL STATE
+// ═══════════════════════════════════════════════════════════
+var map = null;
+var allRecords = [];
+var secondaryData = {};   // {tableName: rows[]}
+var feat = null;          // detected features
+var selectedId = null;
+
+// Layers
+var pointsLayer = null;
+var polygonLayers = {};   // {tableName: L.geoJSON}
+var highlightMarker = null;
+
+// Slider state
+var sliderInitialized = false;
+var sliderValues = [];
+var currentSliderValue = null;
+var animId = null;
+
+// ═══════════════════════════════════════════════════════════
+// UTILITIES (skills/data-conversion.md)
+// ═══════════════════════════════════════════════════════════
+function convertToRows(data) {
+    if (!data || !data.id) return [];
+    var n = data.id.length;
+    var records = [];
+    for (var i = 0; i < n; i++) {
+        var record = {};
+        Object.keys(data).forEach(function(key) {
+            record[key] = data[key][i];
+        });
+        records.push(record);
+    }
+    return records;
+}
+
+function escapeHtml(text) {
+    if (!text) return '';
+    var div = document.createElement('div');
+    div.textContent = String(text);
+    return div.innerHTML;
+}
+
+function findCol(keys, candidates) {
+    for (var i = 0; i < candidates.length; i++) {
+        for (var j = 0; j < keys.length; j++) {
+            if (keys[j].toLowerCase() === candidates[i].toLowerCase()) return keys[j];
+        }
+    }
+    return null;
+}
+
+function findNumericValueCol(sample) {
+    // Use renderer info if available
+    var primary = CONFIG.primaryTable || '';
+    var ri = CONFIG.rendererInfo && CONFIG.rendererInfo[primary];
+    if (ri && ri.field) return ri.field;
+    // Fallback: find first numeric-looking column (not lat/lon/year/id)
+    var skip = ['id','manualsort','latitude','longitude','centroid_lat','centroid_lon',
+                'year','annee','ht_min','ht_max','area_ha','_geojson','_color'];
+    var keys = Object.keys(sample);
+    for (var i = 0; i < keys.length; i++) {
+        var k = keys[i];
+        if (skip.indexOf(k.toLowerCase()) >= 0) continue;
+        if (typeof sample[k] === 'number' && !isNaN(sample[k])) return k;
+    }
+    return null;
+}
+
+function median(arr) {
+    if (!arr.length) return 0;
+    var s = arr.slice().sort(function(a,b){return a-b;});
+    var m = Math.floor(s.length/2);
+    return s.length % 2 ? s[m] : (s[m-1]+s[m])/2;
+}
+
+function mean(arr) {
+    if (!arr.length) return 0;
+    return arr.reduce(function(a,b){return a+b;},0) / arr.length;
+}
+
+function formatNum(v) {
+    if (v == null) return '';
+    if (Math.abs(v) >= 1000000) return (v/1000000).toFixed(1) + ' M';
+    if (Math.abs(v) >= 1000) return Math.round(v/1000) + ' k';
+    return typeof v === 'number' ? v.toLocaleString('fr') : String(v);
+}
+
+// ═══════════════════════════════════════════════════════════
+// FEATURE DETECTION — inspects columns, activates modules
+// ═══════════════════════════════════════════════════════════
+function detectFeatures(records) {
+    if (!records.length) return null;
+    var sample = records[0];
+    var keys = Object.keys(sample);
+
+    var latCol = findCol(keys, ['Latitude','latitude','centroid_lat','lat']);
+    var lonCol = findCol(keys, ['Longitude','longitude','centroid_lon','lon']);
+    var yearCol = findCol(keys, ['year','annee','annee_mutation']);
+    var valueCol = findNumericValueCol(sample);
+    var bandCol = findCol(keys, ['coastal_band','bande_cotiere','bande','band','group_name','band_label']);
+    var floodCol = findCol(keys, ['max_water_height','ht_max']);
+    var labelCol = findCol(keys, ['type_local','nom','name','titre','label','nature','usage_1']);
+
+    var hasPolygons = false;
+    if (CONFIG.tables) {
+        Object.keys(CONFIG.tables).forEach(function(t) {
+            if (CONFIG.tables[t].geomType === 'polygon' || CONFIG.tables[t].geomType === 'line') {
+                hasPolygons = true;
+            }
+        });
+    }
+
+    return {
+        hasPoints: !!(latCol && lonCol),
+        hasPolygons: hasPolygons,
+        hasTemporal: !!yearCol,
+        hasFlood: !!floodCol || (keys.indexOf('ht_min') >= 0),
+        hasValue: !!valueCol,
+        hasBands: !!bandCol,
+        hasColor: keys.indexOf('_color') >= 0,
+        latCol: latCol,
+        lonCol: lonCol,
+        yearCol: yearCol,
+        valueCol: valueCol,
+        bandCol: bandCol,
+        floodCol: floodCol,
+        labelCol: labelCol
+    };
+}
+
+// ═══════════════════════════════════════════════════════════
+// MAP INITIALIZATION
+// ═══════════════════════════════════════════════════════════
+function initMap() {
+    if (map) return;
+    var center = CONFIG.center || [46.5, 2.5];
+    var zoom = CONFIG.zoom || 6;
+    map = L.map('map', { zoomControl: true }).setView(center, zoom);
+    L.tileLayer('https://cartodb-basemaps-a.global.ssl.fastly.net/light_all/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '&copy; OpenStreetMap &copy; CARTO'
+    }).addTo(map);
+
+    // Create panes for z-ordering
+    map.createPane('polygons'); map.getPane('polygons').style.zIndex = 400;
+    map.createPane('points');   map.getPane('points').style.zIndex = 450;
+
+    // Title
+    if (CONFIG.title) {
+        var titleCtrl = L.control({ position: 'topleft' });
+        titleCtrl.onAdd = function() {
+            var div = L.DomUtil.create('div', 'map-title');
+            div.innerHTML = escapeHtml(CONFIG.title);
+            if (CONFIG.zoneName) div.innerHTML += '<small>' + escapeHtml(CONFIG.zoneName) + '</small>';
+            L.DomEvent.disableClickPropagation(div);
+            return div;
+        };
+        titleCtrl.addTo(map);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// COLOR FUNCTIONS
+// ═══════════════════════════════════════════════════════════
+var DEFAULT_PALETTE = ['#3498db','#e74c3c','#2ecc71','#f39c12','#9b59b6',
+                       '#1abc9c','#e67e22','#34495e','#16a085','#c0392b'];
+
+function getFeatureColor(record) {
+    // 1. Explicit _color from renderer
+    if (record._color) return record._color;
+
+    // 2. Renderer info from CONFIG
+    var primary = CONFIG.primaryTable || '';
+    var ri = CONFIG.rendererInfo && CONFIG.rendererInfo[primary];
+    if (ri && ri.type === 'graduated' && feat && feat.valueCol) {
+        var val = record[feat.valueCol];
+        if (val != null && ri.classes) {
+            for (var i = 0; i < ri.classes.length; i++) {
+                var c = ri.classes[i];
+                if (val >= c.min && val < c.max) return c.color;
+            }
+            return ri.classes[ri.classes.length-1].color;
+        }
+    }
+    if (ri && ri.type === 'categorized' && ri.field) {
+        var catVal = record[ri.field];
+        if (ri.categories) {
+            var match = ri.categories.find(function(c) { return c.value == catVal; });
+            if (match) return match.color;
+        }
+    }
+    if (ri && ri.type === 'single' && ri.color) return ri.color;
+
+    // 3. Fallback
+    return DEFAULT_PALETTE[0];
+}
+
+function getPolygonStyle(record, tableName) {
+    var ri = CONFIG.rendererInfo && CONFIG.rendererInfo[tableName];
+    var color = '#3498db';
+    var fillOpacity = 0.3;
+
+    if (record._color) {
+        color = record._color;
+    } else if (ri && ri.type === 'categorized' && ri.field) {
+        var catVal = record[ri.field];
+        if (ri.categories) {
+            var match = ri.categories.find(function(c) { return c.value == catVal; });
+            if (match) color = match.color;
+        }
+    } else if (ri && ri.type === 'single' && ri.color) {
+        color = ri.color;
+    }
+
+    return { fillColor: color, fillOpacity: fillOpacity, weight: 1.5, color: color, opacity: 0.6 };
+}
+
+// ═══════════════════════════════════════════════════════════
+// POPUP — generic, shows all non-technical attributes
+// ═══════════════════════════════════════════════════════════
+function makePopup(record) {
+    var skip = ['id','manualSort','manualsort','_geojson','_color'];
+    if (feat) {
+        if (feat.latCol) skip.push(feat.latCol);
+        if (feat.lonCol) skip.push(feat.lonCol);
+    }
+    var html = '<div style="max-width:280px">';
+    // Title line from label col
+    if (feat && feat.labelCol && record[feat.labelCol]) {
+        html += '<b>' + escapeHtml(String(record[feat.labelCol])) + '</b><hr style="margin:4px 0;border-color:#ddd">';
+    }
+    Object.keys(record).forEach(function(key) {
+        if (skip.indexOf(key) >= 0) return;
+        if (key === (feat && feat.labelCol)) return; // already shown as title
+        var val = record[key];
+        if (val == null || val === '') return;
+        html += '<div class="popup-row">'
+             + '<span class="popup-label">' + escapeHtml(key) + '</span>'
+             + '<span class="popup-value">' + escapeHtml(String(val)) + '</span>'
+             + '</div>';
+    });
+    html += '</div>';
+    return html;
+}
+
+// ═══════════════════════════════════════════════════════════
+// RENDER POINTS
+// ═══════════════════════════════════════════════════════════
+function renderPoints(records, filterFn) {
+    if (pointsLayer) { map.removeLayer(pointsLayer); pointsLayer = null; }
+    if (!feat || !feat.hasPoints) return;
+
+    var filtered = filterFn ? records.filter(filterFn) : records;
+    var markers = [];
+    var bounds = L.latLngBounds();
+
+    filtered.forEach(function(rec) {
+        var lat = rec[feat.latCol];
+        var lon = rec[feat.lonCol];
+        if (lat == null || lon == null || lat === 0 && lon === 0) return;
+
+        var color = getFeatureColor(rec);
+        var radius = 5;
+        if (feat.hasValue && feat.valueCol && rec[feat.valueCol] != null) {
+            var v = rec[feat.valueCol];
+            radius = Math.min(8, Math.max(3, 3 + Math.log10(Math.max(1, Math.abs(v)))));
+        }
+
+        var marker = L.circleMarker([lat, lon], {
+            pane: 'points',
+            radius: radius,
+            fillColor: color,
+            color: '#333', weight: 0.6, fillOpacity: 0.85
+        });
+
+        marker.bindPopup(makePopup(rec), { maxWidth: 300 });
+        marker.on('click', function() { onMarkerClick(rec.id); });
+        marker._recordId = rec.id;
+        markers.push(marker);
+        bounds.extend([lat, lon]);
+    });
+
+    pointsLayer = L.layerGroup(markers, { pane: 'points' }).addTo(map);
+
+    // Fit bounds on first render
+    if (bounds.isValid() && !currentSliderValue) {
+        map.fitBounds(bounds, { padding: [40, 40], maxZoom: 15 });
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// RENDER POLYGONS (from secondary tables via fetchTable)
+// ═══════════════════════════════════════════════════════════
+function renderPolygonTable(tableName, rows) {
+    if (polygonLayers[tableName]) {
+        map.removeLayer(polygonLayers[tableName]);
+    }
+
+    var features = [];
+    var parseErrors = 0;
+    var missingGeojson = 0;
+    rows.forEach(function(row) {
+        if (!row._geojson) { missingGeojson++; return; }
+        var geom = null;
+        try {
+            geom = JSON.parse(row._geojson);
+        } catch(e) {
+            parseErrors++;
+            if (parseErrors <= 3) console.error('[GristMap] _geojson parse error:', e.message, '| value type:', typeof row._geojson, '| first 100 chars:', String(row._geojson).substring(0, 100));
+            return;
+        }
+        var props = {};
+        Object.keys(row).forEach(function(k) {
+            if (k !== '_geojson' && k !== 'id') props[k] = row[k];
+        });
+        features.push({ type: 'Feature', properties: props, geometry: geom });
+    });
+
+    console.log('[GristMap] renderPolygonTable "' + tableName + '": ' + rows.length + ' rows → ' + features.length + ' features (missing: ' + missingGeojson + ', parseErr: ' + parseErrors + ')');
+
+    if (!features.length) return;
+
+    var geojson = { type: 'FeatureCollection', features: features };
+    var layer = L.geoJSON(geojson, {
+        pane: 'polygons',
+        style: function(f) { return getPolygonStyle(f.properties, tableName); },
+        onEachFeature: function(f, layer) {
+            layer.bindPopup(makePopup(f.properties), { maxWidth: 300 });
+        }
+    }).addTo(map);
+
+    polygonLayers[tableName] = layer;
+}
+
+// ═══════════════════════════════════════════════════════════
+// SECONDARY TABLES (fetchTable for polygons/lines)
+// ═══════════════════════════════════════════════════════════
+var secondaryLoaded = false;
+
+async function loadSecondaryTables() {
+    if (secondaryLoaded || !CONFIG.tables) return;
+    // Small delay to let Grist data engine fully load all tables
+    await new Promise(function(r) { setTimeout(r, 1500); });
+    var tableNames = Object.keys(CONFIG.tables);
+    for (var i = 0; i < tableNames.length; i++) {
+        var tname = tableNames[i];
+        var meta = CONFIG.tables[tname];
+        if (meta.role === 'primary' || meta.role === 'form') continue;
+        if (meta.geomType !== 'polygon' && meta.geomType !== 'line') continue;
+        // Retry up to 3 times with increasing delay
+        for (var attempt = 0; attempt < 3; attempt++) {
+            try {
+                var data = await grist.docApi.fetchTable(tname);
+                var rows = convertToRows(data);
+                secondaryData[tname] = rows;
+                renderPolygonTable(tname, rows);
+                break; // success
+            } catch(e) {
+                console.warn('fetchTable ' + tname + ' attempt ' + (attempt+1) + ':', e.message);
+                if (attempt < 2) {
+                    await new Promise(function(r) { setTimeout(r, 2000 * (attempt + 1)); });
+                }
+            }
+        }
+    }
+    secondaryLoaded = true;
+}
+
+// ═══════════════════════════════════════════════════════════
+// YEAR SLIDER (temporal data)
+// ═══════════════════════════════════════════════════════════
+function initYearSlider(years) {
+    if (sliderInitialized || years.length < 2) return;
+
+    var panel = document.getElementById('slider-panel');
+    panel.classList.remove('hidden');
+    document.getElementById('slider-title').textContent = 'Annee';
+
+    var sliderEl = document.getElementById('data-slider');
+    var minY = years[0], maxY = years[years.length - 1];
+
+    noUiSlider.create(sliderEl, {
+        start: [maxY], step: 1,
+        range: { min: minY, max: maxY },
+        tooltips: false,
+        pips: { mode: 'values', values: years, density: 100,
+                format: { to: function(v) { return Math.round(v); } } }
+    });
+
+    L.DomEvent.disableClickPropagation(panel);
+    L.DomEvent.disableScrollPropagation(panel);
+
+    sliderEl.noUiSlider.on('update', function(values) {
+        var year = Math.round(parseFloat(values[0]));
+        currentSliderValue = year;
+        document.getElementById('slider-value').textContent = year;
+        var filterFn = function(r) { return r[feat.yearCol] === year; };
+        var filtered = allRecords.filter(filterFn);
+        // Render filtered data (points or polygons depending on primary type)
+        if (filtered.length && filtered[0]._geojson) {
+            renderPolygonTable(CONFIG.primaryTable || 'primary', filtered);
+        } else {
+            renderPoints(allRecords, filterFn);
+        }
+        updateStats(year);
+        // Set selected rows for linked table
+        try {
+            var ids = filtered.map(function(r) { return r.id; });
+            grist.setSelectedRows(ids);
+        } catch(e) {}
+    });
+
+    sliderValues = years;
+    sliderInitialized = true;
+    initAnimation(sliderEl, minY, maxY);
+}
+
+// ═══════════════════════════════════════════════════════════
+// FLOOD SLIDER
+// ═══════════════════════════════════════════════════════════
+function initFloodSlider() {
+    if (sliderInitialized) return;
+
+    // Find max height in data
+    var maxH = 0;
+    allRecords.forEach(function(r) {
+        var v = r[feat.floodCol] || r.ht_max || 0;
+        if (v > maxH && v < 9999) maxH = v;
+    });
+    maxH = Math.min(maxH, 5.0);
+    if (maxH <= 0) return;
+
+    var panel = document.getElementById('slider-panel');
+    panel.classList.remove('hidden');
+    document.getElementById('slider-title').textContent = 'Hauteur d\'eau (m)';
+
+    var sliderEl = document.getElementById('data-slider');
+    noUiSlider.create(sliderEl, {
+        start: [maxH], step: 0.1,
+        range: { min: 0, max: maxH },
+        tooltips: [{ to: function(v) { return v.toFixed(1) + ' m'; } }]
+    });
+
+    L.DomEvent.disableClickPropagation(panel);
+    L.DomEvent.disableScrollPropagation(panel);
+
+    sliderEl.noUiSlider.on('update', function(values) {
+        var h = parseFloat(values[0]);
+        currentSliderValue = h;
+        document.getElementById('slider-value').textContent = h.toFixed(1) + ' m';
+        renderPoints(allRecords, function(r) {
+            var mwh = r[feat.floodCol] || r.max_water_height || 0;
+            return mwh <= h && mwh > 0;
+        });
+    });
+
+    sliderInitialized = true;
+    initAnimation(sliderEl, 0, maxH);
+}
+
+// ═══════════════════════════════════════════════════════════
+// ANIMATION (shared by year and flood sliders)
+// ═══════════════════════════════════════════════════════════
+function initAnimation(sliderEl, minVal, maxVal) {
+    var playBtn = document.getElementById('play-btn');
+    var lastStep = 0;
+    var STEP_MS = 1500;
+    var step = sliderEl.noUiSlider.options.step || 1;
+
+    function animStep(ts) {
+        if (ts - lastStep >= STEP_MS) {
+            lastStep = ts;
+            var cur = parseFloat(sliderEl.noUiSlider.get());
+            var next = cur + step;
+            if (next > maxVal) { stopAnim(); return; }
+            sliderEl.noUiSlider.set(next);
+        }
+        animId = requestAnimationFrame(animStep);
+    }
+
+    function startAnim() {
+        if (animId) return;
+        var cur = parseFloat(sliderEl.noUiSlider.get());
+        if (cur >= maxVal) sliderEl.noUiSlider.set(minVal);
+        lastStep = performance.now();
+        animId = requestAnimationFrame(animStep);
+        playBtn.innerHTML = '&#9646;&#9646;';
+        playBtn.classList.add('playing');
+    }
+
+    function stopAnim() {
+        if (animId) { cancelAnimationFrame(animId); animId = null; }
+        playBtn.innerHTML = '&#9654;';
+        playBtn.classList.remove('playing');
+    }
+
+    playBtn.addEventListener('click', function() {
+        animId ? stopAnim() : startAnim();
+    });
+}
+
+// ═══════════════════════════════════════════════════════════
+// STATS PANEL (computed client-side)
+// ═══════════════════════════════════════════════════════════
+var statsCtrl = null;
+
+function initStatsPanel() {
+    if (statsCtrl) return;
+    statsCtrl = L.control({ position: 'topright' });
+    statsCtrl.onAdd = function() {
+        var div = L.DomUtil.create('div', 'stats-panel');
+        div.id = 'stats-div';
+        L.DomEvent.disableClickPropagation(div);
+        return div;
+    };
+    statsCtrl.addTo(map);
+}
+
+function updateStats(filterValue) {
+    if (!feat || (!feat.hasBands && !feat.hasTemporal)) return;
+    if (!statsCtrl) initStatsPanel();
+    var div = document.getElementById('stats-div');
+    if (!div) return;
+
+    var isYear = feat.hasTemporal;
+    var filterCol = isYear ? feat.yearCol : feat.floodCol;
+    var groupCol = feat.bandCol;
+    var valCol = feat.valueCol;
+
+    // Current filtered records
+    var filtered = allRecords.filter(function(r) {
+        if (isYear) return r[filterCol] === filterValue;
+        return (r[feat.floodCol] || r.max_water_height || 0) <= filterValue;
+    });
+
+    // Previous period (for trends)
+    var prevFiltered = [];
+    if (isYear) {
+        prevFiltered = allRecords.filter(function(r) { return r[filterCol] === filterValue - 1; });
+    }
+
+    // Group by band
+    var groups = {};
+    filtered.forEach(function(r) {
+        var g = groupCol ? (r[groupCol] || 'Total') : 'Total';
+        if (!groups[g]) groups[g] = [];
+        if (valCol && r[valCol] != null) groups[g].push(r[valCol]);
+    });
+
+    var prevGroups = {};
+    prevFiltered.forEach(function(r) {
+        var g = groupCol ? (r[groupCol] || 'Total') : 'Total';
+        if (!prevGroups[g]) prevGroups[g] = [];
+        if (valCol && r[valCol] != null) prevGroups[g].push(r[valCol]);
+    });
+
+    var label = isYear ? (CONFIG.zoneName || '') + ' \u2014 ' + filterValue
+                       : 'Hauteur \u2264 ' + (typeof filterValue === 'number' ? filterValue.toFixed(1) : filterValue) + ' m';
+    var html = '<h4>' + escapeHtml(label) + '</h4>';
+
+    var totalCount = 0;
+    Object.keys(groups).sort().forEach(function(g) {
+        var vals = groups[g];
+        totalCount += vals.length;
+        var med = median(vals);
+        var m = mean(vals);
+
+        var trend = '';
+        if (isYear && prevGroups[g] && prevGroups[g].length) {
+            var prevMed = median(prevGroups[g]);
+            if (prevMed > 0) {
+                var pct = ((med - prevMed) / prevMed * 100).toFixed(1);
+                var n = parseFloat(pct);
+                if (n > 0) trend = ' <span class="trend-up">\u25b2+' + pct + '%</span>';
+                else if (n < 0) trend = ' <span class="trend-down">\u25bc' + pct + '%</span>';
+            }
+        }
+
+        html += '<div class="stat-row">'
+             + '<span class="stat-label">' + escapeHtml(g) + ' (' + vals.length + ')</span>'
+             + '<span class="stat-value">' + formatNum(med) + trend + '</span>'
+             + '</div>';
+    });
+
+    if (totalCount > 0) {
+        html += '<hr style="margin:5px 0;border-color:#ddd">'
+             + '<div class="stat-row"><span class="stat-label"><b>Total</b></span>'
+             + '<span class="stat-value"><b>' + totalCount + '</b> enregistrements</span></div>';
+    } else {
+        html += '<div style="color:#999;padding:8px 0">Aucune donnee</div>';
+    }
+
+    div.innerHTML = html;
+}
+
+// ═══════════════════════════════════════════════════════════
+// LEGEND (from rendererInfo)
+// ═══════════════════════════════════════════════════════════
+var legendCtrl = null;
+
+function initLegend() {
+    if (legendCtrl || !CONFIG.rendererInfo) return;
+    var html = '';
+    var tables = Object.keys(CONFIG.rendererInfo);
+    if (!tables.length) return;
+
+    tables.forEach(function(tableName) {
+        var ri = CONFIG.rendererInfo[tableName];
+        if (!ri) return;
+
+        // Section header for multi-table
+        if (tables.length > 1) {
+            html += '<h4>' + escapeHtml(tableName.replace(/_/g, ' ')) + '</h4>';
+        }
+
+        if (ri.type === 'graduated' && ri.classes) {
+            if (tables.length <= 1) html += '<h4>' + escapeHtml(ri.field || 'Valeur') + '</h4>';
+            ri.classes.forEach(function(c) {
+                html += '<div class="legend-row">'
+                     + '<span class="legend-circle" style="background:' + c.color + '"></span> '
+                     + escapeHtml(c.label || (c.min + ' - ' + c.max))
+                     + '</div>';
+            });
+        } else if (ri.type === 'categorized' && ri.categories) {
+            if (tables.length <= 1) html += '<h4>' + escapeHtml(ri.field || 'Categorie') + '</h4>';
+            ri.categories.forEach(function(c) {
+                html += '<div class="legend-row">'
+                     + '<span class="legend-swatch" style="background:' + c.color + '"></span> '
+                     + escapeHtml(c.label || c.value)
+                     + '</div>';
+            });
+        } else if (ri.type === 'single') {
+            html += '<div class="legend-row">'
+                 + '<span class="legend-swatch" style="background:' + ri.color + '"></span> '
+                 + escapeHtml(tableName.replace(/_/g, ' '))
+                 + '</div>';
+        }
+    });
+
+    if (!html) return;
+
+    legendCtrl = L.control({ position: 'bottomright' });
+    legendCtrl.onAdd = function() {
+        var div = L.DomUtil.create('div', 'legend-panel');
+        div.innerHTML = html;
+        L.DomEvent.disableClickPropagation(div);
+        return div;
+    };
+    legendCtrl.addTo(map);
+}
+
+// ═══════════════════════════════════════════════════════════
+// GRIST SYNC (skills/inter-widget.md)
+// ═══════════════════════════════════════════════════════════
+function onMarkerClick(recordId) {
+    if (recordId === selectedId) return;
+    selectedId = recordId;
+    try { grist.setCursorPos({ rowId: recordId }); } catch(e) {}
+}
+
+function handleSelection(record) {
+    if (!record || !feat) return;
+    if (record.id === selectedId) return;
+    selectedId = record.id;
+
+    var lat = record[feat.latCol];
+    var lon = record[feat.lonCol];
+    if (lat && lon) {
+        if (highlightMarker) map.removeLayer(highlightMarker);
+        highlightMarker = L.circleMarker([lat, lon], {
+            radius: 12, fillColor: '#ff0', color: '#f00', weight: 2, fillOpacity: 0.5
+        }).addTo(map);
+        map.panTo([lat, lon]);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// MAIN PROCESSING
+// ═══════════════════════════════════════════════════════════
+function processRecords() {
+    feat = detectFeatures(allRecords);
+    if (!feat) {
+        showMessage('Aucune donnee recue. Verifiez la table liee au widget.');
+        return;
+    }
+
+    // Debug: log received columns
+    var cols = allRecords[0] ? Object.keys(allRecords[0]) : [];
+    console.log('[GristMap] ' + allRecords.length + ' records, columns: ' + cols.join(', '));
+    console.log('[GristMap] _geojson present: ' + (allRecords[0] && '_geojson' in allRecords[0]));
+    console.log('[GristMap] features:', JSON.stringify(feat));
+
+    initMap();
+
+    // Render primary table data
+    var primaryHasGeoJson = allRecords[0] && allRecords[0]._geojson;
+    var renderedCount = 0;
+
+    if (primaryHasGeoJson) {
+        // Primary table is polygon/line — render as actual GeoJSON shapes
+        console.log('[GristMap] Rendering ' + allRecords.length + ' polygon/line features from _geojson');
+        renderPolygonTable(CONFIG.primaryTable || 'primary', allRecords);
+        // Fit map to polygon bounds
+        var pLayer = polygonLayers[CONFIG.primaryTable || 'primary'];
+        if (pLayer && pLayer.getBounds().isValid()) {
+            map.fitBounds(pLayer.getBounds(), { padding: [40, 40] });
+            renderedCount = allRecords.length;
+        }
+    } else if (feat.hasPoints && !feat.hasTemporal && !feat.hasFlood) {
+        // Primary table is point — render as circle markers
+        renderPoints(allRecords, null);
+        renderedCount = allRecords.length;
+    }
+
+    // If nothing rendered, show diagnostic
+    if (!primaryHasGeoJson && !feat.hasPoints && !feat.hasTemporal && !feat.hasFlood) {
+        var sample = allRecords[0] || {};
+        var sampleKeys = Object.keys(sample);
+        var diag = '<b>Diagnostic:</b> ' + allRecords.length + ' enregistrements recus.<br>'
+            + 'Colonnes: ' + sampleKeys.slice(0, 15).join(', ')
+            + (sampleKeys.length > 15 ? '... (+' + (sampleKeys.length - 15) + ')' : '') + '<br>'
+            + '_geojson: ' + (sample._geojson ? typeof sample._geojson + ' (' + String(sample._geojson).substring(0, 80) + '...)' : '<b style="color:red">ABSENT</b>') + '<br>'
+            + 'latitude: ' + (sample.latitude || sample.Latitude || sample.centroid_lat || '<b style="color:red">ABSENT</b>');
+        showMessage(diag);
+    }
+
+    // Polygon layers from secondary tables (loaded via fetchTable)
+    if (feat.hasPolygons) {
+        loadSecondaryTables();
+    }
+
+    // Year slider
+    if (feat.hasTemporal) {
+        var yearSet = {};
+        allRecords.forEach(function(r) {
+            var y = r[feat.yearCol];
+            if (y != null) yearSet[y] = true;
+        });
+        var years = Object.keys(yearSet).map(Number).sort(function(a,b){return a-b;});
+        if (years.length >= 2) {
+            initYearSlider(years);
+        } else {
+            // Only one year — render all points
+            renderPoints(allRecords, null);
+        }
+    }
+
+    // Flood slider
+    if (feat.hasFlood && !feat.hasTemporal) {
+        initFloodSlider();
+    }
+
+    // Stats
+    if (feat.hasBands || feat.hasTemporal) {
+        initStatsPanel();
+    }
+
+    // Legend
+    initLegend();
+
+    hideLoading();
+}
+
+// ═══════════════════════════════════════════════════════════
+// UI HELPERS
+// ═══════════════════════════════════════════════════════════
+function hideLoading() {
+    document.getElementById('loading-overlay').classList.add('hidden');
+}
+
+function showMessage(msg) {
+    hideLoading();
+    var el = document.getElementById('msg-overlay');
+    el.innerHTML = msg;
+    el.classList.remove('hidden');
+}
+
+// ═══════════════════════════════════════════════════════════
+// GRIST DATA CONNECTION
+// All data comes from Grist tables — NOTHING is embedded.
+// - Primary table: received via grist.onRecords() (linked section)
+// - Secondary tables: loaded via grist.docApi.fetchTable()
+// - CONFIG (injected at export) contains only metadata:
+//   center, zoom, title, table roles/geomTypes, rendererInfo
+// ═══════════════════════════════════════════════════════════
+function init() {
+    // Timeout: if no data after 8s, show connection help
+    var dataTimeout = setTimeout(function() {
+        if (!allRecords.length) {
+            showMessage(
+                'En attente de donnees...<br><br>'
+                + '<small>Verifiez que ce widget est lie a une table '
+                + '(cliquez sur l\'icone de lien dans l\'en-tete de la section).</small>'
+            );
+        }
+    }, 8000);
+
+    grist.ready({ requiredAccess: 'full' });
+
+    grist.onRecords(function(data, mappings) {
+        clearTimeout(dataTimeout);
+        // onRecords passes RowRecord[] (array of {id, col1, ...})
+        // fetchTable passes columnar {id:[...], col1:[...]} — needs convertToRows
+        if (Array.isArray(data)) {
+            allRecords = data;
+        } else {
+            allRecords = convertToRows(data);
+        }
+        if (!allRecords.length) {
+            showMessage('La table est vide. Ajoutez des enregistrements.');
+            return;
+        }
+        processRecords();
+    });
+
+    grist.onRecord(function(record) {
+        if (!record || !feat) return;
+        handleSelection(record);
+    });
+}
+
+// Start
+init();
+
+})();
+</script>
+</body>
+</html>
