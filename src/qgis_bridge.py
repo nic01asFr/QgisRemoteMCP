@@ -2382,7 +2382,15 @@ class QGISBridge:
         - Pre-configured Map, Chart, and Form widgets
         - Auto-detected relationships between layers
         - Optional aggregated statistics table
+
+        If html_path is provided, delegates to _action_export_grist_from_html()
+        which converts any HTML with inline GeoJSON into a Grist document.
         """
+        # ── Dispatch: HTML mode vs QGIS project mode ────────
+        html_path = params.get("html_path", "")
+        if html_path:
+            return self._action_export_grist_from_html(params)
+
         import sqlite3
         import re as _re
         from collections import defaultdict
@@ -2853,7 +2861,7 @@ class QGISBridge:
 
             # _grist_Tables
             cur.execute(
-                "INSERT INTO _grist_Tables VALUES (?,?,?,0,?,0,0)",
+                "INSERT INTO _grist_Tables VALUES (?,?,?,0,0,?,0)",
                 (table_id_ctr, tname, raw_view_id, raw_section_id)
             )
 
@@ -3297,6 +3305,1230 @@ class QGISBridge:
             "pages": pages_created,
             "layers": {s['table_name']: len(s['records']) for s in layer_specs},
         }
+
+    # ── Grist from HTML — universal HTML→Grist converter ─────────
+
+    def _action_export_grist_from_html(self, params: dict) -> dict:
+        """Convert any HTML with inline GeoJSON into a .grist document.
+
+        Universal: works with export_web_map, export_flood_map, export_temporal_map,
+        qgis2web, or any Leaflet HTML containing FeatureCollection data.
+        """
+        import sqlite3
+        import re as _re
+
+        html_path = params.get("html_path", "")
+        if not os.path.exists(html_path):
+            return {"success": False, "error": f"File not found: {html_path}"}
+
+        html_text = Path(html_path).read_text(encoding="utf-8")
+        tz = params.get("timezone", "Europe/Paris")
+
+        # Document name — derive from filename or param
+        base_name = params.get("document_name", "")
+        if not base_name:
+            base_name = Path(html_path).stem
+        doc_name = _re.sub(r'[^\w\-]', '_', base_name).strip('_') or "grist_export"
+
+        max_feat = params.get("max_features_per_layer", 50000)
+
+        grist_path = f"/data/{doc_name}.grist"
+        if os.path.exists(grist_path):
+            os.remove(grist_path)
+
+        # ── 1. Parse HTML for FeatureCollections ─────────────
+        parsed_fcs = self._grist_parse_html_geojson(html_text)
+        if not parsed_fcs:
+            return {"success": False, "error": "No GeoJSON FeatureCollection data found in HTML file."}
+
+        # ── 2. Convert to Grist table specs ──────────────────
+        table_specs = []
+        wrapper_fcs = [fc for fc in parsed_fcs if fc.get('is_wrapper')]
+        individual_fcs = [fc for fc in parsed_fcs if not fc.get('is_wrapper')]
+
+        for fc_info in individual_fcs:
+            spec = self._grist_fc_to_spec(fc_info['var_name'], fc_info['data'])
+            # Truncate if needed
+            if len(spec['records']) > max_feat:
+                spec['records'] = spec['records'][:max_feat]
+            table_specs.append(spec)
+
+        for fc_info in wrapper_fcs:
+            spec = self._grist_fc_to_spec(
+                fc_info['var_name'], fc_info['data'],
+                element_name=fc_info.get('element_name')
+            )
+            spec['_is_wrapper'] = True
+            if len(spec['records']) > max_feat:
+                spec['records'] = spec['records'][:max_feat]
+            table_specs.append(spec)
+
+        # Deduplicate table names
+        seen_names = {}
+        for spec in table_specs:
+            tname = spec['table_name']
+            if tname in seen_names:
+                seen_names[tname] += 1
+                spec['table_name'] = f"{tname}_{seen_names[tname]}"
+            else:
+                seen_names[tname] = 1
+
+        # ── 3. Detect form tables + cross-table references ──
+        self._grist_detect_form_tables(table_specs)
+        detected_refs = self._grist_detect_refs(table_specs)
+
+        # ── 4. Transform HTML ────────────────────────────────
+        transformed_html = self._grist_gristify_html(html_text, parsed_fcs, table_specs)
+
+        # ── 5. Assemble SQLite .grist ────────────────────────
+        conn = sqlite3.connect(grist_path)
+        cur = conn.cursor()
+
+        # 5a. Meta-tables
+        self._grist_create_meta_tables(cur)
+
+        # 5b. DocInfo
+        cur.execute("INSERT INTO _grist_DocInfo VALUES (1,'','','',46,?,?)", (tz, '{"locale":"en-US"}'))
+
+        # Counters
+        col_id_ctr = 0
+        table_id_ctr = 0
+        view_id_ctr = 0
+        section_id_ctr = 0
+        field_id_ctr = 0
+        page_id_ctr = 0
+        tab_id_ctr = 0
+
+        table_col_refs = {}
+        table_ids = {}
+        raw_section_ids = {}
+        ref_columns_to_process = []  # [(src_table_name, col_spec, col_ref_id)]
+        first_table_name = table_specs[0]['table_name'] if table_specs else None
+
+        # 5c. Create tables
+        for spec in table_specs:
+            tname = spec['table_name']
+            cols = spec['columns']
+
+            table_id_ctr += 1
+            view_id_ctr += 1
+            section_id_ctr += 1
+
+            raw_view_id = view_id_ctr
+            raw_section_id = section_id_ctr
+            table_ids[tname] = table_id_ctr
+            raw_section_ids[tname] = raw_section_id
+            table_col_refs[tname] = {}
+
+            # _grist_Tables
+            cur.execute(
+                "INSERT INTO _grist_Tables VALUES (?,?,?,0,0,?,0)",
+                (table_id_ctr, tname, raw_view_id, raw_section_id)
+            )
+
+            # manualSort column
+            col_id_ctr += 1
+            cur.execute(
+                "INSERT INTO _grist_Tables_column VALUES (?,?,1.0,'manualSort','ManualSortPos','',0,'','manualSort','',0,0,0,0,NULL,0,NULL)",
+                (col_id_ctr, table_id_ctr)
+            )
+
+            # User columns
+            col_refs_for_fields = []
+            for pos_i, col in enumerate(cols):
+                col_id_ctr += 1
+                table_col_refs[tname][col['col_id']] = col_id_ctr
+                cur.execute(
+                    "INSERT INTO _grist_Tables_column VALUES (?,?,?,?,?,?,0,'',?,?,1,0,0,0,NULL,0,NULL)",
+                    (col_id_ctr, table_id_ctr, float(pos_i + 2),
+                     col['col_id'], col['grist_type'],
+                     col['widget_options'] or '', col['label'], '')
+                )
+                col_refs_for_fields.append(col_id_ctr)
+                # Track Ref columns for post-processing (helper display columns)
+                if col.get('_ref_info'):
+                    ref_columns_to_process.append((tname, col, col_id_ctr))
+
+            # Raw data view
+            cur.execute(
+                "INSERT INTO _grist_Views VALUES (?,?,?,'')",
+                (raw_view_id, tname, 'raw_data')
+            )
+
+            # Raw data section
+            cur.execute(
+                "INSERT INTO _grist_Views_section VALUES (?,?,?,?,'','',0,0,'','','','','','',0,0,0,'','','')",
+                (raw_section_id, table_id_ctr, raw_view_id, 'record')
+            )
+
+            # Section fields
+            for pos_i, cr in enumerate(col_refs_for_fields):
+                field_id_ctr += 1
+                cur.execute(
+                    "INSERT INTO _grist_Views_section_field VALUES (?,?,?,?,100,'',0,0,'','')",
+                    (field_id_ctr, raw_section_id, float(pos_i + 1), cr)
+                )
+
+            # TabBar + Pages
+            tab_id_ctr += 1
+            page_id_ctr += 1
+            cur.execute("INSERT INTO _grist_TabBar VALUES (?,?,?)",
+                        (tab_id_ctr, raw_view_id, float(tab_id_ctr)))
+            cur.execute("INSERT INTO _grist_Pages VALUES (?,?,0,?)",
+                        (page_id_ctr, raw_view_id, float(page_id_ctr)))
+
+            # Create data table — handle Choice (TEXT), Ref (INTEGER), standard types
+            col_defs = ["id INTEGER PRIMARY KEY", "manualSort REAL"]
+            for col in cols:
+                aff = 'TEXT'
+                if col['grist_type'] in ('Int', 'Bool'):
+                    aff = 'INTEGER'
+                elif col['grist_type'] in ('Numeric', 'Date', f'DateTime:{tz}'):
+                    aff = 'REAL'
+                elif col['grist_type'].startswith('Ref:'):
+                    aff = 'INTEGER'
+                # Choice stays TEXT (default)
+                col_defs.append(f'"{col["col_id"]}" {aff}')
+            cur.execute(f'CREATE TABLE "{tname}" ({", ".join(col_defs)})')
+
+            # Insert data
+            if spec['records']:
+                col_ids = [c['col_id'] for c in cols]
+                placeholders = ', '.join(['?'] * (len(col_ids) + 2))
+                quoted_cols = ", ".join(f'"{c}"' for c in col_ids)
+                insert_sql = f'INSERT INTO "{tname}" (id, manualSort, {quoted_cols}) VALUES ({placeholders})'
+                batch = []
+                for row_i, rec in enumerate(spec['records']):
+                    row = [row_i + 1, float(row_i + 1)]
+                    for cid in col_ids:
+                        v = rec.get(cid)
+                        if v is None:
+                            row.append(None)
+                        elif isinstance(v, (int, float, str)):
+                            row.append(v)
+                        elif isinstance(v, bool):
+                            row.append(1 if v else 0)
+                        else:
+                            s = str(v)
+                            row.append(None if ('PyQt' in s or 'QVariant' in s) else s)
+                    batch.append(row)
+                    if len(batch) >= 500:
+                        cur.executemany(insert_sql, batch)
+                        batch = []
+                if batch:
+                    cur.executemany(insert_sql, batch)
+
+        # ── 5d. Ref column post-processing ────────────────────
+        # For each Ref column: add gristHelper_Display formula column + UPDATE displayCol/visibleCol
+        if ref_columns_to_process:
+            helper_counter = {}  # table_name -> count of helpers
+            for src_tname, col, ref_col_id in ref_columns_to_process:
+                ref_info = col['_ref_info']
+                target_tname = ref_info['target_table']
+                target_col_id = ref_info['target_col_id']
+
+                # Get target column ref ID
+                target_col_ref = table_col_refs.get(target_tname, {}).get(target_col_id, 0)
+                if not target_col_ref:
+                    continue
+
+                # Create gristHelper_Display formula column
+                helper_n = helper_counter.get(src_tname, 0) + 1
+                helper_counter[src_tname] = helper_n
+                helper_colId = 'gristHelper_Display' if helper_n == 1 else f'gristHelper_Display{helper_n}'
+                formula = f'${col["col_id"]}.{target_col_id}'
+
+                col_id_ctr += 1
+                helper_col_ref = col_id_ctr
+                cur.execute(
+                    "INSERT INTO _grist_Tables_column VALUES (?,?,?,?,?,?,1,?,?,?,1,0,0,0,NULL,0,NULL)",
+                    (helper_col_ref, table_ids[src_tname], 999.0,
+                     helper_colId, 'Any', '', formula, '', '')
+                )
+
+                # Add column to the SQLite data table (cached formula values, NULL initially)
+                cur.execute(f'ALTER TABLE "{src_tname}" ADD COLUMN "{helper_colId}" TEXT')
+
+                # UPDATE the Ref column: set displayCol → helper, visibleCol → target col
+                cur.execute(
+                    "UPDATE _grist_Tables_column SET displayCol=?, visibleCol=? WHERE id=?",
+                    (helper_col_ref, target_col_ref, ref_col_id)
+                )
+
+        # ── 6. Widget page: "Carte interactive" ──────────────
+        if first_table_name:
+            view_id_ctr += 1
+            map_view_id = view_id_ctr
+
+            section_id_ctr += 1
+            map_section_id = section_id_ctr
+
+            section_id_ctr += 1
+            table_section_id = section_id_ctr
+
+            tid = table_ids[first_table_name]
+            crefs = table_col_refs[first_table_name]
+
+            layout = json.dumps({
+                "children": [
+                    {"leaf": map_section_id, "size": 65},
+                    {"leaf": table_section_id, "size": 35}
+                ]
+            })
+
+            # Custom widget with transformed HTML
+            custom_view_inner = json.dumps({
+                "mode": "url",
+                "url": None,
+                "widgetDef": {
+                    "name": "Custom widget builder",
+                    "url": "https://gristlabs.github.io/grist-widget/buildwidget/",
+                    "widgetId": "@berhalak/custom-widget-builder",
+                    "published": True,
+                    "accessLevel": "full",
+                    "renderAfterReady": True,
+                    "description": "Interactive map from HTML export",
+                    "isGristLabsMaintained": False,
+                },
+                "access": "full",
+                "pluginId": "",
+                "sectionId": "",
+                "renderAfterReady": True,
+                "widgetId": "@berhalak/custom-widget-builder",
+                "widgetOptions": {
+                    "_js": "",
+                    "_html": transformed_html
+                },
+                "columnsMapping": None
+            })
+            map_options = json.dumps({"customView": custom_view_inner})
+
+            cur.execute("INSERT INTO _grist_Views VALUES (?,?,'',?)",
+                        (map_view_id, 'Carte interactive', layout))
+
+            # Custom widget section
+            cur.execute(
+                "INSERT INTO _grist_Views_section VALUES (?,?,?,?,'Carte','',0,0,'',?,'','','','',0,0,0,'','','')",
+                (map_section_id, tid, map_view_id, 'custom', map_options)
+            )
+
+            # Fields for custom widget section
+            first_spec = table_specs[0]
+            for pos_i, col in enumerate(first_spec['columns']):
+                if col['col_id'] in crefs:
+                    field_id_ctr += 1
+                    cur.execute(
+                        "INSERT INTO _grist_Views_section_field VALUES (?,?,?,?,100,'',0,0,'','')",
+                        (field_id_ctr, map_section_id, float(pos_i + 1), crefs[col['col_id']])
+                    )
+
+            # Grid section below
+            cur.execute(
+                "INSERT INTO _grist_Views_section VALUES (?,?,?,?,'Donnees','',0,0,'','','','','','',?,0,0,'','','')",
+                (table_section_id, tid, map_view_id, 'record', map_section_id)
+            )
+            for pos_i, col in enumerate(first_spec['columns']):
+                if col['col_id'] in crefs:
+                    field_id_ctr += 1
+                    cur.execute(
+                        "INSERT INTO _grist_Views_section_field VALUES (?,?,?,?,100,'',0,0,'','')",
+                        (field_id_ctr, table_section_id, float(pos_i + 1), crefs[col['col_id']])
+                    )
+
+            tab_id_ctr += 1
+            page_id_ctr += 1
+            cur.execute("INSERT INTO _grist_TabBar VALUES (?,?,?)",
+                        (tab_id_ctr, map_view_id, float(tab_id_ctr)))
+            cur.execute("INSERT INTO _grist_Pages VALUES (?,?,0,?)",
+                        (page_id_ctr, map_view_id, float(page_id_ctr)))
+
+        # ── 7. Form page (if detected) ──────────────────────
+        form_specs = [s for s in table_specs if s.get('has_form')]
+        for fspec in form_specs:
+            fname = fspec['table_name']
+            ftid = table_ids[fname]
+            fcrefs = table_col_refs[fname]
+
+            view_id_ctr += 1
+            form_view_id = view_id_ctr
+
+            section_id_ctr += 1
+            form_section_id = section_id_ctr
+            section_id_ctr += 1
+            form_grid_section_id = section_id_ctr
+
+            layout = json.dumps({
+                "children": [
+                    {"leaf": form_section_id, "size": 50},
+                    {"leaf": form_grid_section_id, "size": 50}
+                ]
+            })
+
+            cur.execute("INSERT INTO _grist_Views VALUES (?,?,'',?)",
+                        (form_view_id, f'Saisie {fname}', layout))
+
+            # Form section
+            cur.execute(
+                "INSERT INTO _grist_Views_section VALUES (?,?,?,?,'Formulaire','',0,0,'','','','','','',0,0,0,'','','')",
+                (form_section_id, ftid, form_view_id, 'form')
+            )
+            for pos_i, col in enumerate(fspec['columns']):
+                if col['col_id'] in fcrefs:
+                    field_id_ctr += 1
+                    cur.execute(
+                        "INSERT INTO _grist_Views_section_field VALUES (?,?,?,?,100,'',0,0,'','')",
+                        (field_id_ctr, form_section_id, float(pos_i + 1), fcrefs[col['col_id']])
+                    )
+
+            # Grid section
+            cur.execute(
+                "INSERT INTO _grist_Views_section VALUES (?,?,?,?,'Donnees','',0,0,'','','','','','',0,0,0,'','','')",
+                (form_grid_section_id, ftid, form_view_id, 'record')
+            )
+            for pos_i, col in enumerate(fspec['columns']):
+                if col['col_id'] in fcrefs:
+                    field_id_ctr += 1
+                    cur.execute(
+                        "INSERT INTO _grist_Views_section_field VALUES (?,?,?,?,100,'',0,0,'','')",
+                        (field_id_ctr, form_grid_section_id, float(pos_i + 1), fcrefs[col['col_id']])
+                    )
+
+            tab_id_ctr += 1
+            page_id_ctr += 1
+            cur.execute("INSERT INTO _grist_TabBar VALUES (?,?,?)",
+                        (tab_id_ctr, form_view_id, float(tab_id_ctr)))
+            cur.execute("INSERT INTO _grist_Pages VALUES (?,?,0,?)",
+                        (page_id_ctr, form_view_id, float(page_id_ctr)))
+
+        # ── 8. ACL ───────────────────────────────────────────
+        cur.execute("INSERT INTO _grist_ACLPrincipals VALUES (1,'group','','','Owners','')")
+        cur.execute("INSERT INTO _grist_ACLPrincipals VALUES (2,'group','','','Admins','')")
+        cur.execute("INSERT INTO _grist_ACLPrincipals VALUES (3,'group','','','Editors','')")
+        cur.execute("INSERT INTO _grist_ACLPrincipals VALUES (4,'group','','','Viewers','')")
+        cur.execute("INSERT INTO _grist_ACLResources VALUES (1,'','')")
+        cur.execute("INSERT INTO _grist_ACLRules VALUES (1,1,63,'[1]','',0,'','',1e999,'','')")
+
+        conn.commit()
+        conn.close()
+
+        total_records = sum(len(s['records']) for s in table_specs)
+        size = os.path.getsize(grist_path)
+        fname = os.path.basename(grist_path)
+
+        return {
+            "success": True,
+            "path": grist_path,
+            "download_url": f"http://localhost:8080/api/files/{fname}",
+            "size_bytes": size,
+            "size_mb": round(size / 1024 / 1024, 1),
+            "document_name": doc_name,
+            "source_html": html_path,
+            "tables": len(table_specs),
+            "total_records": total_records,
+            "form_tables": [s['table_name'] for s in form_specs],
+            "references": detected_refs if detected_refs else [],
+            "layers": {s['table_name']: len(s['records']) for s in table_specs},
+        }
+
+    @staticmethod
+    def _grist_parse_html_geojson(html_text):
+        """Universal scanner: find all GeoJSON FeatureCollections in any HTML.
+
+        Scans for "FeatureCollection" markers, backtracks to opening brace,
+        extracts JSON by brace-counting, and identifies the JS variable name.
+        Also handles layersData wrapper arrays (web_map template).
+
+        Returns list of dicts:
+          [{"var_name": str, "data": dict, "start": int, "end": int}, ...]
+        """
+        import re as _re
+
+        results = []
+        seen_fingerprints = set()
+        marker = '"FeatureCollection"'
+        search_start = 0
+
+        while True:
+            idx = html_text.find(marker, search_start)
+            if idx == -1:
+                break
+            search_start = idx + len(marker)
+
+            # Backtrack to the opening brace of this JSON object
+            brace_start = idx
+            while brace_start > 0 and html_text[brace_start] != '{':
+                brace_start -= 1
+            if html_text[brace_start] != '{':
+                continue
+
+            # Extract JSON by brace counting (handles nested objects, strings)
+            depth = 0
+            i = brace_start
+            in_string = False
+            escape = False
+            json_end = -1
+            while i < len(html_text):
+                ch = html_text[i]
+                if escape:
+                    escape = False
+                    i += 1
+                    continue
+                if ch == '\\' and in_string:
+                    escape = True
+                    i += 1
+                    continue
+                if ch == '"':
+                    in_string = not in_string
+                elif not in_string:
+                    if ch == '{':
+                        depth += 1
+                    elif ch == '}':
+                        depth -= 1
+                        if depth == 0:
+                            json_end = i + 1
+                            break
+                i += 1
+
+            if json_end == -1:
+                continue
+
+            json_str = html_text[brace_start:json_end]
+
+            # Parse and validate
+            try:
+                data = json.loads(json_str)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            if data.get("type") != "FeatureCollection":
+                continue
+            features = data.get("features", [])
+
+            # Deduplicate by fingerprint (property keys + count)
+            if features:
+                sample_keys = sorted(features[0].get("properties", {}).keys())
+                fp = f"{','.join(sample_keys)}:{len(features)}"
+            else:
+                fp = f"empty:{brace_start}"
+            if fp in seen_fingerprints:
+                continue
+            seen_fingerprints.add(fp)
+
+            # Find JS variable name in the 200 chars before the brace
+            prefix = html_text[max(0, brace_start - 200):brace_start]
+            var_match = _re.search(r'(\w+)\s*=\s*$', prefix)
+            var_name = var_match.group(1) if var_match else f"data_{len(results)}"
+
+            results.append({
+                "var_name": var_name,
+                "data": data,
+                "start": brace_start,
+                "end": json_end,
+            })
+
+        # ── Handle layersData wrapper: array of {name, geojson: {FC}, ...}
+        # Detect if any variable is an array containing objects with .geojson FCs
+        layer_array_re = _re.compile(r'var\s+(\w+)\s*=\s*\[')
+        for m in layer_array_re.finditer(html_text):
+            var_name = m.group(1)
+            arr_start = m.end() - 1  # position of '['
+
+            # Bracket counting to find end of array
+            depth = 0
+            i = arr_start
+            in_str = False
+            esc = False
+            arr_end = -1
+            while i < len(html_text):
+                ch = html_text[i]
+                if esc:
+                    esc = False
+                    i += 1
+                    continue
+                if ch == '\\' and in_str:
+                    esc = True
+                    i += 1
+                    continue
+                if ch == '"':
+                    in_str = not in_str
+                elif not in_str:
+                    if ch == '[':
+                        depth += 1
+                    elif ch == ']':
+                        depth -= 1
+                        if depth == 0:
+                            arr_end = i + 1
+                            break
+                i += 1
+
+            if arr_end == -1:
+                continue
+
+            arr_str = html_text[arr_start:arr_end]
+            try:
+                arr_data = json.loads(arr_str)
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+            if not isinstance(arr_data, list) or len(arr_data) == 0:
+                continue
+
+            # Check if this is a wrapper: each element has a .geojson key that is a FC
+            has_geojson = all(
+                isinstance(el, dict) and isinstance(el.get("geojson"), dict)
+                and el["geojson"].get("type") == "FeatureCollection"
+                for el in arr_data
+            )
+            if not has_geojson:
+                continue
+
+            # Remove any individually-found FCs that are subsets of this array
+            results = [r for r in results
+                       if not (r["start"] >= arr_start and r["end"] <= arr_end)]
+
+            # Add each element as a separate FC, tagged as wrapper
+            for el_idx, el in enumerate(arr_data):
+                fc = el["geojson"]
+                el_name = el.get("name", f"Layer_{el_idx}")
+                fp = f"wrapper:{var_name}:{el_idx}"
+                if fp in seen_fingerprints:
+                    continue
+                seen_fingerprints.add(fp)
+
+                results.append({
+                    "var_name": var_name,
+                    "data": fc,
+                    "start": arr_start,
+                    "end": arr_end,
+                    "is_wrapper": True,
+                    "wrapper_index": el_idx,
+                    "wrapper_total": len(arr_data),
+                    "wrapper_element": el,  # keep full element (name, color, legend, etc.)
+                    "element_name": el_name,
+                })
+
+        return results
+
+    @staticmethod
+    def _grist_flatten_coords(coords, flat):
+        """Recursively flatten GeoJSON coordinates to list of [lon, lat] pairs."""
+        if not coords:
+            return
+        if isinstance(coords[0], (int, float)):
+            flat.append(coords)
+        elif isinstance(coords[0], list):
+            if isinstance(coords[0][0], (int, float)):
+                flat.extend(coords)
+            else:
+                for sub in coords:
+                    QGISBridge._grist_flatten_coords(sub, flat)
+
+    @staticmethod
+    def _grist_fc_to_spec(var_name, fc, element_name=None):
+        """Convert a GeoJSON FeatureCollection to a Grist table spec.
+
+        No QGIS dependency — works purely from GeoJSON data.
+        Returns a spec dict compatible with the existing SQLite assembly code.
+        """
+        import re as _re
+        import unicodedata
+
+        def _strip(text):
+            return ''.join(ch for ch in unicodedata.normalize('NFKD', text)
+                           if not unicodedata.combining(ch))
+
+        def _san_table(name):
+            s = _strip(name)
+            s = _re.sub(r'[^A-Za-z0-9_]', '_', s).strip('_')
+            s = _re.sub(r'_+', '_', s)
+            # Clean common prefixes: json_, data_, Data, etc.
+            s = _re.sub(r'^(json|var|data)_', '', s, flags=_re.IGNORECASE)
+            s = _re.sub(r'_?(Data|Json|Geojson)$', '', s, flags=_re.IGNORECASE)
+            if not s or s[0].isdigit():
+                s = 'T' + s
+            # Capitalize first letter
+            return (s[0].upper() + s[1:]) if s else 'Unnamed'
+
+        def _san_col(name):
+            s = _strip(name)
+            s = _re.sub(r'[^A-Za-z0-9_]', '_', s).strip('_')
+            s = _re.sub(r'_+', '_', s)
+            if not s or s[0].isdigit():
+                s = 'c' + s
+            if s.lower() in ('id', 'manualsort'):
+                s = s + '_col'
+            return s or 'unnamed'
+
+        # Table name
+        tname = _san_table(element_name or var_name)
+
+        features = fc.get("features", [])
+        if not features:
+            return {
+                'table_name': tname, 'columns': [], 'records': [],
+                'geom_type': 'unknown', 'has_form': False,
+            }
+
+        # Detect majority geometry type from first 50 features
+        geom_counts = {}
+        for f in features[:50]:
+            g = f.get("geometry")
+            if g:
+                gt = g.get("type", "")
+                base = gt.replace("Multi", "")
+                geom_counts[base] = geom_counts.get(base, 0) + 1
+
+        majority_geom = max(geom_counts, key=geom_counts.get) if geom_counts else "Polygon"
+        is_point = majority_geom == "Point"
+
+        # Scan properties across first 50 features — collect all keys + infer types
+        all_keys = {}  # key → python type name
+        for f in features[:50]:
+            props = f.get("properties") or {}
+            for k, v in props.items():
+                if v is None:
+                    continue
+                if k not in all_keys:
+                    if isinstance(v, bool):
+                        all_keys[k] = 'Bool'
+                    elif isinstance(v, int):
+                        all_keys[k] = 'Int'
+                    elif isinstance(v, float):
+                        all_keys[k] = 'Numeric'
+                    else:
+                        all_keys[k] = 'Text'
+
+        # Detect date columns: name pattern + ISO value check
+        _date_name_pat = _re.compile(r'(^date_|_date$|^date$|^created|^updated)', _re.IGNORECASE)
+        _date_val_pat = _re.compile(r'^\d{4}-\d{2}-\d{2}')
+        for k in list(all_keys.keys()):
+            if all_keys[k] != 'Text':
+                continue
+            if not _date_name_pat.search(k):
+                continue
+            # Verify at least one value looks like a date
+            for f in features[:10]:
+                v = (f.get("properties") or {}).get(k)
+                if v and isinstance(v, str) and _date_val_pat.match(v):
+                    all_keys[k] = 'Date'
+                    break
+
+        # Build columns
+        columns = []
+        MAX_COLS = 30
+        # Priority: keep _color, skip _geojson-like internal columns
+        priority_keys = [k for k in all_keys if k == '_color']
+        normal_keys = [k for k in all_keys if k != '_color']
+        ordered_keys = priority_keys + normal_keys[:MAX_COLS - len(priority_keys)]
+
+        for k in ordered_keys:
+            wo = ''
+            if all_keys[k] == 'Date':
+                wo = '{"dateFormat": "YYYY-MM-DD"}'
+            columns.append({
+                'col_id': _san_col(k),
+                'grist_type': all_keys[k],
+                'label': k,
+                'widget_options': wo,
+                'original_name': k,
+            })
+
+        # Add geometry columns
+        if is_point:
+            columns.append({'col_id': 'latitude', 'grist_type': 'Numeric', 'label': 'Latitude', 'widget_options': '', 'original_name': ''})
+            columns.append({'col_id': 'longitude', 'grist_type': 'Numeric', 'label': 'Longitude', 'widget_options': '', 'original_name': ''})
+        else:
+            columns.append({'col_id': 'centroid_lat', 'grist_type': 'Numeric', 'label': 'Centroid Lat', 'widget_options': '', 'original_name': ''})
+            columns.append({'col_id': 'centroid_lon', 'grist_type': 'Numeric', 'label': 'Centroid Lon', 'widget_options': '', 'original_name': ''})
+            columns.append({'col_id': 'geojson', 'grist_type': 'Text', 'label': 'GeoJSON', 'widget_options': '', 'original_name': ''})
+
+        # Extract records
+        records = []
+        for f in features:
+            rec = {}
+            props = f.get("properties") or {}
+
+            # Property columns
+            for col in columns:
+                orig = col.get('original_name', '')
+                if orig and orig in props:
+                    v = props[orig]
+                    # Type coercion
+                    if col['grist_type'] == 'Int' and v is not None:
+                        try:
+                            v = int(v)
+                        except (ValueError, TypeError):
+                            v = None
+                    elif col['grist_type'] == 'Numeric' and v is not None:
+                        try:
+                            v = float(v)
+                        except (ValueError, TypeError):
+                            v = None
+                    elif col['grist_type'] == 'Date' and v is not None:
+                        try:
+                            import calendar, time
+                            v = calendar.timegm(time.strptime(str(v)[:10], "%Y-%m-%d"))
+                        except (ValueError, TypeError):
+                            v = None
+                    rec[col['col_id']] = v
+
+            # Geometry columns
+            geom = f.get("geometry")
+            if geom:
+                gtype = geom.get("type", "")
+                coords = geom.get("coordinates", [])
+                if is_point and gtype == "Point" and len(coords) >= 2:
+                    rec['latitude'] = round(coords[1], 7)
+                    rec['longitude'] = round(coords[0], 7)
+                elif is_point and gtype == "MultiPoint" and coords:
+                    # Use first point
+                    pt = coords[0]
+                    if len(pt) >= 2:
+                        rec['latitude'] = round(pt[1], 7)
+                        rec['longitude'] = round(pt[0], 7)
+                else:
+                    # Polygon/Line — compute centroid (avg of all coords) + store geojson
+                    rec['geojson'] = json.dumps(geom, ensure_ascii=False)
+                    flat = []
+                    QGISBridge._grist_flatten_coords(coords, flat)
+                    if flat:
+                        avg_lon = sum(c[0] for c in flat) / len(flat)
+                        avg_lat = sum(c[1] for c in flat) / len(flat)
+                        rec['centroid_lat'] = round(avg_lat, 7)
+                        rec['centroid_lon'] = round(avg_lon, 7)
+
+            records.append(rec)
+
+        return {
+            'table_name': tname,
+            'columns': columns,
+            'records': records,
+            'geom_type': majority_geom.lower(),
+            'has_form': False,  # set later by _grist_detect_form_tables
+        }
+
+    @staticmethod
+    def _grist_detect_form_tables(specs):
+        """Detect tables with QField-style form patterns.
+
+        - Marks spec['has_form'] = True for tables matching >= 2 form patterns
+        - Converts detected choice columns to Grist 'Choice' type with dropdown values
+        - Populates widgetOptions with choices list + colored choiceOptions
+        """
+        import json as _json
+
+        form_patterns = {
+            'categorie': 'Choice', 'category': 'Choice', 'type': 'Choice',
+            'priorite': 'Choice', 'priority': 'Choice',
+            'statut': 'Choice', 'status': 'Choice', 'etat': 'Choice',
+            'titre': 'Text', 'title': 'Text', 'nom': 'Text', 'name': 'Text',
+            'description': 'Text', 'commentaire': 'Text', 'notes': 'Text',
+            'photo': 'Attachments', 'image': 'Attachments', 'attachment': 'Attachments',
+        }
+        date_re_pat = None
+        try:
+            import re
+            date_re_pat = re.compile(r'(^date_|_date$|^date$)', re.IGNORECASE)
+        except Exception:
+            pass
+
+        # Grist-compatible color palette for Choice pill backgrounds
+        _CHOICE_COLORS = [
+            '#4285F4', '#EA4335', '#FBBC04', '#34A853', '#FF6D01',
+            '#46BDC6', '#7BAAF7', '#F07B72', '#FCD04F', '#57BB8A',
+            '#FF9E80', '#80CBC4', '#9FA8DA', '#F48FB1', '#A5D6A7',
+        ]
+
+        for spec in specs:
+            matches = 0
+            choice_cols = []
+            for col in spec['columns']:
+                label_lower = col.get('label', '').lower()
+                col_id_lower = col['col_id'].lower()
+
+                # Check known patterns
+                for pat, grist_type in form_patterns.items():
+                    if pat in label_lower or pat in col_id_lower:
+                        matches += 1
+                        if grist_type == 'Choice':
+                            choice_cols.append(col)
+                        break
+
+                # Check date pattern
+                if date_re_pat and (date_re_pat.search(label_lower) or date_re_pat.search(col_id_lower)):
+                    matches += 1
+
+            if matches >= 2:
+                spec['has_form'] = True
+
+                # Convert choice columns: set type='Choice' + collect unique values for dropdowns
+                for col in choice_cols:
+                    col_id = col['col_id']
+                    unique_vals = []
+                    seen = set()
+                    for rec in spec['records']:
+                        v = rec.get(col_id)
+                        if v is not None and str(v).strip() and str(v) not in seen:
+                            seen.add(str(v))
+                            unique_vals.append(str(v))
+                        if len(unique_vals) >= 50:
+                            break
+
+                    # Only convert if reasonable number of unique values (1-30)
+                    if unique_vals and len(unique_vals) <= 30:
+                        sorted_vals = sorted(unique_vals)
+                        choice_opts = {}
+                        for i, val in enumerate(sorted_vals):
+                            choice_opts[val] = {
+                                "fillColor": _CHOICE_COLORS[i % len(_CHOICE_COLORS)],
+                                "textColor": "#FFFFFF"
+                            }
+                        col['grist_type'] = 'Choice'
+                        col['widget_options'] = _json.dumps({
+                            "choices": sorted_vals,
+                            "choiceOptions": choice_opts
+                        }, ensure_ascii=False)
+
+    @staticmethod
+    def _grist_detect_refs(specs):
+        """Detect cross-table references based on naming patterns and value matching.
+
+        Conservative: only triggers when a column name clearly matches
+        '{OtherTable}_id' or 'id_{OtherTable}' and >=80% of values match.
+
+        Modifies specs in-place:
+        - Sets col['_ref_info'] = {'target_table', 'target_col_id', 'value_to_rowid'}
+        - Changes col['grist_type'] to 'Ref:TargetTable'
+        - Converts record values from original values to Grist row IDs (1-based)
+
+        Returns list of detected refs for logging.
+        """
+        if len(specs) < 2:
+            return []
+
+        import re as _re
+
+        # Build lookup: table_name_lower -> spec
+        tname_map = {s['table_name'].lower(): s for s in specs}
+
+        detected = []
+
+        for spec in specs:
+            tname = spec['table_name']
+            for col in spec['columns']:
+                col_id = col['col_id']
+                col_lower = col_id.lower()
+
+                # Skip geometry and system columns
+                if col_id in ('latitude', 'longitude', 'centroid_lat', 'centroid_lon',
+                              'geojson', 'color', 'manualSort'):
+                    continue
+
+                # Try naming patterns: {table}_id, id_{table}, {table}Id, {table}_ref
+                for other_spec in specs:
+                    if other_spec['table_name'] == tname:
+                        continue
+                    ot_lower = other_spec['table_name'].lower()
+                    patterns = [
+                        f'{ot_lower}_id', f'id_{ot_lower}',
+                        f'{ot_lower}id', f'ref_{ot_lower}',
+                        f'{ot_lower}_ref',
+                    ]
+                    if col_lower not in patterns:
+                        continue
+
+                    # Found a naming match — check value overlap
+                    src_vals = set()
+                    for rec in spec['records'][:200]:
+                        v = rec.get(col_id)
+                        if v is not None and str(v).strip():
+                            src_vals.add(str(v))
+                    if not src_vals:
+                        continue
+
+                    # Find best matching column in target table
+                    best_match = None
+                    best_overlap = 0
+                    for target_col in other_spec['columns']:
+                        target_vals = set()
+                        for rec in other_spec['records'][:500]:
+                            v = rec.get(target_col['col_id'])
+                            if v is not None and str(v).strip():
+                                target_vals.add(str(v))
+                        if not target_vals:
+                            continue
+                        overlap = len(src_vals & target_vals)
+                        if overlap > best_overlap:
+                            best_overlap = overlap
+                            best_match = target_col
+
+                    # Require >= 80% of source values to match
+                    if best_match and best_overlap >= len(src_vals) * 0.8:
+                        target_col_id = best_match['col_id']
+                        # Build value → rowId mapping (Grist row IDs are 1-based)
+                        value_to_rowid = {}
+                        for i, rec in enumerate(other_spec['records']):
+                            v = rec.get(target_col_id)
+                            if v is not None:
+                                value_to_rowid[str(v)] = i + 1
+
+                        # Convert record values to row IDs
+                        for rec in spec['records']:
+                            v = rec.get(col_id)
+                            if v is not None:
+                                rec[col_id] = value_to_rowid.get(str(v), 0)
+                            else:
+                                rec[col_id] = 0
+
+                        col['grist_type'] = f'Ref:{other_spec["table_name"]}'
+                        col['_ref_info'] = {
+                            'target_table': other_spec['table_name'],
+                            'target_col_id': target_col_id,
+                        }
+                        detected.append({
+                            'src_table': tname, 'src_col': col_id,
+                            'target_table': other_spec['table_name'],
+                            'target_col': target_col_id,
+                        })
+                        break  # Found match, stop checking other tables
+
+                    if col.get('_ref_info'):
+                        break
+
+        return detected
+
+    @staticmethod
+    def _grist_gristify_html(html_text, parsed_fcs, table_specs):
+        """Transform HTML: remove inline GeoJSON data, inject Grist bootstrap.
+
+        parsed_fcs: output of _grist_parse_html_geojson()
+        table_specs: list of spec dicts from _grist_fc_to_spec(), in same order as parsed_fcs
+
+        IMPORTANT: Bootstrap JS is injected as raw code within the existing <script>
+        block — never as a new <script>...</script> which would break the DOM.
+
+        Returns transformed HTML string.
+        """
+        import re as _re
+
+        # ── 1. Inject Grist API in <head> ────────────────────
+        head_close = html_text.find('</head>')
+        if head_close == -1:
+            head_close = html_text.find('<body')
+            if head_close == -1:
+                head_close = 0
+        grist_api_tag = '\n<script src="https://docs.getgrist.com/grist-plugin-api.js"></script>\n'
+        html_text = html_text[:head_close] + grist_api_tag + html_text[head_close:]
+
+        # Recompute positions after insertion (shift all start/end by the inserted length)
+        shift = len(grist_api_tag)
+        for fc in parsed_fcs:
+            fc['start'] += shift
+            fc['end'] += shift
+
+        # ── 2. Determine if we have wrapper (layersData) or individual vars ──
+        wrapper_fcs = [fc for fc in parsed_fcs if fc.get('is_wrapper')]
+        individual_fcs = [fc for fc in parsed_fcs if not fc.get('is_wrapper')]
+
+        # ── 3. Replace inline data with window refs ─────────
+        # Data vars may be local (inside IIFE → _continueInit), so we must
+        # reference window["varName"] instead of null to pick up bootstrap values.
+        replacements = []
+
+        if wrapper_fcs:
+            arr_start = wrapper_fcs[0]['start']
+            arr_end = wrapper_fcs[0]['end']
+            wvar = wrapper_fcs[0]['var_name']
+            replacements.append((arr_start, arr_end, f'window["{wvar}"]'))
+
+        for fc in individual_fcs:
+            replacements.append((fc['start'], fc['end'], f'window["{fc["var_name"]}"]'))
+
+        # Sort descending to preserve positions
+        replacements.sort(key=lambda x: x[0], reverse=True)
+        for start, end, replacement in replacements:
+            html_text = html_text[:start] + replacement + html_text[end:]
+
+        # ── 4. Build the bootstrap JS (raw code, NO <script> tags) ──
+        col_to_fc_js = """
+function _colToFC(data) {
+  if (!data || !data.id) return {type:"FeatureCollection",features:[]};
+  var keys = Object.keys(data).filter(function(k){return k!=='id'&&k!=='manualSort';});
+  var geoKeys = {latitude:1,longitude:1,centroid_lat:1,centroid_lon:1,geojson:1};
+  var features = [];
+  for (var i=0;i<data.id.length;i++) {
+    var props={}, geom=null;
+    keys.forEach(function(k){
+      var v = data[k][i];
+      if (k==='geojson') { try{geom=JSON.parse(v);}catch(e){} }
+      else if (!geoKeys[k]) { if(v!==null&&v!=='') props[k]=v; }
+    });
+    if (!geom && data.latitude && data.longitude) {
+      geom={type:"Point",coordinates:[data.longitude[i],data.latitude[i]]};
+    }
+    if (!geom && data.centroid_lat && data.centroid_lon) {
+      geom={type:"Point",coordinates:[data.centroid_lon[i],data.centroid_lat[i]]};
+    }
+    if (geom) features.push({type:"Feature",geometry:geom,properties:props});
+  }
+  return {type:"FeatureCollection",features:features};
+}
+"""
+
+        if wrapper_fcs:
+            var_name = wrapper_fcs[0]['var_name']
+            layers_config = []
+            for fc_info, spec in zip(wrapper_fcs, [s for s in table_specs if s.get('_is_wrapper')]):
+                el = fc_info.get('wrapper_element', {})
+                layers_config.append({
+                    'table': spec['table_name'],
+                    'name': el.get('name', spec['table_name']),
+                    'color': el.get('color', '#3498db'),
+                    'geomType': spec.get('geom_type', 'polygon'),
+                    'legend': el.get('legend', []),
+                    'has_feature_colors': el.get('has_feature_colors', False),
+                })
+
+            layers_json = json.dumps(layers_config, ensure_ascii=False)
+            bootstrap = f"""
+// ── Grist Data Bootstrap ──────────────────────────────────
+{col_to_fc_js}
+var _GRIST_LAYERS = {layers_json};
+var _gristPending = _GRIST_LAYERS.length;
+var _gristInitDone = false;
+
+grist.ready({{requiredAccess:'full'}});
+
+function _safeInit() {{
+  if (_gristInitDone) return;
+  _gristInitDone = true;
+  try {{ _continueInit(); }} catch(e) {{ console.error('Map init error:', e); }}
+}}
+
+var _layerResults = [];
+_GRIST_LAYERS.forEach(function(info, idx){{
+  grist.docApi.fetchTable(info.table).then(function(d){{
+    _layerResults[idx] = {{name:info.name, color:info.color, geojson:_colToFC(d), feature_count:d.id.length, legend:info.legend, has_feature_colors:info.has_feature_colors}};
+    if(--_gristPending<=0) {{ {var_name} = _layerResults.filter(Boolean); _safeInit(); }}
+  }}).catch(function(e){{
+    console.error('Grist fetch error for '+info.table+':',e);
+    _layerResults[idx] = {{name:info.name, color:info.color, geojson:{{type:"FeatureCollection",features:[]}}, feature_count:0, legend:info.legend}};
+    if(--_gristPending<=0) {{ {var_name} = _layerResults.filter(Boolean); _safeInit(); }}
+  }});
+}});
+
+"""
+        else:
+            tables_config = {}
+            for fc_info, spec in zip(individual_fcs, [s for s in table_specs if not s.get('_is_wrapper')]):
+                tables_config[spec['table_name']] = {
+                    'varName': fc_info['var_name'],
+                    'geomType': spec.get('geom_type', 'polygon'),
+                }
+
+            tables_json = json.dumps(tables_config, ensure_ascii=False)
+            bootstrap = f"""
+// ── Grist Data Bootstrap ──────────────────────────────────
+{col_to_fc_js}
+var _GRIST_TABLES = {tables_json};
+var _gristPending = Object.keys(_GRIST_TABLES).length;
+var _gristInitDone = false;
+
+grist.ready({{requiredAccess:'full'}});
+
+function _safeInit() {{
+  if (_gristInitDone) return;
+  _gristInitDone = true;
+  try {{ _continueInit(); }} catch(e) {{ console.error('Map init error:', e); }}
+}}
+
+Object.keys(_GRIST_TABLES).forEach(function(tname){{
+  var info = _GRIST_TABLES[tname];
+  grist.docApi.fetchTable(tname).then(function(d){{
+    window[info.varName] = _colToFC(d);
+    if(--_gristPending<=0) _safeInit();
+  }}).catch(function(e){{
+    console.error('Grist fetch error for '+tname+':',e);
+    window[info.varName] = {{type:"FeatureCollection",features:[]}};
+    if(--_gristPending<=0) _safeInit();
+  }});
+}});
+
+"""
+
+        # ── 5. Insert bootstrap + wrap init in _continueInit ─
+        # All injection is raw JS within the existing <script> block.
+        # Strategy:
+        #   - IIFE: replace `(function() {` with bootstrap + `function _continueInit() {`
+        #           replace `})();` with `}`
+        #   - No IIFE: insert bootstrap + `function _continueInit() {` before init code,
+        #              add `}` before the closing `</script>`
+
+        iife_match = _re.search(r'\(function\s*\(\s*\)\s*\{', html_text)
+
+        if iife_match:
+            # Replace IIFE opening with bootstrap + _continueInit function
+            iife_start = iife_match.start()
+            iife_end = iife_match.end()
+
+            html_text = (html_text[:iife_start]
+                         + '\n' + bootstrap
+                         + 'function _continueInit() {\n'
+                         + html_text[iife_end:])
+
+            # Find and replace the IIFE closing: })(); → }
+            # Search from after our insertion
+            search_from = iife_start + len(bootstrap) + len('function _continueInit() {\n')
+            close_iife = _re.search(r'\}\s*\)\s*\(\s*\)\s*;?', html_text[search_from:])
+            if close_iife:
+                close_start = search_from + close_iife.start()
+                close_end = search_from + close_iife.end()
+                html_text = html_text[:close_start] + '\n}\n' + html_text[close_end:]
+        else:
+            # No IIFE — find first executable init code after the last nullified data
+            init_patterns = [
+                r'var\s+map\s*=',
+                r'L\.map\s*\(',
+                r'document\s*\.\s*addEventListener',
+                r'window\s*\.\s*onload',
+            ]
+            combined_pattern = '|'.join(init_patterns)
+
+            last_null_pos = 0
+            for fc in parsed_fcs:
+                end_pos = fc.get('end', 0)
+                if end_pos > last_null_pos:
+                    last_null_pos = end_pos
+
+            init_match = _re.search(combined_pattern, html_text[last_null_pos:])
+            if init_match:
+                insert_pos = last_null_pos + init_match.start()
+                line_start = html_text.rfind('\n', 0, insert_pos) + 1
+
+                # Insert bootstrap + _continueInit opening as raw JS
+                html_text = (html_text[:line_start]
+                             + '\n' + bootstrap
+                             + 'function _continueInit() {\n'
+                             + html_text[line_start:])
+
+                # Find the closing </script> and add } just before it
+                close_offset = line_start + len(bootstrap) + len('function _continueInit() {\n') + 50
+                script_close = html_text.find('</script>', close_offset)
+                if script_close != -1:
+                    html_text = html_text[:script_close] + '\n}\n' + html_text[script_close:]
+            else:
+                # Fallback: inject as a new script block at end of body
+                body_close = html_text.rfind('</body>')
+                if body_close == -1:
+                    body_close = len(html_text)
+                html_text = (html_text[:body_close]
+                             + '\n<script>\n' + bootstrap
+                             + 'function _continueInit() { /* no init code found */ }\n'
+                             + '</script>\n'
+                             + html_text[body_close:])
+
+        return html_text
 
     @staticmethod
     def _grist_create_meta_tables(c):

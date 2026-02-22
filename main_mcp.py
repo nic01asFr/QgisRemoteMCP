@@ -564,11 +564,12 @@ TOOLS = [
     # ── Grist Export ─────────────────────────────────────────────
     {
         "name": "export_grist",
-        "description": "Export the current QGIS project as a .grist file (SQLite). Creates a complete Grist document with tables, typed columns, data records, Choice dropdowns, lat/lon for map widget, and auto-detected relationships between layers. Generates pre-configured pages: Carte (map + linked table), Statistiques (chart + stats table), Saisie terrain (form + map). The .grist file can be uploaded to any Grist instance.",
+        "description": "Export as a .grist file (SQLite). Two modes: (1) From QGIS project layers (default) — creates tables, typed columns, map widget, stats, form. (2) From HTML file (html_path) — takes any HTML containing GeoJSON (export_web_map, export_flood_map, export_temporal_map, qgis2web, or any Leaflet HTML), extracts data into Grist tables, and transforms the original map into a Grist custom widget reading from those tables. Same interactive map, but data lives in Grist.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "document_name": {"type": "string", "description": "Document name (default: project name)"},
+                "html_path": {"type": "string", "description": "Path to any HTML file containing GeoJSON data (from export_web_map, export_flood_map, export_temporal_map, qgis2web, or any Leaflet HTML with inline FeatureCollections). Converts it into a .grist document with data in tables and the original map as a Grist custom widget."},
+                "document_name": {"type": "string", "description": "Document name (default: derived from html filename or project name)"},
                 "max_features_per_layer": {"type": "integer", "description": "Max features per layer (default: 50000)", "default": 50000},
                 "include_stats": {"type": "boolean", "description": "Generate stats summary table (default: true)", "default": True},
                 "detect_relationships": {"type": "boolean", "description": "Auto-detect Ref columns between tables (default: true)", "default": True},
@@ -1207,7 +1208,7 @@ def _tool_export_qfield(arguments: dict) -> dict:
 
 def _tool_export_grist(arguments: dict) -> dict:
     params = {}
-    for key in ("document_name", "max_features_per_layer", "include_stats",
+    for key in ("html_path", "document_name", "max_features_per_layer", "include_stats",
                 "detect_relationships", "timezone"):
         if key in arguments:
             params[key] = arguments[key]
