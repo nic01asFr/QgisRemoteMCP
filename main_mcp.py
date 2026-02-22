@@ -561,6 +561,22 @@ TOOLS = [
             "required": []
         }
     },
+    # ── Grist Export ─────────────────────────────────────────────
+    {
+        "name": "export_grist",
+        "description": "Export the current QGIS project as a .grist file (SQLite). Creates a complete Grist document with tables, typed columns, data records, Choice dropdowns, lat/lon for map widget, and auto-detected relationships between layers. Generates pre-configured pages: Carte (map + linked table), Statistiques (chart + stats table), Saisie terrain (form + map). The .grist file can be uploaded to any Grist instance.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "document_name": {"type": "string", "description": "Document name (default: project name)"},
+                "max_features_per_layer": {"type": "integer", "description": "Max features per layer (default: 50000)", "default": 50000},
+                "include_stats": {"type": "boolean", "description": "Generate stats summary table (default: true)", "default": True},
+                "detect_relationships": {"type": "boolean", "description": "Auto-detect Ref columns between tables (default: true)", "default": True},
+                "timezone": {"type": "string", "description": "Timezone for DateTime columns (default: Europe/Paris)", "default": "Europe/Paris"}
+            },
+            "required": []
+        }
+    },
     # ── Recipes ───────────────────────────────────────────────────
     {
         "name": "list_recipes",
@@ -1189,6 +1205,16 @@ def _tool_export_qfield(arguments: dict) -> dict:
     return {"content": _text(response, indent=2)}
 
 
+def _tool_export_grist(arguments: dict) -> dict:
+    params = {}
+    for key in ("document_name", "max_features_per_layer", "include_stats",
+                "detect_relationships", "timezone"):
+        if key in arguments:
+            params[key] = arguments[key]
+    response = qgis_command("export_grist", params, timeout=SOCKET_TIMEOUT_LONG)
+    return {"content": _text(response, indent=2)}
+
+
 # ── Recipes ───────────────────────────────────────────────────
 
 def _tool_list_recipes(arguments: dict) -> dict:
@@ -1213,7 +1239,7 @@ def _tool_get_recipe(arguments: dict) -> dict:
 
 # Actions that need longer timeouts (WFS downloads, heavy exports)
 _LONG_TIMEOUT_ACTIONS = frozenset({
-    "smart_load", "export_flood_map", "export_web_map", "export_temporal_map", "export_qfield", "execute_python",
+    "smart_load", "export_flood_map", "export_web_map", "export_temporal_map", "export_qfield", "export_grist", "execute_python",
 })
 
 
@@ -1354,6 +1380,7 @@ TOOL_HANDLERS = {
     "export_flood_map": _tool_export_flood_map,
     "export_temporal_map": _tool_export_temporal_map,
     "export_qfield": _tool_export_qfield,
+    "export_grist": _tool_export_grist,
     "list_recipes": _tool_list_recipes,
     "get_recipe": _tool_get_recipe,
     "run_recipe": _tool_run_recipe,

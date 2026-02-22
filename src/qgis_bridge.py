@@ -94,7 +94,7 @@ class QGISBridge:
         "remove_layer", "run_processing", "zoom_to_extent",
         "set_layer_style", "set_layer_visibility", "apply_style",
         "add_from_catalog", "set_study_zone", "smart_load",
-        "apply_layout_template", "export_web_map", "export_flood_map", "export_temporal_map", "export_qfield",
+        "apply_layout_template", "export_web_map", "export_flood_map", "export_temporal_map", "export_qfield", "export_grist",
         "mouse_click", "mouse_scroll", "key_press", "mouse_drag",
     })
 
@@ -2370,6 +2370,863 @@ class QGISBridge:
             "has_observations_layer": include_obs,
             "layers": {lid: info["original_name"] for lid, info in exported_layers.items()},
         }
+
+    # ── Grist Export ─────────────────────────────────────────────
+
+    def _action_export_grist(self, params: dict) -> dict:
+        """Export current project as a .grist file (SQLite) with widgets.
+
+        Creates a complete Grist document with:
+        - Tables with typed columns mapped from QGIS fields
+        - All vector layer data with lat/lon for map widget
+        - Pre-configured Map, Chart, and Form widgets
+        - Auto-detected relationships between layers
+        - Optional aggregated statistics table
+        """
+        import sqlite3
+        import re as _re
+        from collections import defaultdict
+
+        project = QgsProject.instance()
+        doc_name = params.get("document_name", project.baseName() or "qgis_export")
+        doc_name = _re.sub(r'[^\w\-]', '_', doc_name).strip('_') or "qgis_export"
+        max_feat = params.get("max_features_per_layer", 50000)
+        include_stats = params.get("include_stats", True)
+        detect_rels = params.get("detect_relationships", True)
+        tz = params.get("timezone", "Europe/Paris")
+
+        grist_path = f"/data/{doc_name}.grist"
+        if os.path.exists(grist_path):
+            os.remove(grist_path)
+
+        # ── Helper functions ──────────────────────────────────
+
+        def _strip_accents(text):
+            import unicodedata
+            nfkd = unicodedata.normalize('NFKD', text)
+            return ''.join(ch for ch in nfkd if not unicodedata.combining(ch))
+
+        def sanitize_table(name):
+            s = _strip_accents(name)
+            s = _re.sub(r'[^A-Za-z0-9_]', '_', s).strip('_')
+            if not s or s[0].isdigit():
+                s = 'T' + s
+            return s or 'Unnamed'
+
+        def sanitize_col(name):
+            s = _strip_accents(name)
+            s = _re.sub(r'[^A-Za-z0-9_]', '_', s).strip('_')
+            if not s or s[0].isdigit():
+                s = 'c' + s
+            if s.lower() in ('id', 'manualsort'):
+                s = s + '_col'
+            return s or 'unnamed'
+
+        _TYPE_MAP = {
+            'string': 'Text', 'text': 'Text', 'varchar': 'Text',
+            'integer': 'Int', 'integer32': 'Int', 'int4': 'Int', 'int': 'Int',
+            'integer64': 'Int', 'int8': 'Int', 'bigint': 'Int',
+            'real': 'Numeric', 'double': 'Numeric', 'float': 'Numeric',
+            'float8': 'Numeric', 'numeric': 'Numeric',
+            'boolean': 'Bool', 'bool': 'Bool',
+            'date': 'Date', 'datetime': f'DateTime:{tz}',
+            'timestamp': f'DateTime:{tz}',
+        }
+        _QV_MAP = {
+            QVariant.Int: 'Int', QVariant.LongLong: 'Int',
+            QVariant.Double: 'Numeric', QVariant.Bool: 'Bool',
+            QVariant.String: 'Text',
+        }
+
+        def qgis_to_grist(field):
+            tn = field.typeName().lower()
+            return _TYPE_MAP.get(tn, _QV_MAP.get(field.type(), 'Text'))
+
+        def extract_widget(layer, idx):
+            setup = layer.editorWidgetSetup(idx)
+            wt = setup.type()
+            cfg = setup.config()
+            if wt == 'ValueMap':
+                choices = []
+                for entry in cfg.get('map', []):
+                    if isinstance(entry, dict):
+                        for _disp, val in entry.items():
+                            choices.append(str(val))
+                if choices:
+                    return 'Choice', json.dumps({"choices": choices})
+            elif wt == 'DateTime':
+                return f'DateTime:{tz}', ''
+            elif wt == 'ExternalResource':
+                return 'Attachments', ''
+            elif wt == 'CheckBox':
+                return 'Bool', ''
+            return None, ''
+
+        def coerce(val, gtype):
+            if val is None:
+                return None
+            # Unwrap QVariant and PyQt types early
+            type_name = type(val).__name__
+            if type_name == 'QVariant' or 'QVariant' in str(type(val)):
+                # NULL QVariant
+                if hasattr(val, 'isNull') and val.isNull():
+                    return None
+                if hasattr(val, 'value'):
+                    val = val.value()
+                    if val is None:
+                        return None
+                    type_name = type(val).__name__
+                else:
+                    return None
+            if type_name in ('QDate', 'QDateTime', 'QTime'):
+                if hasattr(val, 'isNull') and val.isNull():
+                    return None
+                if hasattr(val, 'toPyDateTime'):
+                    val = val.toPyDateTime()
+                    return val.isoformat() if val else None
+                if hasattr(val, 'toPyDate'):
+                    val = val.toPyDate()
+                    return val.isoformat() if val else None
+                if hasattr(val, 'toString'):
+                    fmt = 'yyyy-MM-dd HH:mm:ss' if type_name == 'QDateTime' else 'yyyy-MM-dd' if type_name == 'QDate' else 'HH:mm:ss'
+                    s = val.toString(fmt)
+                    return s if s else None
+                return None
+            # Reject any remaining PyQt types
+            mod = getattr(type(val), '__module__', '') or ''
+            if 'PyQt' in mod or 'sip' in mod:
+                return None
+            if isinstance(val, str) and val == 'NULL':
+                return None
+            try:
+                if gtype == 'Int':
+                    return int(val)
+                elif gtype == 'Numeric':
+                    return float(val)
+                elif gtype == 'Bool':
+                    return 1 if val else 0
+                else:
+                    s = str(val)
+                    if s.startswith('PyQt') or s.startswith('sip.'):
+                        return None
+                    return s
+            except (ValueError, TypeError):
+                return str(val)
+
+        # ── 1. Introspect layers ──────────────────────────────
+
+        crs_4326 = QgsCoordinateReferenceSystem("EPSG:4326")
+        layer_specs = []
+        all_fields = defaultdict(list)  # field_name → [table_names]
+        used_tables = set()
+        map_table = None  # first point table for map page
+        obs_table = None  # observations table for form page
+        temporal_table = None  # table with year field for stats
+
+        for layer in project.mapLayers().values():
+            if not isinstance(layer, QgsVectorLayer):
+                continue
+            # Include empty layers (observations) for form widget
+            tname = sanitize_table(layer.name())
+            counter = 1
+            while tname in used_tables:
+                tname = sanitize_table(layer.name()) + f'_{counter}'
+                counter += 1
+            used_tables.add(tname)
+
+            geom_type = layer.geometryType()  # 0=Point, 1=Line, 2=Polygon
+            is_point = (geom_type == 0)
+            is_polygon = (geom_type == 2)
+
+            columns = []  # [{col_id, grist_type, label, widget_options}]
+            for idx in range(layer.fields().count()):
+                field = layer.fields().field(idx)
+                col_id = sanitize_col(field.name())
+                gtype = qgis_to_grist(field)
+                wopts = ''
+                override, w = extract_widget(layer, idx)
+                if override:
+                    gtype = override
+                    wopts = w
+                columns.append({
+                    'col_id': col_id, 'grist_type': gtype,
+                    'label': field.name(), 'widget_options': wopts,
+                    'original_name': field.name(),
+                })
+                all_fields[field.name()].append(tname)
+
+            # Add geometry columns
+            geo_cols = []
+            if is_point:
+                geo_cols = [
+                    {'col_id': 'latitude', 'grist_type': 'Numeric', 'label': 'Latitude', 'widget_options': '', 'original_name': ''},
+                    {'col_id': 'longitude', 'grist_type': 'Numeric', 'label': 'Longitude', 'widget_options': '', 'original_name': ''},
+                ]
+            elif is_polygon:
+                geo_cols = [
+                    {'col_id': 'centroid_lat', 'grist_type': 'Numeric', 'label': 'Centroid Lat', 'widget_options': '', 'original_name': ''},
+                    {'col_id': 'centroid_lon', 'grist_type': 'Numeric', 'label': 'Centroid Lon', 'widget_options': '', 'original_name': ''},
+                ]
+            columns.extend(geo_cols)
+
+            # Extract features
+            tr = QgsCoordinateTransform(layer.crs(), crs_4326, project)
+            records = []
+            for i, feat in enumerate(layer.getFeatures()):
+                if i >= max_feat:
+                    break
+                rec = {}
+                for col in columns:
+                    if not col['original_name']:
+                        continue
+                    val = feat[col['original_name']]
+                    c_val = coerce(val, col['grist_type'])
+                    if c_val is not None:
+                        rec[col['col_id']] = c_val
+
+                geom = feat.geometry()
+                if not geom.isEmpty():
+                    from qgis.core import QgsGeometry
+                    geom_copy = QgsGeometry(geom)
+                    geom_copy.transform(tr)
+                    if is_point:
+                        pt = geom_copy.asPoint()
+                        rec['latitude'] = round(pt.y(), 6)
+                        rec['longitude'] = round(pt.x(), 6)
+                    elif is_polygon:
+                        centroid = geom_copy.centroid().asPoint()
+                        rec['centroid_lat'] = round(centroid.y(), 6)
+                        rec['centroid_lon'] = round(centroid.x(), 6)
+                records.append(rec)
+
+            spec = {
+                'table_name': tname, 'columns': columns,
+                'records': records, 'is_point': is_point,
+                'is_polygon': is_polygon, 'source_layer': layer.name(),
+                'has_lat_lon': is_point,
+            }
+            layer_specs.append(spec)
+
+            # Detect special tables
+            if is_point and map_table is None and len(records) > 0:
+                map_table = spec
+            name_lower = layer.name().lower()
+            if 'observation' in name_lower:
+                obs_table = spec
+            col_ids = [c['col_id'] for c in columns]
+            if 'year' in col_ids or 'annee' in col_ids:
+                temporal_table = spec
+
+        if not layer_specs:
+            return {"error": "No vector layers to export"}
+
+        # ── 2. Stats table ────────────────────────────────────
+
+        stats_spec = None
+        if include_stats and temporal_table:
+            t_col = 'year' if 'year' in [c['col_id'] for c in temporal_table['columns']] else 'annee'
+            # Find best numeric column
+            num_cols = [c for c in temporal_table['columns']
+                        if c['grist_type'] == 'Numeric' and c['col_id'] not in
+                        ('latitude', 'longitude', 'centroid_lat', 'centroid_lon')]
+            band_cols = [c for c in temporal_table['columns']
+                         if 'band' in c['col_id'].lower() or 'bande' in c['col_id'].lower()]
+            if num_cols:
+                v_col = num_cols[0]['col_id']
+                g_col = band_cols[0]['col_id'] if band_cols else None
+                agg = defaultdict(lambda: defaultdict(list))
+                for rec in temporal_table['records']:
+                    yr = rec.get(t_col)
+                    grp = rec.get(g_col, 'Total') if g_col else 'Total'
+                    val = rec.get(v_col)
+                    if yr is not None and val is not None:
+                        try:
+                            agg[int(yr)][str(grp)].append(float(val))
+                        except (ValueError, TypeError):
+                            pass
+                stats_records = []
+                for yr in sorted(agg):
+                    for grp in sorted(agg[yr]):
+                        vals = sorted(agg[yr][grp])
+                        n = len(vals)
+                        if n == 0:
+                            continue
+                        stats_records.append({
+                            t_col: yr, 'group_name': grp, 'count': n,
+                            'median': round(vals[n // 2], 1),
+                            'mean': round(sum(vals) / n, 1),
+                            'min_val': round(vals[0], 1),
+                            'max_val': round(vals[-1], 1),
+                        })
+                if stats_records:
+                    stats_spec = {
+                        'table_name': sanitize_table(temporal_table['table_name'] + '_Stats'),
+                        'columns': [
+                            {'col_id': t_col, 'grist_type': 'Int', 'label': 'Annee', 'widget_options': '', 'original_name': ''},
+                            {'col_id': 'group_name', 'grist_type': 'Text', 'label': 'Groupe', 'widget_options': '', 'original_name': ''},
+                            {'col_id': 'count', 'grist_type': 'Int', 'label': 'Nombre', 'widget_options': '', 'original_name': ''},
+                            {'col_id': 'median', 'grist_type': 'Numeric', 'label': 'Mediane', 'widget_options': '', 'original_name': ''},
+                            {'col_id': 'mean', 'grist_type': 'Numeric', 'label': 'Moyenne', 'widget_options': '', 'original_name': ''},
+                            {'col_id': 'min_val', 'grist_type': 'Numeric', 'label': 'Min', 'widget_options': '', 'original_name': ''},
+                            {'col_id': 'max_val', 'grist_type': 'Numeric', 'label': 'Max', 'widget_options': '', 'original_name': ''},
+                        ],
+                        'records': stats_records, 'is_point': False, 'is_polygon': False,
+                        'source_layer': '(computed)', 'has_lat_lon': False,
+                    }
+                    layer_specs.append(stats_spec)
+
+        # ── 3. Create SQLite .grist ───────────────────────────
+
+        conn = sqlite3.connect(grist_path)
+        cur = conn.cursor()
+
+        # 3a. Meta-tables
+        self._grist_create_meta_tables(cur)
+
+        # 3b. DocInfo
+        cur.execute("INSERT INTO _grist_DocInfo VALUES (1,'','','',46,?,?)", (tz, '{"locale":"en-US"}'))
+
+        # Counters
+        col_id_ctr = 0
+        table_id_ctr = 0
+        view_id_ctr = 0
+        section_id_ctr = 0
+        field_id_ctr = 0
+        page_id_ctr = 0
+        tab_id_ctr = 0
+
+        # Track colRefs for widget mapping
+        table_col_refs = {}  # table_name → {col_id → colRef}
+        table_ids = {}       # table_name → table_id_ctr value
+        raw_section_ids = {} # table_name → section_id for raw view
+
+        # 3c. For each table: meta-records + data
+        for spec in layer_specs:
+            tname = spec['table_name']
+            cols = spec['columns']
+
+            table_id_ctr += 1
+            view_id_ctr += 1
+            section_id_ctr += 1
+
+            raw_view_id = view_id_ctr
+            raw_section_id = section_id_ctr
+            table_ids[tname] = table_id_ctr
+            raw_section_ids[tname] = raw_section_id
+            table_col_refs[tname] = {}
+
+            # _grist_Tables
+            cur.execute(
+                "INSERT INTO _grist_Tables VALUES (?,?,?,0,0,?,0)",
+                (table_id_ctr, tname, raw_view_id, raw_section_id)
+            )
+
+            # _grist_Tables_column: manualSort first
+            col_id_ctr += 1
+            cur.execute(
+                "INSERT INTO _grist_Tables_column VALUES (?,?,1.0,'manualSort','ManualSortPos','',0,'','manualSort','',0,0,0,0,NULL,0,NULL)",
+                (col_id_ctr, table_id_ctr)
+            )
+
+            # User columns
+            col_refs_for_fields = []
+            for pos_i, col in enumerate(cols):
+                col_id_ctr += 1
+                table_col_refs[tname][col['col_id']] = col_id_ctr
+                cur.execute(
+                    "INSERT INTO _grist_Tables_column VALUES (?,?,?,?,?,?,0,'',?,?,1,0,0,0,NULL,0,NULL)",
+                    (col_id_ctr, table_id_ctr, float(pos_i + 2),
+                     col['col_id'], col['grist_type'],
+                     col['widget_options'] or '', col['label'], '')
+                )
+                col_refs_for_fields.append(col_id_ctr)
+
+            # _grist_Views (raw data view)
+            cur.execute(
+                "INSERT INTO _grist_Views VALUES (?,?,?,'')",
+                (raw_view_id, tname, 'raw_data')
+            )
+
+            # _grist_Views_section (raw data grid)
+            cur.execute(
+                "INSERT INTO _grist_Views_section VALUES (?,?,?,?,'','',0,0,'','','','','','',0,0,0,'','','')",
+                (raw_section_id, table_id_ctr, raw_view_id, 'record')
+            )
+
+            # _grist_Views_section_field
+            for pos_i, cr in enumerate(col_refs_for_fields):
+                field_id_ctr += 1
+                cur.execute(
+                    "INSERT INTO _grist_Views_section_field VALUES (?,?,?,?,100,'',0,0,'','')",
+                    (field_id_ctr, raw_section_id, float(pos_i + 1), cr)
+                )
+
+            # _grist_TabBar + _grist_Pages
+            tab_id_ctr += 1
+            page_id_ctr += 1
+            cur.execute("INSERT INTO _grist_TabBar VALUES (?,?,?)",
+                        (tab_id_ctr, raw_view_id, float(tab_id_ctr)))
+            cur.execute("INSERT INTO _grist_Pages VALUES (?,?,0,?)",
+                        (page_id_ctr, raw_view_id, float(page_id_ctr)))
+
+            # Create data table
+            col_defs = ["id INTEGER PRIMARY KEY", "manualSort REAL"]
+            for col in cols:
+                aff = 'TEXT'
+                if col['grist_type'] in ('Int', 'Bool'):
+                    aff = 'INTEGER'
+                elif col['grist_type'] in ('Numeric', 'Date', f'DateTime:{tz}'):
+                    aff = 'REAL'
+                col_defs.append(f'"{col["col_id"]}" {aff}')
+            cur.execute(f'CREATE TABLE "{tname}" ({", ".join(col_defs)})')
+
+            # Insert data in batches
+            if spec['records']:
+                col_ids = [c['col_id'] for c in cols]
+                placeholders = ', '.join(['?'] * (len(col_ids) + 2))
+                quoted_cols = ", ".join(f'"{c}"' for c in col_ids)
+                insert_sql = f'INSERT INTO "{tname}" (id, manualSort, {quoted_cols}) VALUES ({placeholders})'
+                batch = []
+                def _safe(v):
+                    """Ensure value is sqlite3-safe (str/int/float/None)."""
+                    if v is None:
+                        return None
+                    if isinstance(v, (int, float, str)):
+                        return v
+                    if isinstance(v, bool):
+                        return 1 if v else 0
+                    # Last resort: stringify or None
+                    s = str(v)
+                    return None if ('PyQt' in s or 'QVariant' in s or 'sip.' in s) else s
+
+                for row_i, rec in enumerate(spec['records']):
+                    row = [row_i + 1, float(row_i + 1)]
+                    for cid in col_ids:
+                        row.append(_safe(rec.get(cid)))
+                    batch.append(row)
+                    if len(batch) >= 500:
+                        cur.executemany(insert_sql, batch)
+                        batch = []
+                if batch:
+                    cur.executemany(insert_sql, batch)
+
+        # ── 4. Widget pages ───────────────────────────────────
+
+        pages_created = {}
+
+        # 4a. Page "Carte" — map + linked table
+        if map_table:
+            view_id_ctr += 1
+            map_view_id = view_id_ctr
+
+            # Map section
+            section_id_ctr += 1
+            map_section_id = section_id_ctr
+
+            # Table section (linked to map)
+            section_id_ctr += 1
+            table_section_id = section_id_ctr
+
+            tname = map_table['table_name']
+            tid = table_ids[tname]
+            crefs = table_col_refs[tname]
+
+            # Find colRefs for Name, Latitude, Longitude
+            name_ref = None
+            lat_ref = crefs.get('latitude')
+            lon_ref = crefs.get('longitude')
+            # Use first text column as Name
+            for col in map_table['columns']:
+                if col['grist_type'] == 'Text' and col['col_id'] in crefs:
+                    name_ref = crefs[col['col_id']]
+                    break
+            if not name_ref:
+                name_ref = lat_ref  # fallback
+
+            layout = json.dumps({
+                "children": [
+                    {"leaf": map_section_id, "size": 60},
+                    {"leaf": table_section_id, "size": 40}
+                ]
+            })
+
+            # Map widget — use Custom Widget Builder with embedded HTML
+            # Try to find an existing temporal map HTML export
+            import glob as _glob
+            html_files = sorted(_glob.glob('/data/temporal_map_*.html'), reverse=True)
+            if not html_files:
+                html_files = sorted(_glob.glob('/data/*.html'), reverse=True)
+
+            if html_files:
+                with open(html_files[0], 'r', encoding='utf-8') as f:
+                    html_content = f.read()
+            else:
+                # Minimal map fallback
+                html_content = '<!DOCTYPE html><html><body><p>No map HTML found. Run export_temporal_map first.</p></body></html>'
+
+            grist_init_js = "grist.ready({ requiredAccess: 'none' });\ngrist.onRecords(table => {\n\n});\ngrist.onRecord(record => {\n\n});"
+            custom_view_inner = json.dumps({
+                "mode": "url",
+                "url": None,
+                "widgetDef": {
+                    "name": "Custom widget builder",
+                    "url": "https://gristlabs.github.io/grist-widget/buildwidget/",
+                    "widgetId": "@berhalak/custom-widget-builder",
+                    "published": True,
+                    "accessLevel": "none",
+                    "renderAfterReady": True,
+                    "description": "Build custom widgets with HTML and JavaScript, right inside Grist.",
+                    "isGristLabsMaintained": False,
+                },
+                "access": "full",
+                "pluginId": "",
+                "sectionId": "",
+                "renderAfterReady": True,
+                "widgetId": "@berhalak/custom-widget-builder",
+                "widgetOptions": {
+                    "_js": grist_init_js,
+                    "_html": html_content
+                },
+                "columnsMapping": None
+            })
+            map_options = json.dumps({
+                "customView": custom_view_inner
+            })
+
+            cur.execute("INSERT INTO _grist_Views VALUES (?,?,'',?)",
+                        (map_view_id, 'Carte', layout))
+
+            # Map section
+            cur.execute(
+                "INSERT INTO _grist_Views_section VALUES (?,?,?,?,'Carte','',0,0,'',?,'','','','',0,0,0,'','','')",
+                (map_section_id, tid, map_view_id, 'custom', map_options)
+            )
+
+            # Linked table section
+            cur.execute(
+                "INSERT INTO _grist_Views_section VALUES (?,?,?,?,'Donnees','',0,0,'','','','','','',?,0,0,'','','')",
+                (table_section_id, tid, map_view_id, 'record', map_section_id)
+            )
+
+            # Fields for table section
+            for pos_i, col in enumerate(map_table['columns']):
+                if col['col_id'] in crefs:
+                    field_id_ctr += 1
+                    cur.execute(
+                        "INSERT INTO _grist_Views_section_field VALUES (?,?,?,?,100,'',0,0,'','')",
+                        (field_id_ctr, table_section_id, float(pos_i + 1), crefs[col['col_id']])
+                    )
+
+            tab_id_ctr += 1
+            page_id_ctr += 1
+            cur.execute("INSERT INTO _grist_TabBar VALUES (?,?,?)",
+                        (tab_id_ctr, map_view_id, float(tab_id_ctr)))
+            cur.execute("INSERT INTO _grist_Pages VALUES (?,?,0,?)",
+                        (page_id_ctr, map_view_id, float(page_id_ctr)))
+            pages_created['carte'] = True
+
+        # 4b. Page "Statistiques" — chart + table
+        if stats_spec:
+            view_id_ctr += 1
+            stats_view_id = view_id_ctr
+
+            section_id_ctr += 1
+            chart_section_id = section_id_ctr
+            section_id_ctr += 1
+            stats_table_section_id = section_id_ctr
+
+            sname = stats_spec['table_name']
+            stid = table_ids[sname]
+
+            layout = json.dumps({
+                "children": [
+                    {"leaf": chart_section_id, "size": 50},
+                    {"leaf": stats_table_section_id, "size": 50}
+                ]
+            })
+
+            cur.execute("INSERT INTO _grist_Views VALUES (?,?,'',?)",
+                        (stats_view_id, 'Statistiques', layout))
+
+            # Chart section with options
+            chart_options = json.dumps({
+                "multiseries": True,
+                "orientation": "v",
+                "invertYAxis": False,
+                "logYAxis": False,
+                "stacked": False,
+                "isXAxisUndefined": False
+            })
+            cur.execute(
+                "INSERT INTO _grist_Views_section VALUES (?,?,?,?,'Evolution','',0,0,'',?,?,'','','',0,0,0,'','','')",
+                (chart_section_id, stid, stats_view_id, 'chart', chart_options, 'bar')
+            )
+
+            # Chart fields: 1st = X axis (year), 2nd = group (series), 3rd+ = Y values
+            screfs = table_col_refs[sname]
+            chart_col_order = [t_col, 'group_name', 'median', 'mean']
+            for pos_i, cid in enumerate(chart_col_order):
+                if cid in screfs:
+                    field_id_ctr += 1
+                    cur.execute(
+                        "INSERT INTO _grist_Views_section_field VALUES (?,?,?,?,100,'',0,0,'','')",
+                        (field_id_ctr, chart_section_id, float(pos_i + 1), screfs[cid])
+                    )
+
+            # Stats table section
+            cur.execute(
+                "INSERT INTO _grist_Views_section VALUES (?,?,?,?,'Donnees','',0,0,'','','','','','',0,0,0,'','','')",
+                (stats_table_section_id, stid, stats_view_id, 'record')
+            )
+
+            for pos_i, col in enumerate(stats_spec['columns']):
+                if col['col_id'] in screfs:
+                    field_id_ctr += 1
+                    cur.execute(
+                        "INSERT INTO _grist_Views_section_field VALUES (?,?,?,?,100,'',0,0,'','')",
+                        (field_id_ctr, stats_table_section_id, float(pos_i + 1), screfs[col['col_id']])
+                    )
+
+            tab_id_ctr += 1
+            page_id_ctr += 1
+            cur.execute("INSERT INTO _grist_TabBar VALUES (?,?,?)",
+                        (tab_id_ctr, stats_view_id, float(tab_id_ctr)))
+            cur.execute("INSERT INTO _grist_Pages VALUES (?,?,0,?)",
+                        (page_id_ctr, stats_view_id, float(page_id_ctr)))
+            pages_created['statistiques'] = True
+
+        # 4c. Page "Saisie terrain" — form + map + table
+        if obs_table:
+            view_id_ctr += 1
+            obs_view_id = view_id_ctr
+
+            section_id_ctr += 1
+            form_section_id = section_id_ctr
+            section_id_ctr += 1
+            obs_map_section_id = section_id_ctr
+            section_id_ctr += 1
+            obs_table_section_id = section_id_ctr
+
+            oname = obs_table['table_name']
+            otid = table_ids[oname]
+            ocrefs = table_col_refs[oname]
+
+            layout = json.dumps({
+                "children": [
+                    {"leaf": form_section_id, "size": 40},
+                    {"children": [
+                        {"leaf": obs_map_section_id, "size": 50},
+                        {"leaf": obs_table_section_id, "size": 50}
+                    ], "size": 60}
+                ]
+            })
+
+            # Map for observations (customDef format)
+            obs_mapping = {}
+            if ocrefs.get('latitude'):
+                obs_mapping["Latitude"] = ocrefs['latitude']
+            if ocrefs.get('longitude'):
+                obs_mapping["Longitude"] = ocrefs['longitude']
+            name_col = ocrefs.get('titre') or ocrefs.get('latitude')
+            if name_col:
+                obs_mapping["Name"] = name_col
+            obs_map_opts = json.dumps({
+                "customDef": {
+                    "mode": "url",
+                    "url": "https://gristlabs.github.io/grist-widget/map/",
+                    "access": "full",
+                    "columnsMapping": obs_mapping,
+                    "renderAfterReady": True,
+                    "pluginId": "",
+                    "sectionId": ""
+                }
+            })
+
+            cur.execute("INSERT INTO _grist_Views VALUES (?,?,'',?)",
+                        (obs_view_id, 'Saisie terrain', layout))
+
+            # Form section
+            cur.execute(
+                "INSERT INTO _grist_Views_section VALUES (?,?,?,?,'Nouvelle observation','',0,0,'','','','','','',0,0,0,'','','')",
+                (form_section_id, otid, obs_view_id, 'form')
+            )
+            # Form fields
+            for pos_i, col in enumerate(obs_table['columns']):
+                if col['col_id'] in ocrefs:
+                    field_id_ctr += 1
+                    cur.execute(
+                        "INSERT INTO _grist_Views_section_field VALUES (?,?,?,?,100,'',0,0,'','')",
+                        (field_id_ctr, form_section_id, float(pos_i + 1), ocrefs[col['col_id']])
+                    )
+
+            # Obs map section
+            cur.execute(
+                "INSERT INTO _grist_Views_section VALUES (?,?,?,?,'Carte observations','',0,0,'',?,'','','','',0,0,0,'','','')",
+                (obs_map_section_id, otid, obs_view_id, 'custom', obs_map_opts)
+            )
+
+            # Obs table section (linked to map)
+            cur.execute(
+                "INSERT INTO _grist_Views_section VALUES (?,?,?,?,'Observations','',0,0,'','','','','','',?,0,0,'','','')",
+                (obs_table_section_id, otid, obs_view_id, 'record', obs_map_section_id)
+            )
+            for pos_i, col in enumerate(obs_table['columns']):
+                if col['col_id'] in ocrefs:
+                    field_id_ctr += 1
+                    cur.execute(
+                        "INSERT INTO _grist_Views_section_field VALUES (?,?,?,?,100,'',0,0,'','')",
+                        (field_id_ctr, obs_table_section_id, float(pos_i + 1), ocrefs[col['col_id']])
+                    )
+
+            tab_id_ctr += 1
+            page_id_ctr += 1
+            cur.execute("INSERT INTO _grist_TabBar VALUES (?,?,?)",
+                        (tab_id_ctr, obs_view_id, float(tab_id_ctr)))
+            cur.execute("INSERT INTO _grist_Pages VALUES (?,?,0,?)",
+                        (page_id_ctr, obs_view_id, float(page_id_ctr)))
+            pages_created['saisie'] = True
+
+        # ── 5. Default ACL + principals ──────────────────────
+
+        cur.execute("INSERT INTO _grist_ACLPrincipals VALUES (1,'group','','','Owners','')")
+        cur.execute("INSERT INTO _grist_ACLPrincipals VALUES (2,'group','','','Admins','')")
+        cur.execute("INSERT INTO _grist_ACLPrincipals VALUES (3,'group','','','Editors','')")
+        cur.execute("INSERT INTO _grist_ACLPrincipals VALUES (4,'group','','','Viewers','')")
+        cur.execute("INSERT INTO _grist_ACLResources VALUES (1,'','')")
+        cur.execute("INSERT INTO _grist_ACLRules VALUES (1,1,63,'[1]','',0,'','',1e999,'','')")
+
+        conn.commit()
+        conn.close()
+
+        total_records = sum(len(s['records']) for s in layer_specs)
+        size = os.path.getsize(grist_path)
+        fname = os.path.basename(grist_path)
+
+        return {
+            "success": True,
+            "path": grist_path,
+            "download_url": f"http://localhost:8080/api/files/{fname}",
+            "size_bytes": size,
+            "size_mb": round(size / 1024 / 1024, 1),
+            "document_name": doc_name,
+            "tables": len(layer_specs),
+            "total_records": total_records,
+            "pages": pages_created,
+            "layers": {s['table_name']: len(s['records']) for s in layer_specs},
+        }
+
+    @staticmethod
+    def _grist_create_meta_tables(c):
+        """Create all 26 required Grist meta-tables (schema version 46)."""
+        c.execute("""CREATE TABLE _grist_DocInfo (
+            id INTEGER PRIMARY KEY, docId TEXT, peers TEXT, basketId TEXT,
+            schemaVersion INTEGER, timezone TEXT, documentSettings TEXT)""")
+        c.execute("""CREATE TABLE _grist_Tables (
+            id INTEGER PRIMARY KEY, tableId TEXT, primaryViewId INTEGER,
+            summarySourceTable INTEGER, onDemand INTEGER,
+            rawViewSectionRef INTEGER, recordCardViewSectionRef INTEGER)""")
+        c.execute("""CREATE TABLE _grist_Tables_column (
+            id INTEGER PRIMARY KEY, parentId INTEGER, parentPos REAL,
+            colId TEXT, type TEXT, widgetOptions TEXT, isFormula INTEGER,
+            formula TEXT, label TEXT, description TEXT, untieColIdFromLabel INTEGER,
+            summarySourceCol INTEGER, displayCol INTEGER, visibleCol INTEGER,
+            rules TEXT, recalcWhen INTEGER, recalcDeps TEXT)""")
+        c.execute("""CREATE TABLE _grist_Views (
+            id INTEGER PRIMARY KEY, name TEXT, type TEXT, layoutSpec TEXT)""")
+        c.execute("""CREATE TABLE _grist_Views_section (
+            id INTEGER PRIMARY KEY, tableRef INTEGER, parentId INTEGER,
+            parentKey TEXT, title TEXT, description TEXT, defaultWidth INTEGER,
+            borderWidth INTEGER, theme TEXT, options TEXT, chartType TEXT,
+            layoutSpec TEXT, filterSpec TEXT, sortColRefs TEXT,
+            linkSrcSectionRef INTEGER, linkSrcColRef INTEGER,
+            linkTargetColRef INTEGER, embedId TEXT, rules TEXT, shareOptions TEXT)""")
+        c.execute("""CREATE TABLE _grist_Views_section_field (
+            id INTEGER PRIMARY KEY, parentId INTEGER, parentPos REAL,
+            colRef INTEGER, width INTEGER, widgetOptions TEXT,
+            displayCol INTEGER, visibleCol INTEGER, filter TEXT, rules TEXT)""")
+        c.execute("""CREATE TABLE _grist_TabBar (
+            id INTEGER PRIMARY KEY, viewRef INTEGER, tabPos REAL)""")
+        c.execute("""CREATE TABLE _grist_Pages (
+            id INTEGER PRIMARY KEY, viewRef INTEGER, indentation INTEGER, pagePos REAL)""")
+        c.execute("""CREATE TABLE _grist_ACLResources (
+            id INTEGER PRIMARY KEY, tableId TEXT, colIds TEXT)""")
+        c.execute("""CREATE TABLE _grist_ACLRules (
+            id INTEGER PRIMARY KEY, resource INTEGER, permissions INTEGER,
+            principals TEXT, aclFormula TEXT, aclColumn INTEGER,
+            aclFormulaParsed TEXT, permissionsText TEXT, rulePos REAL,
+            userAttributes TEXT, memo TEXT)""")
+        c.execute("""CREATE TABLE _grist_ACLPrincipals (
+            id INTEGER PRIMARY KEY, type TEXT, userEmail TEXT,
+            userName TEXT, groupName TEXT, instanceId TEXT)""")
+        c.execute("""CREATE TABLE _grist_ACLMemberships (
+            id INTEGER PRIMARY KEY, parent INTEGER, child INTEGER)""")
+        c.execute("""CREATE TABLE _grist_Attachments (
+            id INTEGER PRIMARY KEY, fileIdent TEXT, fileName TEXT, fileType TEXT,
+            fileSize INTEGER, fileExt TEXT, imageHeight INTEGER, imageWidth INTEGER,
+            timeDeleted REAL, timeUploaded REAL)""")
+        c.execute("""CREATE TABLE _grist_Filters (
+            id INTEGER PRIMARY KEY, viewSectionRef INTEGER, colRef INTEGER,
+            filter TEXT, pinned INTEGER)""")
+        c.execute("""CREATE TABLE _grist_Shares (
+            id INTEGER PRIMARY KEY, linkId TEXT, options TEXT, label TEXT, description TEXT)""")
+        c.execute("""CREATE TABLE _grist_Validations (
+            id INTEGER PRIMARY KEY, formula TEXT, name TEXT, tableRef INTEGER)""")
+        c.execute("""CREATE TABLE _grist_Cells (
+            id INTEGER PRIMARY KEY, tableRef INTEGER, colRef INTEGER, rowId INTEGER,
+            root INTEGER, parentId INTEGER, type INTEGER, content TEXT,
+            userRef TEXT, timeCreated REAL, timeUpdated REAL, resolved INTEGER)""")
+        c.execute("""CREATE TABLE _grist_Triggers (
+            id INTEGER PRIMARY KEY, tableRef INTEGER, eventTypes TEXT,
+            isReadyColRef INTEGER, actions TEXT, label TEXT, memo TEXT,
+            enabled INTEGER, watchedColRefList TEXT, options TEXT, condition TEXT)""")
+        c.execute("""CREATE TABLE _grist_REPL_Hist (
+            id INTEGER PRIMARY KEY, code TEXT, outputText TEXT, errorText TEXT)""")
+        c.execute("""CREATE TABLE _grist_Imports (
+            id INTEGER PRIMARY KEY, tableRef INTEGER, origFileName TEXT,
+            parseFileSchemaId TEXT, delimiter TEXT, doMergeFields TEXT,
+            mergeFieldsRaw TEXT, destTableId TEXT, transformSectionRef INTEGER,
+            hiddenTableRef INTEGER)""")
+        c.execute("""CREATE TABLE _grist_External_database (
+            id INTEGER PRIMARY KEY, host TEXT, port INTEGER, database TEXT,
+            type TEXT, credentials TEXT)""")
+        c.execute("""CREATE TABLE _grist_External_table (
+            id INTEGER PRIMARY KEY, tableRef INTEGER, databaseRef INTEGER,
+            transformSectionRef INTEGER, queryFormula TEXT, tableName TEXT)""")
+        c.execute("""CREATE TABLE _grist_TableViews (
+            id INTEGER PRIMARY KEY, tableRef INTEGER, viewRef INTEGER)""")
+        c.execute("""CREATE TABLE _grist_Formulas (
+            id INTEGER PRIMARY KEY, name TEXT, formula TEXT)""")
+
+        # ── _gristsys_* tables (DocStorage system tables) ────────
+        c.execute("""CREATE TABLE _gristsys_Files (
+            id INTEGER PRIMARY KEY, ident TEXT UNIQUE, data BLOB, storageId TEXT)""")
+        c.execute("""CREATE TABLE _gristsys_Action (
+            id INTEGER PRIMARY KEY, "actionNum" BLOB DEFAULT 0,
+            "time" BLOB DEFAULT 0, "user" BLOB DEFAULT '',
+            "desc" BLOB DEFAULT '', "otherId" BLOB DEFAULT 0,
+            "linkId" BLOB DEFAULT 0, "json" BLOB DEFAULT '')""")
+        c.execute("""CREATE TABLE _gristsys_Action_step (
+            id INTEGER PRIMARY KEY, "parentId" BLOB DEFAULT 0,
+            "type" BLOB DEFAULT '', "tableName" BLOB DEFAULT '',
+            "colNames" BLOB DEFAULT '', "values" BLOB DEFAULT '',
+            "json" BLOB DEFAULT '')""")
+        c.execute("""CREATE TABLE _gristsys_ActionHistory (
+            id INTEGER PRIMARY KEY, actionHash TEXT UNIQUE,
+            parentRef INTEGER, actionNum INTEGER, body BLOB)""")
+        c.execute("""CREATE TABLE _gristsys_ActionHistoryBranch (
+            id INTEGER PRIMARY KEY, name TEXT UNIQUE, actionRef INTEGER)""")
+        c.execute("INSERT INTO _gristsys_ActionHistoryBranch(name) VALUES('shared')")
+        c.execute("INSERT INTO _gristsys_ActionHistoryBranch(name) VALUES('local_sent')")
+        c.execute("INSERT INTO _gristsys_ActionHistoryBranch(name) VALUES('local_unsent')")
+        c.execute("""CREATE TABLE _gristsys_FileInfo (
+            id INTEGER PRIMARY KEY CHECK (id = 0),
+            docId TEXT DEFAULT '', ownerInstanceId TEXT DEFAULT '')""")
+        c.execute("INSERT INTO _gristsys_FileInfo (id) VALUES (0)")
+        c.execute("""CREATE TABLE _gristsys_PluginData (
+            id INTEGER PRIMARY KEY, pluginId TEXT NOT NULL,
+            key TEXT NOT NULL, value BLOB DEFAULT '')""")
+        c.execute("""CREATE UNIQUE INDEX _gristsys_PluginData_unique_key
+            ON _gristsys_PluginData(pluginId, key)""")
 
     # ── Data Source Catalog ──────────────────────────────────────
 
