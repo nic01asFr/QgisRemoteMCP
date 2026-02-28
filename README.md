@@ -1,4 +1,4 @@
-# QgisStreamMCP
+# 🖱️QgisRemoteMCP
 
 **QGIS as a service for your AI assistant** — Deploy once, use QGIS from anywhere. No local installation required, no GIS expertise needed.
 
@@ -25,7 +25,7 @@ Administrators deploy the container once (on a server, a NAS, or locally). Users
 ## Quick Start
 
 ```bash
-git clone https://github.com/nic01asFr/QgisStreamMCP.git
+git clone https://gitlab.cerema.fr/nicolas.laval/QgisRemoteMCP.git
 cd QgisStreamMCP
 docker compose up -d --build
 ```
@@ -413,7 +413,7 @@ url = os.environ.get("MY_SERVICE_URL")
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    QgisStreamMCP Container                      │
+│                    🖱️QgisRemoteMCP Container                      │
 │                                                              │
 │  supervisord                                                 │
 │  ├── Xvfb :99                (virtual display 1920x1080)    │
