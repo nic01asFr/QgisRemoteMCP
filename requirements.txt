@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════════════════
-# BigQgisMCP — Python dependencies
+# QgisRemoteMCP — Python dependencies
 # ═══════════════════════════════════════════════════════════════════
 
 # MCP Protocol
@@ -18,6 +18,9 @@ aiofiles>=24.1.0
 
 # Auth
 PyJWT>=2.9.0
+
+# Multi-user: Docker SDK (only needed when MULTI_USER_MODE=true)
+docker>=7.0.0
 
 # Utilities
 python-dotenv>=1.0.0

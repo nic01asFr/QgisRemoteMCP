@@ -1,5 +1,5 @@
 """
-BigQgisMCP -- Python Helpers for execute_python
+QgisRemoteMCP -- Python Helpers for execute_python
 ================================================
 
 Ready-made utility functions injected into execute_python's exec_globals
@@ -124,7 +124,7 @@ def fetch_json(url, params=None, timeout=HTTP_TIMEOUT):
     try:
         if params:
             url = url + "?" + urllib.parse.urlencode(params)
-        req = urllib.request.Request(url, headers={"User-Agent": "BigQgisMCP/1.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "QgisRemoteMCP/1.0"})
         resp = urllib.request.urlopen(req, timeout=timeout)
         return json.loads(resp.read().decode())
     except urllib.error.URLError as e:
@@ -136,7 +136,7 @@ def fetch_json(url, params=None, timeout=HTTP_TIMEOUT):
 # ── Geocoding ─────────────────────────────────────────────────
 
 def geocode(address, limit=1):
-    """Geocode a French address using the BAN API.
+    """Geocode an address. Tries BAN (French API) first, then Nominatim (OSM) as fallback.
 
     Returns:
         {"lon", "lat", "label", "score", "city", "postcode", "bbox"}
@@ -145,27 +145,52 @@ def geocode(address, limit=1):
     Example:
         loc = helpers.geocode("Gare de Lyon, Paris")
     """
+    # Try BAN (French national geocoder) with short timeout
     data = fetch_json("https://api-adresse.data.gouv.fr/search/",
-                      {"q": address, "limit": limit})
-    if "error" in data:
-        return data
-    features = data.get("features", [])
-    if not features:
-        return {"error": f"No result for: {address}"}
-    f = features[0]
-    coords = f["geometry"]["coordinates"]
-    props = f["properties"]
-    buf = 0.005  # ~500m
-    return {
-        "lon": coords[0],
-        "lat": coords[1],
-        "label": props.get("label", ""),
-        "score": props.get("score", 0),
-        "city": props.get("city", ""),
-        "postcode": props.get("postcode", ""),
-        "bbox": [coords[0] - buf, coords[1] - buf,
-                 coords[0] + buf, coords[1] + buf],
-    }
+                      {"q": address, "limit": limit}, timeout=5)
+    if "error" not in data:
+        features = data.get("features", [])
+        if features:
+            f = features[0]
+            coords = f["geometry"]["coordinates"]
+            props = f["properties"]
+            buf = 0.005  # ~500m
+            return {
+                "lon": coords[0],
+                "lat": coords[1],
+                "label": props.get("label", ""),
+                "score": props.get("score", 0),
+                "city": props.get("city", ""),
+                "postcode": props.get("postcode", ""),
+                "bbox": [coords[0] - buf, coords[1] - buf,
+                         coords[0] + buf, coords[1] + buf],
+            }
+
+    # Fallback: Nominatim (OpenStreetMap) — globally accessible
+    nom = fetch_json("https://nominatim.openstreetmap.org/search",
+                     {"q": address, "format": "json", "limit": 1,
+                      "addressdetails": 1}, timeout=10)
+    if "error" not in nom and isinstance(nom, list) and nom:
+        r = nom[0]
+        lon, lat = float(r["lon"]), float(r["lat"])
+        bb = r.get("boundingbox", [])  # [south, north, west, east]
+        if len(bb) == 4:
+            bbox = [float(bb[2]), float(bb[0]), float(bb[3]), float(bb[1])]
+        else:
+            buf = 0.005
+            bbox = [lon - buf, lat - buf, lon + buf, lat + buf]
+        addr = r.get("address", {})
+        return {
+            "lon": lon,
+            "lat": lat,
+            "label": r.get("display_name", address),
+            "score": 0.8,
+            "city": addr.get("city", addr.get("town", addr.get("village", ""))),
+            "postcode": addr.get("postcode", ""),
+            "bbox": bbox,
+        }
+
+    return {"error": f"Geocoding failed for '{address}' (BAN and Nominatim unavailable)"}
 
 
 def reverse_geocode(lon, lat):
@@ -204,7 +229,7 @@ def search_commune(name):
     """
     data = fetch_json("https://geo.api.gouv.fr/communes",
                       {"nom": name, "fields": "nom,code,codesPostaux,"
-                       "population,centre,contour", "limit": 1})
+                       "population,centre,contour", "limit": 1}, timeout=5)
     if "error" in data:
         return data
     if not data or not isinstance(data, list) or len(data) == 0:
@@ -759,7 +784,7 @@ def get_study_zone():
 # ── Smart Download ───────────────────────────────────────────
 
 def download_wfs_ogr(url, typename, bbox_4326=None, output_path=None,
-                     native_crs="EPSG:2154", max_features=10000, name=None):
+                     native_crs="EPSG:2154", max_features=None, name=None):
     """Download WFS features as local GeoPackage via ogr2ogr.
 
     Uses GDAL's WFS driver which handles pagination automatically (IGN pages
@@ -772,7 +797,7 @@ def download_wfs_ogr(url, typename, bbox_4326=None, output_path=None,
         bbox_4326: [xmin,ymin,xmax,ymax] in EPSG:4326 (auto from study zone if None)
         output_path: Save path (default /data/cache/{typename_short}_{hash}.gpkg)
         native_crs: Server's native CRS for output (default EPSG:2154)
-        max_features: Max features to download (default 10000)
+        max_features: Max features to download (None = unlimited, uses bbox + pagination)
         name: Display name
 
     Returns:
@@ -809,7 +834,7 @@ def download_wfs_ogr(url, typename, bbox_4326=None, output_path=None,
     if os.path.exists(output_path):
         age_hours = (time.time() - os.path.getmtime(output_path)) / 3600
         if age_hours < 24:
-            layer = QgsVectorLayer(output_path, name, "ogr")
+            layer = QgsVectorLayer(output_path + f"|layername={typename_short}", name, "ogr")
             if layer.isValid():
                 result = _finalize_layer(layer)
                 result["path"] = output_path
@@ -878,7 +903,10 @@ def download_wfs_ogr(url, typename, bbox_4326=None, output_path=None,
         return {"error": f"ogr2ogr completed but output file not found: {output_path}"}
 
     # 7. Load GPKG as OGR vector layer
-    layer = QgsVectorLayer(output_path, name, "ogr")
+    # Must use |layername= to avoid QGIS reading stale feature count statistics
+    # Without it, featureCount() returns ~10k (cached) instead of actual count,
+    # and native:clip processes only those ~10k features — not the full dataset.
+    layer = QgsVectorLayer(output_path + f"|layername={typename_short}", name, "ogr")
     if not layer.isValid():
         return {"error": f"Downloaded GPKG is invalid: {output_path}"}
 
@@ -960,7 +988,7 @@ out skel qt;"""
     try:
         data = urllib.parse.urlencode({"data": raw_query}).encode()
         req = urllib.request.Request(OVERPASS_URL, data=data, method="POST")
-        req.add_header("User-Agent", "BigQgisMCP/1.0")
+        req.add_header("User-Agent", "QgisRemoteMCP/1.0")
         resp = urllib.request.urlopen(req, timeout=OVERPASS_TIMEOUT + 10)
         result_json = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:

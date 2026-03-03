@@ -1,105 +1,183 @@
 {
   "id": "risque_inondation",
   "name": "Analyse de risque inondation (Directive Inondation)",
-  "description": "Analyse professionnelle du risque inondation utilisant les données réglementaires de la Directive Inondation (Georisques). Charge les vraies enveloppes de crue modélisées (T10, T100, T1000), les hauteurs d'eau, et identifie les bâtiments et établissements sensibles exposés. Produit une carte de vulnérabilité avec statistiques.",
-  "tags": ["risques", "inondation", "TRI", "directive inondation", "Georisques"],
+  "description": "Analyse professionnelle du risque inondation utilisant les données réglementaires de la Directive Inondation (Georisques). Charge les zones de crue T10/T100/T1000, les hauteurs d'eau ISO_HT pour les 3 scénarios (si disponibles), et identifie les bâtiments et routes exposés. Architecture optimisée : jointure multi-scénarios (t10_ht_max / t100_ht_max / t1000_ht_max) directement sur bâtiments et routes, rendu par règles sur T100. Produit une carte de vulnérabilité avec statistiques détaillées et export web interactif multi-scénarios.",
+  "tags": [
+    "risques",
+    "inondation",
+    "TRI",
+    "directive inondation",
+    "Georisques",
+    "routes"
+  ],
   "parameters": {
     "zone": {
       "type": "string",
       "required": true,
-      "description": "Commune dans un TRI (ex: 'Béziers', 'Nîmes', 'Montpellier')"
+      "description": "Commune dans un TRI (ex: 'Nîmes', 'Béziers', 'Montpellier')"
     }
   },
   "steps": [
     {
       "id": "zone",
       "tool": "set_study_zone",
-      "params": {"target": "$zone"},
+      "params": {
+        "target": "$zone"
+      },
       "description": "Définir la zone d'étude"
     },
     {
       "id": "basemap",
       "tool": "smart_load",
-      "params": {"id": "cartodb_positron"},
-      "description": "Fond de carte clair"
+      "params": {
+        "id": "ign_planign"
+      },
+      "description": "Fond IGN Plan v2"
     },
     {
       "id": "flood_t1000",
       "tool": "smart_load",
-      "params": {"id": "tri_inondation_t1000"},
-      "description": "Zone inondable — crue extrême T1000 (événement millénaire). Peut être vide si la zone n'est pas dans un TRI."
+      "params": {
+        "id": "tri_inondation_t1000"
+      },
+      "description": "Zone inondable — crue extrême T1000"
     },
     {
       "id": "flood_t100",
       "tool": "smart_load",
-      "params": {"id": "tri_inondation_t100"},
+      "params": {
+        "id": "tri_inondation_t100"
+      },
       "description": "Zone inondable — crue centennale T100 (référence réglementaire)"
     },
     {
       "id": "flood_t10",
       "tool": "smart_load",
-      "params": {"id": "tri_inondation_t10"},
+      "params": {
+        "id": "tri_inondation_t10"
+      },
       "description": "Zone inondable — crue fréquente T10"
     },
     {
-      "id": "water_depth",
+      "id": "water_depth_t10",
       "tool": "smart_load",
-      "params": {"id": "tri_hauteurs_eau_t100"},
-      "description": "Hauteurs d'eau pour la crue centennale (classes ht_min/ht_max en mètres)"
+      "params": {
+        "id": "tri_hauteurs_eau_t10"
+      },
+      "description": "Hauteurs d'eau T10 — classes ht_min/ht_max en mètres (Georisques, peut être absent)"
+    },
+    {
+      "id": "water_depth_t100",
+      "tool": "smart_load",
+      "params": {
+        "id": "tri_hauteurs_eau_t100"
+      },
+      "description": "Hauteurs d'eau T100 — classes ht_min/ht_max en mètres (Georisques)"
+    },
+    {
+      "id": "water_depth_t1000",
+      "tool": "smart_load",
+      "params": {
+        "id": "tri_hauteurs_eau_t1000"
+      },
+      "description": "Hauteurs d'eau T1000 — classes ht_min/ht_max en mètres (Georisques, peut être absent)"
     },
     {
       "id": "buildings",
       "tool": "smart_load",
-      "params": {"id": "bdtopo_batiments"},
-      "description": "Bâtiments BD TOPO"
+      "params": {
+        "id": "bdtopo_batiments"
+      },
+      "description": "Bâtiments BD TOPO — couche complète (sans limite de features)"
+    },
+    {
+      "id": "roads",
+      "tool": "smart_load",
+      "params": {
+        "id": "bdtopo_routes"
+      },
+      "description": "Routes BD TOPO — couche complète (sans limite de features)"
     },
     {
       "id": "sensitive",
       "tool": "smart_load",
-      "params": {"id": "tri_enjeux_sensibles"},
-      "description": "Établissements sensibles en zone inondable (écoles, hôpitaux)"
+      "params": {
+        "id": "tri_enjeux_sensibles"
+      },
+      "description": "Établissements sensibles en zone inondable (écoles, hôpitaux, ERP)"
+    },
+    {
+      "id": "commune_boundary",
+      "tool": "execute_python",
+      "description": "Recuperer le perimetre communal. Re-telecharger routes avec bbox T1000 (couverture complete, au-dela de la commune). Clipper bati a (commune intersect T1000), routes a T1000.",
+      "params": {
+        "timeout": 300
+      },
+      "code": "import json, urllib.request, urllib.parse, os\nimport processing\nfrom qgis.core import QgsVectorLayer, QgsCoordinateReferenceSystem, QgsCoordinateTransform\n\nstudy = helpers.get_study_zone()\ncommune_name = study.get('name', '') if study else ''\n\nif not commune_name:\n    result['skipped'] = 'Nom de zone non trouve'\n    result['success'] = True\nelse:\n    try:\n        encoded = urllib.parse.quote(commune_name)\n        url = ('https://geo.api.gouv.fr/communes?nom=' + encoded\n               + '&fields=contour&geometry=contour&format=geojson&limit=1')\n        with urllib.request.urlopen(url, timeout=20) as resp:\n            geojson_data = json.loads(resp.read().decode('utf-8'))\n\n        if not geojson_data.get('features'):\n            result['warning'] = 'Commune non trouvee dans API Geo : ' + commune_name\n            result['success'] = True\n        else:\n            tmp = '/tmp/commune_boundary.geojson'\n            with open(tmp, 'w', encoding='utf-8') as f:\n                json.dump(geojson_data, f)\n\n            commune_4326 = QgsVectorLayer(tmp, 'commune_tmp', 'ogr')\n            if not commune_4326.isValid():\n                result['warning'] = 'GeoJSON commune invalide'\n                result['success'] = True\n            else:\n                commune_4326.setCrs(QgsCoordinateReferenceSystem('EPSG:4326'))\n                commune_fixed = processing.run('native:fixgeometries', {\n                    'INPUT': commune_4326, 'METHOD': 1, 'OUTPUT': 'memory:'\n                })['OUTPUT']\n                commune_2154 = processing.run('native:reprojectlayer', {\n                    'INPUT': commune_fixed,\n                    'TARGET_CRS': 'EPSG:2154',\n                    'OUTPUT': 'memory:'\n                })['OUTPUT']\n                commune_2154.setName('Limite communale')\n                commune_2154 = project.addMapLayer(commune_2154)\n\n                props = geojson_data['features'][0].get('properties', {})\n                result['commune_nom'] = props.get('nom', commune_name)\n                result['commune_code'] = props.get('code', '?')\n\n                def find_exact(name):\n                    return next((l for l in project.mapLayers().values()\n                                 if isinstance(l, QgsVectorLayer) and l.name() == name), None)\n\n                # Zone de crue la plus large (T1000 = crues extremes)\n                def find_flood_zone(priorities):\n                    for pattern in priorities:\n                        l = next((l for l in project.mapLayers().values()\n                                  if isinstance(l, QgsVectorLayer)\n                                  and pattern in l.name().lower()\n                                  and 'hauteur' not in l.name().lower()\n                                  and l.geometryType() == 2), None)\n                        if l:\n                            return l\n                    return None\n\n                flood_clip_zone = find_flood_zone(['t1000', 'treme', 't100', 'centennale', 't10', 'quente'])\n                flood_dissolved = None\n\n                if flood_clip_zone:\n                    # Fix + dissolve T1000\n                    flood_fixed = processing.run('native:fixgeometries', {\n                        'INPUT': flood_clip_zone, 'METHOD': 1, 'OUTPUT': 'memory:'\n                    })['OUTPUT']\n                    flood_dissolved = processing.run('native:dissolve', {\n                        'INPUT': flood_fixed, 'OUTPUT': 'memory:'\n                    })['OUTPUT']\n                    result['flood_clip_zone'] = flood_clip_zone.name()\n\n                    # Bbox de T1000 en EPSG:4326\n                    crs_4326 = QgsCoordinateReferenceSystem('EPSG:4326')\n                    tr_4326 = QgsCoordinateTransform(flood_clip_zone.crs(), crs_4326, project)\n                    t1000_ext = tr_4326.transformBoundingBox(flood_clip_zone.extent())\n                    t1000_bbox_4326 = [\n                        t1000_ext.xMinimum(), t1000_ext.yMinimum(),\n                        t1000_ext.xMaximum(), t1000_ext.yMaximum()\n                    ]\n                    result['t1000_bbox_4326'] = [round(v, 5) for v in t1000_bbox_4326]\n\n                    # Re-telecharger routes avec bbox T1000\n                    # smart_load utilisait bbox commune : les routes dans l'extension\n                    # T1000 hors commune n'etaient pas telechargees.\n                    old_route = find_exact('Routes (BD TOPO)')\n                    if old_route:\n                        project.removeMapLayer(old_route.id())\n                    dl_route = helpers.download_wfs_ogr(\n                        'https://data.geopf.fr/wfs/ows',\n                        'BDTOPO_V3:troncon_de_route',\n                        bbox_4326=t1000_bbox_4326,\n                        name='Routes (BD TOPO)'\n                    )\n                    if 'error' in dl_route:\n                        result['route_redownload_warning'] = dl_route['error']\n                    else:\n                        result['routes_t1000_downloaded'] = dl_route.get('feature_count', '?')\n                        result['routes_cached'] = dl_route.get('cached', False)\n\n                # Batiments: clip commune -> clip T1000\n                bat = find_exact('B\\u00e2timents (BD TOPO)')\n                if bat:\n                    bat_count = bat.featureCount()\n                    bat_commune = processing.run('native:clip', {\n                        'INPUT': bat, 'OVERLAY': commune_2154, 'OUTPUT': 'memory:'\n                    })['OUTPUT']\n                    result['bat_avant'] = bat_count\n                    result['bat_commune'] = bat_commune.featureCount()\n                    if flood_dissolved:\n                        bat_clip = processing.run('native:clip', {\n                            'INPUT': bat_commune, 'OVERLAY': flood_dissolved, 'OUTPUT': 'memory:'\n                        })['OUTPUT']\n                    else:\n                        bat_clip = bat_commune\n                    bat_clip.setName('B\\u00e2timents (BD TOPO)')\n                    bat_clip = project.addMapLayer(bat_clip)\n                    project.removeMapLayer(bat.id())\n                    result['bat_apres'] = bat_clip.featureCount()\n\n                # Routes: clip a T1000 (re-telechargees avec bbox T1000)\n                route = find_exact('Routes (BD TOPO)')\n                if route and flood_dissolved:\n                    route_count = route.featureCount()\n                    route_clip = processing.run('native:clip', {\n                        'INPUT': route, 'OVERLAY': flood_dissolved, 'OUTPUT': 'memory:'\n                    })['OUTPUT']\n                    route_clip.setName('Routes (BD TOPO)')\n                    route_clip = project.addMapLayer(route_clip)\n                    project.removeMapLayer(route.id())\n                    result['route_avant'] = route_count\n                    result['route_apres'] = route_clip.featureCount()\n                elif route:\n                    result['route_warning'] = 'Zone de crue non trouvee -- routes conservees sans clip'\n\n                result['success'] = True\n                try: os.unlink(tmp)\n                except: pass\n    except Exception as e:\n        result['warning'] = 'Echec recuperation limite communale : ' + str(e)\n        result['success'] = True\n"
     },
     {
       "id": "analysis",
       "tool": "execute_python",
-      "description": "Identifier les bâtiments exposés par période de retour et calculer les statistiques",
-      "code": "import processing\nfrom qgis.core import QgsVectorLayer\n\n# Find layers\ndef find(keyword):\n    return [l for l in project.mapLayers().values() if isinstance(l, QgsVectorLayer) and keyword in l.name().lower()]\n\ndef fix(layer):\n    \"\"\"Fix invalid geometries (common in Georisques WFS data).\"\"\"\n    return processing.run('native:fixgeometries', {'INPUT': layer, 'METHOD': 1, 'OUTPUT': 'memory:'})['OUTPUT']\n\nt100 = find('centennale') or find('t100') or find('alea_synt_01_02')\nbat = find('timent')\n\nif not t100:\n    result['error'] = 'Zone inondable T100 non trouvee. La commune est peut-etre hors TRI.'\nelif not bat:\n    result['error'] = 'Couche batiments non trouvee'\nelse:\n    # Fix geometries before spatial operations (Georisques data often has invalid geom)\n    t100_fixed = fix(t100[0])\n    bat_fixed = fix(bat[0])\n    \n    # Extract buildings in T100 flood zone\n    intersect = processing.run('native:extractbylocation', {\n        'INPUT': bat_fixed,\n        'PREDICATE': [0],\n        'INTERSECT': t100_fixed,\n        'OUTPUT': 'memory:'\n    })\n    exposed = intersect['OUTPUT']\n    exposed.setName('Batiments exposes (T100)')\n    project.addMapLayer(exposed)\n    \n    # Try T10 intersection too\n    t10 = find('frequente') or find('t10') or find('alea_synt_01_01')\n    t10_count = 0\n    if t10:\n        t10_fixed = fix(t10[0])\n        inter10 = processing.run('native:extractbylocation', {\n            'INPUT': bat_fixed,\n            'PREDICATE': [0],\n            'INTERSECT': t10_fixed,\n            'OUTPUT': 'memory:'\n        })\n        t10_layer = inter10['OUTPUT']\n        t10_layer.setName('Batiments exposes (T10)')\n        project.addMapLayer(t10_layer)\n        t10_count = t10_layer.featureCount()\n    \n    # Statistics\n    total = bat[0].featureCount()\n    t100_count = exposed.featureCount()\n    result['stats'] = {\n        'total_batiments': total,\n        'exposes_t10_frequente': t10_count,\n        'exposes_t100_centennale': t100_count,\n        'pct_t100': round(t100_count / max(total, 1) * 100, 1)\n    }\n    result['success'] = True"
+      "description": "Joindre les hauteurs d'eau directement sur bâtiments et routes (une couche par entité, ht_max/ht_num joints). Calcul des statistiques d'exposition.",
+      "code": "import processing\nfrom qgis.core import QgsVectorLayer, QgsField, QgsFeatureRequest\n\ndef find_exact(name):\n    return next((l for l in project.mapLayers().values()\n                 if isinstance(l, QgsVectorLayer) and l.name() == name), None)\n\ndef find_kw(kw):\n    return next((l for l in project.mapLayers().values()\n                 if isinstance(l, QgsVectorLayer) and kw.lower() in l.name().lower()), None)\n\ndef fix(layer):\n    return processing.run('native:fixgeometries', {'INPUT': layer, 'METHOD': 1, 'OUTPUT': 'memory:'})['OUTPUT']\n\ndef parse_ht(raw):\n    if raw is None or str(raw) in ('', 'NULL', 'None'): return -1.0\n    try:\n        v = float(str(raw))\n        return min(v, 5.0) if v < 9000 else 5.0\n    except: return -1.0\n\n# Couches source\nbat_layer   = find_exact('Bâtiments (BD TOPO)')\nroute_layer = find_exact('Routes (BD TOPO)')\n\n# Resoudre les couches hauteur par scenario (t1000 avant t100 avant t10 pour eviter substring match)\nht_layers = {}\nfor l in project.mapLayers().values():\n    if not isinstance(l, QgsVectorLayer): continue\n    n = l.name().lower()\n    if 'hauteur' not in n: continue\n    if 't1000' in n or 'extr' in n:       ht_layers['t1000'] = l\n    elif 't100' in n or 'centennale' in n: ht_layers['t100']  = l\n    elif 't10' in n or 'quente' in n:      ht_layers['t10']   = l\n    else: ht_layers.setdefault('t100', l)\n\nif 't100' not in ht_layers:\n    result['warning'] = 'Hauteurs T100 non trouvees -- commune hors TRI Georisques'\n    result['success'] = True\nelif not bat_layer:\n    result['error'] = 'Couche batiments manquante'\nelse:\n    # Fixer geometries hauteur -- ISO_HT de Georisques peut avoir des self-intersections\n    ht_fixed = {sc: fix(l) for sc, l in ht_layers.items()}\n    result['scenarios_hauteur'] = list(ht_fixed.keys())\n\n    # Batiments : jointure multi-scenarios\n    # METHOD=1 (premier match) vs METHOD=2 (plus grand overlap) -- evite le calcul d'aire, ~3x plus rapide\n    # ISO_HT sont des zones disjointes (classes de profondeur), donc premier match = bon match\n    has_routes = route_layer is not None\n    bat_work = bat_layer\n    for sc, ht in ht_fixed.items():\n        bat_work = processing.run('native:joinattributesbylocation', {\n            'INPUT': bat_work, 'JOIN': ht,\n            'PREDICATE': [0], 'JOIN_FIELDS': ['ht_min', 'ht_max'],\n            'METHOD': 1, 'DISCARD_NONMATCHING': False,\n            'PREFIX': sc + '_', 'OUTPUT': 'memory:'\n        })['OUTPUT']\n    bat_work.setName('Bâtiments')\n    bat_work = project.addMapLayer(bat_work)\n    orig_bat = find_exact('Bâtiments (BD TOPO)')\n    if orig_bat: project.removeMapLayer(orig_bat.id())\n\n    # Routes : jointure multi-scenarios + ht_num Double\n    if has_routes:\n        route_work = route_layer\n        for sc, ht in ht_fixed.items():\n            route_work = processing.run('native:joinattributesbylocation', {\n                'INPUT': route_work, 'JOIN': ht,\n                'PREDICATE': [0], 'JOIN_FIELDS': ['ht_min', 'ht_max'],\n                'METHOD': 1, 'DISCARD_NONMATCHING': False,\n                'PREFIX': sc + '_', 'OUTPUT': 'memory:'\n            })['OUTPUT']\n        # ht_num_tXX via fieldcalculator C++ -- rapide sur 35k routes\n        for sc in list(ht_fixed.keys()):\n            fn = sc + '_ht_max'\n            if route_work.fields().indexOf(fn) >= 0:\n                expr = 'CASE WHEN \"%s\" IS NULL THEN -1.0 WHEN to_real(\"%s\") >= 9000 THEN 5.0 ELSE minimum(to_real(\"%s\"), 5.0) END' % (fn, fn, fn)\n                route_work = processing.run('native:fieldcalculator', {\n                    'INPUT': route_work, 'FIELD_NAME': 'ht_num_' + sc,\n                    'FIELD_TYPE': 0, 'FORMULA': expr, 'OUTPUT': 'memory:'\n                })['OUTPUT']\n        # Alias ht_num = t100 (retrocompat style QGIS)\n        if route_work.fields().indexOf('t100_ht_max') >= 0:\n            expr = 'CASE WHEN \"t100_ht_max\" IS NULL THEN -1.0 WHEN to_real(\"t100_ht_max\") >= 9000 THEN 5.0 ELSE minimum(to_real(\"t100_ht_max\"), 5.0) END'\n            route_work = processing.run('native:fieldcalculator', {\n                'INPUT': route_work, 'FIELD_NAME': 'ht_num',\n                'FIELD_TYPE': 0, 'FORMULA': expr, 'OUTPUT': 'memory:'\n            })['OUTPUT']\n        route_work.setName('Routes')\n        route_work = project.addMapLayer(route_work)\n        orig_route = find_exact('Routes (BD TOPO)')\n        if orig_route: project.removeMapLayer(orig_route.id())\n\n    # Stats T100 -- NoGeometry + attribut seul pour perf sur 100k features\n    total_bat = bat_work.featureCount()\n    idx = bat_work.fields().indexOf('t100_ht_max')\n    if idx < 0: idx = bat_work.fields().indexOf('ht_max')\n    depth = {'< 0.5m': 0, '0.5-1m': 0, '1-2m': 0, '> 2m': 0, 'hors_zone': 0}\n    req = QgsFeatureRequest().setFlags(QgsFeatureRequest.NoGeometry).setSubsetOfAttributes([idx])\n    for f in bat_work.getFeatures(req):\n        v = parse_ht(f.attribute(idx))\n        if v < 0:        depth['hors_zone'] += 1\n        elif v <= 0.5:   depth['< 0.5m']   += 1\n        elif v <= 1.0:   depth['0.5-1m']   += 1\n        elif v <= 2.0:   depth['1-2m']     += 1\n        else:            depth['> 2m']     += 1\n    exposed = total_bat - depth['hors_zone']\n    result['stats'] = {\n        'total_batiments': total_bat,\n        'exposes_T100': exposed,\n        'taux_exposition_pct': round(exposed / max(total_bat, 1) * 100, 1),\n        'par_classe_profondeur': depth\n    }\n    if has_routes:\n        ridx = route_work.fields().indexOf('ht_num')\n        rs = {'hors_zone': 0, 'carrossable': 0, 'difficile': 0, 'impraticable': 0, 'bloquee': 0}\n        req_r = QgsFeatureRequest().setFlags(QgsFeatureRequest.NoGeometry).setSubsetOfAttributes([ridx] if ridx >= 0 else [])\n        for f in route_work.getFeatures(req_r):\n            v = f.attribute(ridx) if ridx >= 0 else None\n            if v is None or v < 0:  rs['hors_zone']    += 1\n            elif v <= 0.5:           rs['carrossable']  += 1\n            elif v <= 1.0:           rs['difficile']    += 1\n            elif v <= 2.0:           rs['impraticable'] += 1\n            else:                    rs['bloquee']      += 1\n        result['stats']['routes'] = rs\n    result['success'] = True\n",
+      "params": {
+        "timeout": 900
+      }
     },
     {
       "id": "style",
       "tool": "execute_python",
-      "description": "Styliser les zones par période de retour (bleu gradué) et bâtiments exposés (rouge)",
-      "code": "from qgis.core import QgsFillSymbol, QgsSingleSymbolRenderer, QgsVectorLayer, QgsCoordinateTransform, QgsCategorizedSymbolRenderer, QgsRendererCategory\n\ndef find(keyword):\n    return [l for l in project.mapLayers().values() if isinstance(l, QgsVectorLayer) and keyword in l.name().lower()]\n\n# Style flood zones — blue gradient by return period (T1000=light, T100=medium, T10=dark)\nstyles = [\n    ('t1000', 'extreme', '150,200,255,60', '80,130,200', 0.2),\n    ('centennale', 't100', '65,105,225,100', '30,60,180', 0.3),\n    ('frequente', 't10', '20,50,160,130', '10,30,120', 0.4),\n]\nfor kw1, kw2, fill, outline, width in styles:\n    layers = find(kw1) or find(kw2)\n    for l in layers:\n        if l.geometryType() == 2 and 'timent' not in l.name().lower():\n            sym = QgsFillSymbol.createSimple({'color': fill, 'outline_color': outline, 'outline_width': str(width)})\n            l.setRenderer(QgsSingleSymbolRenderer(sym))\n            l.triggerRepaint()\n\n# Style water depth by ht_max classes\nht = find('hauteur')\nif ht:\n    cats = []\n    depth_colors = {\n        0.5: ('180,210,255,120', 'H < 0.5m'),\n        1.0: ('100,160,230,150', '0.5 - 1m'),\n        2.0: ('50,100,200,180', '1 - 2m'),\n        999: ('20,50,150,200', '> 2m'),\n    }\n    from qgis.core import QgsGraduatedSymbolRenderer, QgsRendererRange\n    ranges = []\n    for ht_max, (color, label) in depth_colors.items():\n        ht_min = {0.5: 0, 1.0: 0.5, 2.0: 1.0, 999: 2.0}[ht_max]\n        sym = QgsFillSymbol.createSimple({'color': color, 'outline_color': '30,60,150,100', 'outline_width': '0.1'})\n        ranges.append(QgsRendererRange(ht_min, ht_max, sym, label))\n    renderer = QgsGraduatedSymbolRenderer('ht_max', ranges)\n    ht[0].setRenderer(renderer)\n    ht[0].triggerRepaint()\n\n# Style exposed buildings — red\nexposed = find('exposes')\nfor l in exposed:\n    sym = QgsFillSymbol.createSimple({'color': '230,50,50,200', 'outline_color': '150,30,30', 'outline_width': '0.3'})\n    l.setRenderer(QgsSingleSymbolRenderer(sym))\n    l.triggerRepaint()\n\n# Style normal buildings — light gray, hidden by default\nfor l in project.mapLayers().values():\n    if isinstance(l, QgsVectorLayer) and 'timent' in l.name() and 'expos' not in l.name().lower():\n        sym = QgsFillSymbol.createSimple({'color': '200,200,200,100', 'outline_color': '150,150,150', 'outline_width': '0.1'})\n        l.setRenderer(QgsSingleSymbolRenderer(sym))\n        l.triggerRepaint()\n\n# Style sensitive facilities — orange points\nsensitive = find('sensible') or find('enjeux')\nif sensitive:\n    from qgis.core import QgsMarkerSymbol\n    for l in sensitive:\n        sym = QgsMarkerSymbol.createSimple({'name': 'triangle', 'color': '255,140,0,220', 'outline_color': '180,80,0', 'size': '3.5'})\n        l.setRenderer(QgsSingleSymbolRenderer(sym))\n        l.triggerRepaint()\n\n# Zoom to T100 flood zone\nt100 = find('centennale') or find('t100')\nif t100:\n    canvas = iface.mapCanvas()\n    tr = QgsCoordinateTransform(t100[0].crs(), project.crs(), project)\n    canvas.setExtent(tr.transformBoundingBox(t100[0].extent()))\n    canvas.zoomByFactor(1.15)\n    canvas.refresh()\n\nresult['success'] = True"
+      "description": "Zoom zone de travail. Style couches. setCustomLayerOrder: sensibles > batiments > routes > zones > hauteurs masquees (restent en projet) > commune gris pointille > basemap. Icones par categorie.",
+      "code": "from qgis.core import (QgsFillSymbol, QgsSingleSymbolRenderer, QgsGraduatedSymbolRenderer,\n                        QgsRendererRange, QgsVectorLayer, QgsCoordinateTransform,\n                        QgsLineSymbol, QgsMarkerSymbol, QgsRuleBasedRenderer,\n                        QgsCategorizedSymbolRenderer, QgsRendererCategory, QgsMapLayer)\n\ndef find_kw(kw):\n    return [l for l in project.mapLayers().values()\n            if isinstance(l, QgsVectorLayer) and kw.lower() in l.name().lower()]\n\ndef find_exact(name):\n    return next((l for l in project.mapLayers().values()\n                 if isinstance(l, QgsVectorLayer) and l.name() == name), None)\n\n# ── 0. Zoom sur la zone de travail au debut ──\nref_zones = find_kw('(T1000)') or find_kw('treme') or find_kw('(T100)') or find_kw('centennale')\nif ref_zones:\n    canvas = iface.mapCanvas()\n    tr = QgsCoordinateTransform(ref_zones[0].crs(), project.crs(), project)\n    ext = tr.transformBoundingBox(ref_zones[0].extent())\n    canvas.setExtent(ext)\n    canvas.zoomByFactor(1.1)\n\n# ── 1. Zones inondables — bleu gradue ──\nzone_styles = [\n    ('(T1000)', '150,200,255,40',  '80,130,200,60',  0.15),\n    ('(T100)',  '90,140,230,70',   '40,80,190,90',   0.2),\n    ('(T10)',   '30,70,180,90',    '15,45,140,110',  0.3),\n]\nfor pattern, fill, outline, width in zone_styles:\n    for l in find_kw(pattern):\n        if l.geometryType() == 2 and 'timent' not in l.name() and 'hauteur' not in l.name():\n            sym = QgsFillSymbol.createSimple({'color': fill, 'outline_color': outline, 'outline_width': str(width)})\n            l.setRenderer(QgsSingleSymbolRenderer(sym))\n            l.triggerRepaint()\n\n# ── 2. Hauteurs d'eau — style (reste en projet mais sera masquee) ──\nfor l in find_kw('hauteur'):\n    depth_colors = [\n        (0,   0.5,  '180,220,255,80',  '< 0.5m'),\n        (0.5, 1.0,  '90,160,230,110',  '0.5-1m'),\n        (1.0, 2.0,  '50,100,200,140',  '1-2m'),\n        (2.0, 5.0,  '20,50,150,170',   '> 2m'),\n    ]\n    rngs = []\n    for lo, hi, color, label in depth_colors:\n        sym = QgsFillSymbol.createSimple({'color': color, 'outline_color': '30,60,150,80', 'outline_width': '0.1'})\n        rngs.append(QgsRendererRange(lo, hi, sym, label))\n    l.setRenderer(QgsGraduatedSymbolRenderer('ht_max', rngs))\n    l.triggerRepaint()\n\n# ── 3. Batiments — regles COALESCE tous scenarios ──\nbat = find_exact('B\\u00e2timents')\nif bat:\n    root_rule = QgsRuleBasedRenderer.Rule(None)\n    ht_scenarios = [sc + '_ht_max' for sc in ['t1000', 't100', 't10'] if bat.fields().indexOf(sc + '_ht_max') >= 0]\n    if ht_scenarios:\n        parts = ', '.join('to_real(\"%s\")' % f for f in ht_scenarios)\n        ht_expr = 'COALESCE(%s)' % parts\n    elif bat.fields().indexOf('ht_max') >= 0:\n        ht_expr = 'to_real(\"ht_max\")'\n    else:\n        ht_expr = '-1'\n    bat_rules = [\n        ('(%s) IS NULL OR (%s) < 0' % (ht_expr, ht_expr), '200,200,200,80', '150,150,150,60', '0.1', 'Hors zone'),\n        ('(%s) <= 0.5' % ht_expr,                          '255,240,100,220', '200,180,30,180', '0.25', '< 0.5m'),\n        ('(%s) > 0.5 AND (%s) <= 1.0' % (ht_expr, ht_expr), '255,165,30,225', '200,110,10,185', '0.3',  '0.5-1m'),\n        ('(%s) > 1.0 AND (%s) <= 2.0' % (ht_expr, ht_expr), '255,110,30,230', '180,65,10,190',  '0.35', '1-2m'),\n        ('(%s) > 2.0' % ht_expr,                            '210,25,25,240',  '140,10,10,200',  '0.4',  '> 2m'),\n    ]\n    for expr, fill, outline, width, label in bat_rules:\n        sym = QgsFillSymbol.createSimple({'color': fill, 'outline_color': outline, 'outline_width': width})\n        rule = QgsRuleBasedRenderer.Rule(sym)\n        rule.setFilterExpression(expr)\n        rule.setLabel(label)\n        root_rule.appendChild(rule)\n    bat.setRenderer(QgsRuleBasedRenderer(root_rule))\n    bat.triggerRepaint()\n\n# ── 4. Routes — regles ht_num ──\nroute = find_exact('Routes')\nif route:\n    root_rule = QgsRuleBasedRenderer.Rule(None)\n    rt_rules = [\n        ('ht_num < 0',                     '#888888', '0.26', 'Hors zone'),\n        ('ht_num >= 0 AND ht_num <= 0.5',  '#1ed241', '0.4',  '< 0.5m — Carrossable'),\n        ('ht_num > 0.5 AND ht_num <= 1.0', '#f0c800', '0.4',  '0.5-1m — Difficile'),\n        ('ht_num > 1.0 AND ht_num <= 2.0', '#ff5a00', '0.4',  '1-2m — Impraticable'),\n        ('ht_num > 2.0',                   '#d21414', '0.4',  '> 2m — Bloquee'),\n    ]\n    for expr, color, width, label in rt_rules:\n        sym = QgsLineSymbol.createSimple({'color': color, 'width': width})\n        rule = QgsRuleBasedRenderer.Rule(sym)\n        rule.setFilterExpression(expr)\n        rule.setLabel(label)\n        root_rule.appendChild(rule)\n    route.setRenderer(QgsRuleBasedRenderer(root_rule))\n    route.triggerRepaint()\n\n# ── 5. Enjeux sensibles — icones par categorie ──\nsensibles_layers = find_kw('sensible') + find_kw('enjeux')\nfor l in sensibles_layers:\n    cat_field = None\n    for fname in ['typ_ets', 'categorie', 'nature', 'type']:\n        if l.fields().indexOf(fname) >= 0:\n            cat_field = fname\n            break\n    def cat_style(val):\n        v = val.upper()\n        if any(k in v for k in ['SANTE', 'HOPITAL', 'MEDIC', 'CLINIC', 'CHU', 'CHR', 'URGENCE']):\n            return '#e63946', 'cross', '5.0', 'Sante / Hopital'\n        elif any(k in v for k in ['EDUC', 'ECOLE', 'UNIVERSI', 'SCOLAIRE', 'LYCEE', 'COLLEGE']):\n            return '#2196F3', 'rectangle', '4.5', 'Enseignement'\n        elif any(k in v for k in ['SECOUR', 'POMPIER', 'GENDARME', 'POLICE', 'SAPEUR']):\n            return '#ff9800', 'star', '5.0', 'Secours / Securite'\n        elif any(k in v for k in ['ERP', 'PUBLIC', 'ACCUEIL', 'MAIRIE', 'ADMIN']):\n            return '#9c27b0', 'diamond', '4.5', 'ERP / Service public'\n        else:\n            return '#607d8b', 'circle', '4.0', val[:40]\n    if cat_field:\n        unique_vals = sorted(set(\n            str(f[cat_field]) for f in l.getFeatures()\n            if f[cat_field] is not None and str(f[cat_field]) not in ('', 'NULL', 'None')\n        ))\n        cats = []\n        for val in unique_vals:\n            color, shape, size, label = cat_style(val)\n            sym = QgsMarkerSymbol.createSimple({\n                'name': shape, 'color': color,\n                'outline_color': '#ffffff', 'outline_width': '0.5', 'size': size\n            })\n            cats.append(QgsRendererCategory(val, sym, label))\n        if cats:\n            l.setRenderer(QgsCategorizedSymbolRenderer(cat_field, cats))\n        else:\n            sym = QgsMarkerSymbol.createSimple({'name': 'triangle', 'color': '255,140,0,230', 'outline_color': '180,80,0', 'size': '4'})\n            l.setRenderer(QgsSingleSymbolRenderer(sym))\n    else:\n        sym = QgsMarkerSymbol.createSimple({'name': 'triangle', 'color': '255,140,0,230', 'outline_color': '180,80,0', 'size': '4'})\n        l.setRenderer(QgsSingleSymbolRenderer(sym))\n    l.triggerRepaint()\n\n# ── 6. Limite communale — gris pointille ──\ncommune_l = find_exact('Limite communale')\nif commune_l:\n    sym = QgsFillSymbol.createSimple({\n        'color': '0,0,0,0',\n        'outline_color': '100,100,100,200',\n        'outline_width': '0.8',\n        'outline_style': 'dash'\n    })\n    commune_l.setRenderer(QgsSingleSymbolRenderer(sym))\n    commune_l.triggerRepaint()\n\n# ── 7. Ordre de rendu et visibilite ──\n# setCustomLayerOrder : ne modifie pas la structure du layer tree,\n# les couches restent dans le projet (export_flood_map peut les trouver).\n# index 0 = couche du bas (dessinee en premier / derriere)\nroot = project.layerTreeRoot()\nlayers_ordered = []   # top -> bottom (devant -> derriere)\nseen_ids = set()\n\ndef add_l(l, visible=True):\n    if l and l.id() not in seen_ids:\n        seen_ids.add(l.id())\n        layers_ordered.append((l, visible))\n\nfor l in (find_kw('sensible') + find_kw('enjeux')):\n    add_l(l, True)\nadd_l(find_exact('B\\u00e2timents'), True)\nadd_l(find_exact('Routes'), True)\nfor kw in ['(T10)', '(T100)', '(T1000)']:\n    for l in find_kw(kw):\n        if l.geometryType() == 2 and 'timent' not in l.name() and 'hauteur' not in l.name():\n            add_l(l, True)\nfor l in find_kw('hauteur'):\n    add_l(l, False)   # masquees mais restent dans le projet\nadd_l(commune_l, True)\nfor l in project.mapLayers().values():\n    if not isinstance(l, QgsVectorLayer) and l.id() not in seen_ids:\n        seen_ids.add(l.id())\n        layers_ordered.append((l, True))\n\n# Rendu : bottom-to-top (reversed par rapport a notre liste top-to-bottom)\nrender_layers = [l for l, v in reversed(layers_ordered)]\nroot.setCustomLayerOrder(render_layers)\nroot.setHasCustomLayerOrder(True)\n\n# Visibilite dans le panneau couches\nfor layer, visible in layers_ordered:\n    node = root.findLayer(layer.id())\n    if node:\n        node.setItemVisibilityChecked(visible)\n\nresult['success'] = True\n"
     },
     {
       "id": "layout",
       "tool": "apply_layout_template",
       "params": {
         "template": "a3_landscape",
-        "variables": {"title": "Risque inondation — $zone", "subtitle": "Directive Inondation — Zones de crue T10/T100/T1000 + hauteurs d'eau (Georisques)"}
+        "variables": {
+          "title": "Risque inondation — $zone",
+          "subtitle": "Zones T10/T100/T1000 · Hauteurs d'eau · Routes praticabilité · Bâtiments exposés par profondeur"
+        }
       },
-      "description": "Mise en page A3"
+      "description": "Mise en page A3 paysage"
     },
     {
-      "id": "export",
+      "id": "export_pdf",
       "tool": "export_pdf",
-      "params": {"layout": "Export A3 Landscape"},
+      "params": {
+        "layout": "A3 Landscape"
+      },
       "description": "Export PDF"
     },
     {
       "id": "flood_web",
       "tool": "export_flood_map",
       "params": {
-        "include_fields": ["usage_1", "nature", "nombre_de_logements", "nombre_d_etages", "hauteur", "nom_si_ext", "categorie", "ht_min", "ht_max", "scenario", "cours_deau"]
+        "include_fields": [
+          "usage_1",
+          "nature",
+          "nombre_de_logements",
+          "nombre_d_etages",
+          "hauteur",
+          "ht_min",
+          "ht_max",
+          "t10_ht_max",
+          "t100_ht_max",
+          "t1000_ht_max",
+          "scenario",
+          "cours_deau"
+        ]
       },
-      "description": "Export carte web interactive avec slider de hauteur d'eau et animation dynamique"
+      "description": "Carte web interactive — slider hauteur d'eau, sélecteur scénario T10/T100/T1000, statistiques dynamiques"
     }
   ],
   "outputs": [
-    "PDF carte de risque inondation professionnelle",
-    "Carte web interactive avec simulation dynamique (slider hauteur d'eau + animation)",
-    "Couche 'Bâtiments exposés (T100)' avec statistiques",
-    "Zones inondables par période de retour (T10, T100, T1000)",
-    "Hauteurs d'eau par classe (< 0.5m, 0.5-1m, 1-2m, > 2m)"
+    "Couche Limite communale (contour administratif communal, EPSG:2154)",
+    "PDF A3 — carte de vulnérabilité professionnelle (rendu T100)",
+    "Carte web interactive Leaflet (slider hauteur d'eau + sélecteur scénario T10/T100/T1000)",
+    "Couche Bâtiments avec t10_ht_max / t100_ht_max / t1000_ht_max joints (NULL hors zone, rendu T100 par défaut)",
+    "Couche Routes avec ht_num_t10 / ht_num_t100 / ht_num_t1000 joints (vert→rouge selon praticabilité)",
+    "Statistiques T100 : total exposés, répartition par classe de profondeur, routes impactées"
   ]
 }

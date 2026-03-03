@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>QGIS Desktop — BigQgisMCP</title>
+<title>QGIS Desktop — QgisRemoteMCP</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1e1e2e; color: #cdd6f4; overflow-x: hidden; }
@@ -17,6 +17,8 @@
   .toolbar button { padding: 4px 12px; font-size: 11px; border: 1px solid #313244; background: #1e1e2e; color: #cdd6f4; border-radius: 6px; cursor: pointer; transition: all 0.15s; }
   .toolbar button:hover { background: #313244; border-color: #45475a; }
   .toolbar button.active { background: #cba6f7; color: #1e1e2e; border-color: #cba6f7; }
+  .toolbar button.vnc-btn { background: #1e3a2e; color: #a6e3a1; border-color: #a6e3a1; font-weight: 600; }
+  .toolbar button.vnc-btn:hover { background: #a6e3a1; color: #1e1e2e; border-color: #a6e3a1; }
   .toolbar .sep { width: 1px; height: 20px; background: #313244; margin: 0 4px; }
   .toolbar .spacer { flex: 1; }
 
@@ -108,7 +110,7 @@
     <button onclick="doUpload()" id="btnUpload">Upload File</button>
     <button onclick="toggleFiles()" id="btnFiles">Files</button>
     <div class="spacer"></div>
-    <button onclick="openVncPopout()" id="btnPopout" title="Open noVNC in browser">Pop-out</button>
+    <button onclick="openVncPopout()" id="btnPopout" class="vnc-btn" title="Open QGIS full-screen in browser via noVNC">&#x1F5D4; Open in Browser</button>
   </div>
 
   <input type="file" id="fileInput" style="display:none" multiple
@@ -180,7 +182,7 @@ function initMcpApp() {
         method: 'ui/initialize',
         params: {
             protocolVersion: '2026-01-26',
-            appInfo: { name: 'BigQgisMCP', version: '1.0.0' },
+            appInfo: { name: 'QgisRemoteMCP', version: '1.0.0' },
             appCapabilities: { tools: { listChanged: false }, availableDisplayModes: ['inline'] }
         }
     }, '*');

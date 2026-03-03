@@ -1,4 +1,4 @@
-# BigQgisMCP
+# QgisRemoteMCP
 
 **QGIS Desktop as an MCP Server** — Full GUI via noVNC, PyQGIS scripting, 1000+ Processing algorithms, smart data pipeline with 30+ French national datasets.
 
@@ -21,8 +21,8 @@ An AI assistant controls a live QGIS Desktop — loads data, runs analysis, prod
 ## Quick Start
 
 ```bash
-git clone https://github.com/nic01asFr/BigQgisMCP.git
-cd BigQgisMCP
+git clone https://gitlab.cerema.fr/mcp/QgisRemoteMCP.git
+cd QgisRemoteMCP
 docker compose up -d --build
 ```
 
@@ -401,7 +401,7 @@ Configure via environment variables (`MOONDREAM_URL`, `SAMGEO3_URL`, `DEPTHPRO_U
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    BigQgisMCP Container                      │
+│                    QgisRemoteMCP Container                      │
 │                                                              │
 │  supervisord                                                 │
 │  ├── Xvfb :99                (virtual display 1920x1080)    │
@@ -470,7 +470,7 @@ curl -X POST http://localhost:8080/api/execute \
 ## Project Structure
 
 ```
-BigQgisMCP/
+QgisRemoteMCP/
 ├── main_mcp.py             # MCP Server (40 tools, 10 resources, 3 prompts)
 ├── datasources.json        # 30+ pre-configured data sources catalog
 ├── qgis_app.html           # MCP App (interactive QGIS in conversation)

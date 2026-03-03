@@ -1,5 +1,5 @@
 """
-BigQgisMCP — REST API Server
+QgisRemoteMCP — REST API Server
 ═══════════════════════════════════════════════════════════════════
 
 FastAPI server that communicates with QGIS via UNIX socket.
@@ -29,7 +29,7 @@ SOCKET_PATH = "/tmp/qgis_bridge.sock"
 SOCKET_TIMEOUT = 30  # seconds
 
 app = FastAPI(
-    title="BigQgisMCP API",
+    title="QgisRemoteMCP API",
     description="REST API for QGIS Desktop control",
     version="1.0.0",
 )

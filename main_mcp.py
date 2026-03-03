@@ -1,5 +1,5 @@
 """
-BigQgisMCP — MCP Server (Streamable HTTP)
+QgisRemoteMCP — MCP Server (Streamable HTTP)
 ═══════════════════════════════════════════════════════════════════
 
 Raw Starlette-based MCP server with MCP Apps support.
@@ -15,20 +15,32 @@ import time
 import base64
 import uuid
 import asyncio
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+import httpx
 import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
+
+# Multi-user managers (imported lazily — only used when MULTI_USER_MODE=true)
+try:
+    from src.auth import AuthManager
+    from src.container_manager import ContainerManager
+    _MULTIUSER_DEPS_OK = True
+except ImportError:
+    _MULTIUSER_DEPS_OK = False
 
 # ── Configuration ─────────────────────────────────────────────────
 
 SOCKET_PATH = "/tmp/qgis_bridge.sock"
 SOCKET_TIMEOUT = 60
-SOCKET_TIMEOUT_LONG = 300  # for WFS downloads via ogr2ogr
+SOCKET_TIMEOUT_LONG = 300      # for WFS downloads via ogr2ogr
+SOCKET_TIMEOUT_RECIPE = 1200   # for run_recipe (up to 20 min for heavy analyses)
 SKILLS_DIR = Path("/app/skills")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8100"))
 VNC_PORT = int(os.environ.get("QGIS_VNC_PORT", "6080"))
@@ -39,42 +51,102 @@ MOONDREAM_URL = os.environ.get("MOONDREAM_URL", "http://localhost:8001")
 SAMGEO3_URL = os.environ.get("SAMGEO3_URL", "http://localhost:8002")
 DEPTHPRO_URL = os.environ.get("DEPTHPRO_URL", "http://localhost:8003")
 
+# ── Multi-user configuration ───────────────────────────────────────
+
+# Set MULTI_USER_MODE=true to enable per-user Docker containers + optional auth.
+MULTI_USER_MODE: bool = os.environ.get("MULTI_USER_MODE", "false").lower() == "true"
+
+# Internal port of the api_server inside each QGIS container.
+# In single-user mode this is the local api_server (same container).
+# In multi-user mode this is dynamically assigned per user.
+_SINGLE_USER_API_PORT: int = int(os.environ.get("API_PORT", "8080"))
+
+# ContextVar: carries current user_id through asyncio.to_thread → tool handlers.
+# Python 3.7+ propagates ContextVars automatically into threads started with to_thread.
+current_user_id: ContextVar[str] = ContextVar("current_user_id", default="default")
+
+# Global manager instances — initialised in lifespan when MULTI_USER_MODE=true.
+container_manager: Optional["ContainerManager"] = None
+auth_manager: Optional["AuthManager"] = None
+
 # MCP Apps
 UI_RESOURCE_URI = "ui://bigqgismcp/qgis-desktop"
 UI_MIME_TYPE = "text/html;profile=mcp-app"
 UI_HTML_CONTENT = ""
 
 # Sessions
+SESSION_TTL = 7200  # 2 hours — stale sessions pruned automatically
 sessions: Dict[str, Dict[str, Any]] = {}
+
+
+def _session_touch(session_id: str) -> None:
+    """Update last_seen for an existing session; prune stale sessions when dict grows large."""
+    now = time.time()
+    if session_id in sessions:
+        sessions[session_id]["last_seen"] = now
+    if len(sessions) > 200:
+        stale = [sid for sid, d in list(sessions.items())
+                 if now - d.get("last_seen", 0) > SESSION_TTL]
+        for sid in stale:
+            sessions.pop(sid, None)
+
+
+async def _ensure_session(user_id: str) -> None:
+    """Ensure a QGIS container is running for user_id (multi-user mode only).
+
+    If no ready session exists, starts a new container and waits for it to
+    become healthy.  No-op in single-user mode.
+    """
+    if not MULTI_USER_MODE or container_manager is None:
+        return
+    session = container_manager.get_session(user_id)
+    if session and session.status == "ready":
+        container_manager.touch_session(user_id)
+        return
+    # Start a new container — this blocks for ~30-60 s on first call
+    print(f"[QgisRemoteMCP] Starting QGIS container for user={user_id} …")
+    await container_manager.start_session(user_id)
+
 
 # ── QGIS Bridge client ───────────────────────────────────────────
 
+def _get_user_api_port() -> int:
+    """Return the api_server port for the current user.
+
+    Single-user mode  → fixed port (API_PORT env var, default 8080).
+    Multi-user mode   → dynamic port from container_manager session.
+    Falls back to the single-user port if no session is found.
+    """
+    if MULTI_USER_MODE and container_manager is not None:
+        uid = current_user_id.get("default")
+        session = container_manager.sessions.get(uid)
+        if session and session.api_port:
+            return session.api_port
+    return _SINGLE_USER_API_PORT
+
+
 def qgis_command(action: str, params: dict = None, timeout: int = None) -> dict:
-    """Send a command to QGIS bridge via UNIX socket."""
-    if not os.path.exists(SOCKET_PATH):
-        return {"error": "QGIS bridge not ready. QGIS may still be starting up."}
+    """Send a command to the QGIS api_server via HTTP POST /api/command.
+
+    Replaces the former UNIX-socket transport so that each user's request
+    is routed to the correct container port (multi-user) or the local
+    api_server (single-user).  The api_server in every container exposes
+    POST /api/command → UNIX socket → bridge — no bridge changes needed.
+    """
     effective_timeout = timeout or SOCKET_TIMEOUT
+    port = _get_user_api_port()
+    url = f"http://localhost:{port}/api/command"
     try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(effective_timeout)
-        sock.connect(SOCKET_PATH)
-        request = json.dumps({"action": action, "params": params or {}})
-        sock.sendall(request.encode())
-        sock.shutdown(socket.SHUT_WR)
-        data = b""
-        while True:
-            chunk = sock.recv(65536)
-            if not chunk:
-                break
-            data += chunk
-        sock.close()
-        return json.loads(data.decode())
-    except socket.timeout:
+        with httpx.Client(timeout=effective_timeout) as client:
+            resp = client.post(url, json={"action": action, "params": params or {}})
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.TimeoutException:
         return {"error": f"QGIS command timed out after {effective_timeout}s."}
-    except ConnectionRefusedError:
-        return {"error": "Cannot connect to QGIS. The application may be restarting."}
+    except httpx.ConnectError:
+        return {"error": f"Cannot connect to QGIS api_server at port {port}. QGIS may still be starting up."}
     except Exception as e:
-        return {"error": f"Bridge error: {str(e)}"}
+        return {"error": f"Bridge HTTP error: {str(e)}"}
 
 
 # ── Load HTML ─────────────────────────────────────────────────────
@@ -84,9 +156,9 @@ def load_ui_html():
     html_path = Path(__file__).parent / "qgis_app.html"
     if html_path.exists():
         UI_HTML_CONTENT = html_path.read_text(encoding="utf-8")
-        print(f"[BigQgisMCP] Loaded UI HTML: {len(UI_HTML_CONTENT)} bytes")
+        print(f"[QgisRemoteMCP] Loaded UI HTML: {len(UI_HTML_CONTENT)} bytes")
     else:
-        print(f"[BigQgisMCP] Warning: UI HTML not found at {html_path}")
+        print(f"[QgisRemoteMCP] Warning: UI HTML not found at {html_path}")
         UI_HTML_CONTENT = "<html><body><h1>QGIS App UI not found</h1></body></html>"
 
 load_ui_html()
@@ -126,7 +198,8 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "code": {"type": "string", "description": "Python code to execute inside QGIS"}
+                "code": {"type": "string", "description": "Python code to execute inside QGIS"},
+                "timeout": {"type": "integer", "description": "Execution timeout in seconds (default 60). Increase for long-running spatial operations.", "default": 60}
             },
             "required": ["code"]
         }
@@ -747,6 +820,22 @@ Skills : skill://smart-loading, skill://processing, skill://cartography, skill:/
 
 
 # ══════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════
+
+def _accepts_sse(accept_header: str) -> bool:
+    """Return True if the Accept header includes text/event-stream as a media type.
+
+    Parses properly so that 'text/event-stream-custom' does not match.
+    """
+    for part in accept_header.split(","):
+        media_type = part.strip().split(";")[0].strip()
+        if media_type == "text/event-stream":
+            return True
+    return False
+
+
+# ══════════════════════════════════════════════════════════════════
 # TOOL EXECUTION
 # ══════════════════════════════════════════════════════════════════
 
@@ -795,8 +884,12 @@ def _error(message: str) -> dict:
 
 
 def _validate_required(arguments: dict, *fields) -> Optional[str]:
-    """Return error message if any required field is missing/empty, else None."""
-    missing = [f for f in fields if not arguments.get(f)]
+    """Return error message if any required field is absent or None, else None.
+
+    Uses `is None` (not falsiness) so that 0, False and {} are accepted —
+    e.g. mouse_click(x=0, y=0) or run_processing(parameters={}) must not fail.
+    """
+    missing = [f for f in fields if arguments.get(f) is None]
     if missing:
         return f"Missing required parameter(s): {', '.join(missing)}"
     return None
@@ -806,8 +899,7 @@ def _validate_required(arguments: dict, *fields) -> Optional[str]:
 # Each function takes (arguments: dict) and returns an MCP result dict.
 
 def _tool_qgis_desktop_ui(arguments: dict) -> dict:
-    vnc_url = f"http://{VNC_HOST}:{VNC_PORT}/vnc.html?autoconnect=true&resize=scale"
-    return {"content": [{"type": "text", "text": f"QGIS Desktop interface opened.\nVNC URL: {vnc_url}\nThe interactive view is displayed above."}]}
+    return {"content": [{"type": "text", "text": "QGIS Desktop UI opened. Use the '🖵 Open in Browser' button in the panel to open full-screen noVNC."}]}
 
 
 def _tool_execute_python(arguments: dict) -> dict:
@@ -1288,8 +1380,14 @@ def _tool_run_recipe(arguments: dict) -> dict:
         if action == "apply_layout_template" and "template" in params:
             params["template_id"] = params.pop("template")
 
-        # Determine timeout
-        timeout = SOCKET_TIMEOUT_LONG if action in _LONG_TIMEOUT_ACTIONS else SOCKET_TIMEOUT
+        # Determine timeout — execute_python in recipes can be very heavy (spatial joins on 100k+
+        # features), so use the recipe timeout (1200s) instead of the standard long timeout (300s).
+        if action == "execute_python":
+            timeout = SOCKET_TIMEOUT_RECIPE
+        elif action in _LONG_TIMEOUT_ACTIONS:
+            timeout = SOCKET_TIMEOUT_LONG
+        else:
+            timeout = SOCKET_TIMEOUT
 
         # Execute
         resp = qgis_command(action, params, timeout=timeout)
@@ -1339,6 +1437,149 @@ def _tool_run_recipe(arguments: dict) -> dict:
     }
 
     return {"content": _text(response, indent=2) + _auto_screenshot()}
+
+
+async def stream_run_recipe(arguments: dict, msg_id: Any, session_id: str,
+                            progress_token: Any, user_id: str = "default"):
+    """Async generator — streams run_recipe progress via SSE (MCP notifications/progress).
+
+    Yields SSE events:
+      - notifications/progress  for each step (keeps connection alive, shows progress)
+      - final tools/call result as the last event
+    """
+    # Set ContextVar here (not in handle_mcp) because the generator runs after
+    # the handler returns, so any ContextVar set in handle_mcp would already be reset.
+    _cv_token = current_user_id.set(user_id)
+
+    def sse(data: dict) -> str:
+        return f"event: message\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    def progress(step: int, total: int, message: str) -> str:
+        if progress_token is not None:
+            return sse({
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": {"progressToken": progress_token, "progress": step,
+                           "total": total, "message": message},
+            })
+        # No token — SSE comment keeps the TCP connection alive without a JSON event
+        return f": {step}/{total} {message}\n\n"
+
+    err = _validate_required(arguments, "id", "zone")
+    if err:
+        yield sse({"jsonrpc": "2.0", "id": msg_id,
+                   "error": {"code": -32602, "message": err}})
+        return
+
+    recipe_id = arguments["id"]
+    zone      = arguments["zone"]
+
+    yield progress(0, 1, f"Démarrage : {recipe_id} — {zone}")
+
+    # 1. New project
+    if arguments.get("new_project", True):
+        await asyncio.to_thread(qgis_command, "new_project",
+                                {"title": f"{recipe_id} — {zone}"})
+
+    # 2. Resolve recipe
+    recipe_params = {"id": recipe_id, "zone": zone}
+    if arguments.get("grid_size"):
+        recipe_params["grid_size"] = arguments["grid_size"]
+
+    recipe_resp = await asyncio.to_thread(qgis_command, "get_recipe", recipe_params)
+    if "error" in recipe_resp:
+        yield sse({"jsonrpc": "2.0", "id": msg_id,
+                   "error": {"code": -32602,
+                             "message": f"Recipe not found: {recipe_resp['error']}"}})
+        return
+
+    steps   = recipe_resp.get("steps", [])
+    total   = len(steps)
+    results = []
+    stopped = False
+
+    # 3. Execute each step, yielding progress before each
+    for i, step in enumerate(steps):
+        step_id     = step.get("id", f"step_{i}")
+        action      = step.get("tool", "")
+        description = step.get("description", "")
+        params      = dict(step.get("params", {}))
+
+        if action == "execute_python":
+            params["code"] = step.get("code", "")
+            params.setdefault("timeout", 180)
+        if action == "apply_layout_template" and "template" in params:
+            params["template_id"] = params.pop("template")
+
+        if action == "execute_python":
+            sock_timeout = SOCKET_TIMEOUT_RECIPE
+        elif action in _LONG_TIMEOUT_ACTIONS:
+            sock_timeout = SOCKET_TIMEOUT_LONG
+        else:
+            sock_timeout = SOCKET_TIMEOUT
+
+        yield progress(i, total, f"Étape {i + 1}/{total} : {description}")
+
+        # Run the bridge call in a thread and send SSE keepalive comments every 25s so the
+        # client connection never times out during long operations (smart_load can take 300s).
+        task = asyncio.ensure_future(asyncio.to_thread(qgis_command, action, params, sock_timeout))
+        while not task.done():
+            done, _ = await asyncio.wait({task}, timeout=25)
+            if not done:
+                yield f": keepalive\n\n"
+        resp = task.result()
+        success = "error" not in resp
+
+        step_result = {
+            "step": f"{i + 1}/{total}",
+            "id": step_id,
+            "tool": action,
+            "description": description,
+            "success": success,
+        }
+        if not success:
+            step_result["error"] = resp.get("error", "Unknown error")
+        else:
+            for key in ("feature_count", "layer_id", "name", "path",
+                        "download_url", "size", "stats"):
+                if key in resp:
+                    step_result[key] = resp[key]
+            if action == "execute_python" and "result" in resp:
+                step_result["result"] = resp["result"]
+
+        results.append(step_result)
+
+        if not success and action == "set_study_zone":
+            stopped = True
+            break
+
+    # 4. Final result
+    succeeded = sum(1 for r in results if r["success"])
+    failed    = sum(1 for r in results if not r["success"])
+
+    response_data = {
+        "recipe": recipe_id,
+        "zone": zone,
+        "total_steps": total,
+        "executed": len(results),
+        "succeeded": succeeded,
+        "failed": failed,
+        "stopped_early": stopped,
+        "steps": results,
+        "outputs": recipe_resp.get("outputs", []),
+    }
+
+    yield progress(total, total, f"Terminé — {succeeded}/{total} étapes réussies")
+
+    # Screenshot (async, non-blocking)
+    await asyncio.sleep(0.3)  # let QGIS render
+    ss_resp  = await asyncio.to_thread(qgis_command, "screenshot", {"width": 1280, "height": 720})
+    content  = [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False, indent=2)}]
+    if "image_base64" in ss_resp:
+        content.append({"type": "image", "data": ss_resp["image_base64"], "mimeType": "image/png"})
+
+    yield sse({"jsonrpc": "2.0", "id": msg_id, "result": {"content": content}})
+    current_user_id.reset(_cv_token)
 
 
 # ── Dispatch table ────────────────────────────────────────────
@@ -1401,7 +1642,7 @@ def execute_tool(name: str, arguments: dict) -> dict:
 # ══════════════════════════════════════════════════════════════════
 
 SERVER_INFO = {
-    "name": "BigQgisMCP",
+    "name": "QgisRemoteMCP",
     "version": "1.0.0",
 }
 
@@ -1494,7 +1735,7 @@ Every mutating tool response includes a context line with: current phase (setup/
 - Files in /data/ are accessible via REST API at http://localhost:8080/api/files/{{filename}}.
 - Python code is syntax-validated before execution — malformed code returns a clean error instead of crashing QGIS.
 - The project is auto-saved to /data/.autosave.qgz before risky operations (execute_python, run_processing, remove_layer, new_project).
-- execute_python has a 30s timeout by default. Pass `timeout` param to adjust.
+- execute_python has a 60s timeout by default. Pass `timeout` param to adjust (e.g. timeout=180 for heavy spatial joins).
 
 ## External vision services
 - Moondream (image understanding): {MOONDREAM_URL}
@@ -1503,11 +1744,11 @@ Every mutating tool response includes a context line with: current phase (setup/
 """
 
 
-def handle_mcp_message(method: str, params: dict, msg_id: Any, session_id: str):
-    """Handle a single MCP JSON-RPC message. Returns (response_dict, notification_dict_or_None)."""
+def handle_mcp_message(method: str, params: dict, msg_id: Any, session_id: str) -> Optional[dict]:
+    """Handle a single MCP JSON-RPC message. Returns a response dict, or None for notifications."""
 
     if method == "initialize":
-        sessions[session_id] = {"initialized": True}
+        sessions[session_id] = {"initialized": True, "last_seen": time.time()}
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
@@ -1524,45 +1765,48 @@ def handle_mcp_message(method: str, params: dict, msg_id: Any, session_id: str):
                 "serverInfo": SERVER_INFO,
                 "instructions": INSTRUCTIONS,
             }
-        }, None
+        }
 
-    elif method == "notifications/initialized":
-        return None, None
+    if method == "notifications/initialized":
+        return None
 
-    elif method == "ping":
-        return {"jsonrpc": "2.0", "id": msg_id, "result": {}}, None
+    if method == "ping":
+        _session_touch(session_id)
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
+
+    _session_touch(session_id)
 
     # ── Tools ──────────────────────────────────────────────────
 
-    elif method == "tools/list":
+    if method == "tools/list":
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {"tools": TOOLS}
-        }, None
+        }
 
-    elif method == "tools/call":
+    if method == "tools/call":
         tool_name = params.get("name", "")
         arguments = params.get("arguments", {})
         try:
             result = execute_tool(tool_name, arguments)
-            return {"jsonrpc": "2.0", "id": msg_id, "result": result}, None
+            return {"jsonrpc": "2.0", "id": msg_id, "result": result}
         except Exception as e:
             return {
                 "jsonrpc": "2.0", "id": msg_id,
                 "result": {"content": [{"type": "text", "text": f"Error: {str(e)}"}], "isError": True}
-            }, None
+            }
 
     # ── Resources ──────────────────────────────────────────────
 
-    elif method == "resources/list":
+    if method == "resources/list":
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {"resources": RESOURCES}
-        }, None
+        }
 
-    elif method == "resources/read":
+    if method == "resources/read":
         uri = params.get("uri", "")
 
         if uri == UI_RESOURCE_URI:
@@ -1585,16 +1829,16 @@ def handle_mcp_message(method: str, params: dict, msg_id: Any, session_id: str):
                         }
                     }]
                 }
-            }, None
+            }
 
-        elif uri == "skill://qgis-status":
+        if uri == "skill://qgis-status":
             return {
                 "jsonrpc": "2.0",
                 "id": msg_id,
                 "result": {"contents": [{"uri": uri, "mimeType": "text/plain", "text": json.dumps(qgis_command("health"), indent=2)}]}
-            }, None
+            }
 
-        elif uri in SKILL_MAP:
+        if uri in SKILL_MAP:
             content = _load_skill(SKILL_MAP[uri])
             if uri == "skill://data-sources":
                 catalog_path = Path("/app/datasources.json")
@@ -1605,24 +1849,24 @@ def handle_mcp_message(method: str, params: dict, msg_id: Any, session_id: str):
                 "jsonrpc": "2.0",
                 "id": msg_id,
                 "result": {"contents": [{"uri": uri, "mimeType": "text/plain", "text": content}]}
-            }, None
+            }
 
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
             "error": {"code": -32602, "message": f"Unknown resource: {uri}"}
-        }, None
+        }
 
     # ── Prompts ────────────────────────────────────────────────
 
-    elif method == "prompts/list":
+    if method == "prompts/list":
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {"prompts": PROMPTS}
-        }, None
+        }
 
-    elif method == "prompts/get":
+    if method == "prompts/get":
         prompt_name = params.get("name", "")
         arguments = params.get("arguments", {})
         messages = get_prompt_content(prompt_name, arguments)
@@ -1630,16 +1874,15 @@ def handle_mcp_message(method: str, params: dict, msg_id: Any, session_id: str):
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {"messages": [{"role": "user", "content": messages}]}
-        }, None
+        }
 
     # ── Unknown ────────────────────────────────────────────────
 
-    else:
-        return {
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "error": {"code": -32601, "message": f"Method not found: {method}"}
-        }, None
+    return {
+        "jsonrpc": "2.0",
+        "id": msg_id,
+        "error": {"code": -32601, "message": f"Method not found: {method}"}
+    }
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1663,9 +1906,29 @@ def make_sse_response(data: dict, session_id: str) -> Response:
 async def handle_mcp(request: Request) -> Response:
     """Main MCP endpoint — handles Streamable HTTP."""
 
-    # GET = SSE stream (not used in our case, but acknowledge)
+    # GET = MCP 2024-11-05 SSE transport (Claude Desktop, older clients)
+    # Open persistent SSE connection, send endpoint event, then keepalives.
+    # Clients using this protocol will POST tool calls to /mcp normally.
     if request.method == "GET":
-        return Response(status_code=405, content="Use POST for MCP requests")
+        session_id = request.headers.get("mcp-session-id", uuid.uuid4().hex)
+
+        async def _sse_keepalive():
+            # Announce where to POST requests
+            yield f"event: endpoint\ndata: /mcp\n\n"
+            # Keep connection alive; Claude Desktop reconnects automatically if it drops
+            while True:
+                await asyncio.sleep(30)
+                yield f": keepalive\n\n"
+
+        return StreamingResponse(
+            _sse_keepalive(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "mcp-session-id": session_id,
+            },
+        )
 
     # DELETE = close session
     if request.method == "DELETE":
@@ -1679,14 +1942,57 @@ async def handle_mcp(request: Request) -> Response:
     except Exception:
         return JSONResponse({"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}}, status_code=400)
 
+    # Batch requests are not supported (JSON-RPC 2.0 §6)
+    if isinstance(body, list):
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Batch requests are not supported"}},
+            status_code=400,
+        )
+
     # Get or create session
-    session_id = request.headers.get("mcp-session-id", "")
-    if not session_id:
-        session_id = uuid.uuid4().hex
+    # Keep the raw header value to distinguish "client sent a known ID" from "auto-generated"
+    session_id_header = request.headers.get("mcp-session-id", "")
+    session_id = session_id_header or uuid.uuid4().hex
 
     method = body.get("method", "")
     params = body.get("params", {})
     msg_id = body.get("id")
+
+    # Session validation (P3 — lenient): only enforce when the client explicitly sent a
+    # mcp-session-id header that we don't recognise. Auto-generated IDs (no header sent)
+    # are allowed through for backward-compat with session-less clients and proxies.
+    _STATEFUL_METHODS = frozenset({
+        "tools/list", "tools/call",
+        "resources/list", "resources/read",
+        "prompts/list", "prompts/get",
+    })
+    if (sessions and  # only enforce when server has active sessions (prevents blocking reconnects after restart)
+            session_id_header and
+            method in _STATEFUL_METHODS and
+            msg_id is not None and
+            session_id_header not in sessions):
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": msg_id,
+             "error": {"code": -32600, "message": "Session not initialized or expired. Send 'initialize' first."}},
+            headers={"mcp-session-id": session_id_header},
+            status_code=400,
+        )
+
+    # ── Multi-user: resolve user_id from auth header ──────────────
+    # Auth is optional: if no Bearer token is provided, use "anonymous"
+    # (which gets its own isolated container).
+    if MULTI_USER_MODE:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer ") and auth_manager is not None:
+            api_key = auth_header[7:].strip()
+            user = auth_manager.verify_api_key(api_key)
+            user_id = user.id if user else "anonymous"
+        else:
+            user_id = "anonymous"
+        # Ensure the user's QGIS container is running before we dispatch
+        await _ensure_session(user_id)
+    else:
+        user_id = "default"
 
     # Notifications (no id) — just acknowledge
     if msg_id is None:
@@ -1694,15 +2000,38 @@ async def handle_mcp(request: Request) -> Response:
             return Response(status_code=202, headers={"mcp-session-id": session_id})
         return Response(status_code=202, headers={"mcp-session-id": session_id})
 
-    # Handle the message
-    response, notification = handle_mcp_message(method, params, msg_id, session_id)
+    # run_recipe: stream via SSE only if client supports it (e.g. direct Claude.ai).
+    # mcp-remote proxies don't send Accept: text/event-stream and can't parse SSE results
+    # → they would return null → "No result received from client-side tool execution".
+    # For non-SSE clients, fall through to the normal synchronous handler below.
+    accept = request.headers.get("accept", "")
+    if (method == "tools/call" and
+            params.get("name") == "run_recipe" and
+            _accepts_sse(accept)):
+        progress_token = params.get("_meta", {}).get("progressToken")
+        # Pass user_id into the generator — it sets its own ContextVar token
+        # because the generator runs after this handler returns.
+        return StreamingResponse(
+            stream_run_recipe(params.get("arguments", {}), msg_id, session_id,
+                              progress_token, user_id=user_id),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
+                     "mcp-session-id": session_id},
+        )
+
+    # Handle the message — run in thread pool to avoid blocking the asyncio event loop.
+    # ContextVar is propagated automatically by asyncio.to_thread (Python 3.7+).
+    token = current_user_id.set(user_id)
+    try:
+        response = await asyncio.to_thread(handle_mcp_message, method, params, msg_id, session_id)
+    finally:
+        current_user_id.reset(token)
 
     if response is None:
         return Response(status_code=202, headers={"mcp-session-id": session_id})
 
     # Check Accept header — prefer SSE if supported
-    accept = request.headers.get("accept", "")
-    if "text/event-stream" in accept:
+    if _accepts_sse(accept):
         return make_sse_response(response, session_id)
     else:
         return JSONResponse(response, headers={"mcp-session-id": session_id})
@@ -1710,16 +2039,169 @@ async def handle_mcp(request: Request) -> Response:
 
 async def handle_health(request: Request) -> JSONResponse:
     """Health check endpoint."""
-    bridge_ok = os.path.exists(SOCKET_PATH)
-    return JSONResponse({"status": "ok", "bridge": bridge_ok, "server": "BigQgisMCP"})
+    if MULTI_USER_MODE:
+        bridge_ok = True  # bridge runs per-container; gateway itself is always up
+    else:
+        # Quick HTTP probe to the local api_server
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                r = await client.get(f"http://localhost:{_SINGLE_USER_API_PORT}/health")
+                bridge_ok = r.status_code == 200
+        except Exception:
+            bridge_ok = os.path.exists(SOCKET_PATH)  # fallback: legacy check
+    return JSONResponse({
+        "status": "ok",
+        "bridge": bridge_ok,
+        "server": "QgisRemoteMCP",
+        "multi_user": MULTI_USER_MODE,
+    })
+
+
+# ── Auth endpoints (active when MULTI_USER_MODE=true) ─────────────
+
+async def handle_auth_register(request: Request) -> JSONResponse:
+    """POST /api/auth/register — {"email": "...", "password": "..."}"""
+    if not MULTI_USER_MODE or auth_manager is None:
+        return JSONResponse({"error": "Auth not enabled (MULTI_USER_MODE=false)"}, status_code=404)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+    try:
+        result = auth_manager.register(body.get("email", ""), body.get("password", ""))
+        return JSONResponse(result, status_code=201)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+async def handle_auth_login(request: Request) -> JSONResponse:
+    """POST /api/auth/login — {"email": "...", "password": "..."}"""
+    if not MULTI_USER_MODE or auth_manager is None:
+        return JSONResponse({"error": "Auth not enabled (MULTI_USER_MODE=false)"}, status_code=404)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+    try:
+        result = auth_manager.login(body.get("email", ""), body.get("password", ""))
+        return JSONResponse(result)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=401)
+
+
+async def handle_auth_me(request: Request) -> JSONResponse:
+    """GET /api/auth/me — returns current user info."""
+    if not MULTI_USER_MODE or auth_manager is None:
+        return JSONResponse({"error": "Auth not enabled"}, status_code=404)
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return JSONResponse({"error": "Missing Bearer token"}, status_code=401)
+    api_key = auth_header[7:].strip()
+    user = auth_manager.verify_api_key(api_key)
+    if not user:
+        return JSONResponse({"error": "Invalid API key"}, status_code=401)
+    return JSONResponse(auth_manager.get_user_info(user.id))
+
+
+async def handle_auth_regenerate(request: Request) -> JSONResponse:
+    """POST /api/auth/regenerate-key"""
+    if not MULTI_USER_MODE or auth_manager is None:
+        return JSONResponse({"error": "Auth not enabled"}, status_code=404)
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return JSONResponse({"error": "Missing Bearer token"}, status_code=401)
+    api_key = auth_header[7:].strip()
+    user = auth_manager.verify_api_key(api_key)
+    if not user:
+        return JSONResponse({"error": "Invalid API key"}, status_code=401)
+    new_key = auth_manager.regenerate_api_key(user.id)
+    return JSONResponse({"api_key": new_key})
+
+
+async def handle_session_info(request: Request) -> JSONResponse:
+    """GET /api/session — returns the caller's container session info."""
+    if not MULTI_USER_MODE or container_manager is None:
+        return JSONResponse({"error": "Multi-user mode not enabled"}, status_code=404)
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer ") and auth_manager is not None:
+        api_key = auth_header[7:].strip()
+        user = auth_manager.verify_api_key(api_key)
+        user_id = user.id if user else "anonymous"
+    else:
+        user_id = "anonymous"
+    session = container_manager.get_session(user_id)
+    if not session:
+        return JSONResponse({"status": "not_started", "user_id": user_id})
+    return JSONResponse(session.to_dict())
+
+
+async def handle_sessions_list(request: Request) -> JSONResponse:
+    """GET /api/sessions — list all active sessions (admin, no auth required for MVP)."""
+    if not MULTI_USER_MODE or container_manager is None:
+        return JSONResponse({"error": "Multi-user mode not enabled"}, status_code=404)
+    return JSONResponse({"sessions": container_manager.list_sessions()})
+
+
+# ── Lifespan: initialise / shutdown managers ──────────────────────
+
+@asynccontextmanager
+async def lifespan(app):
+    global container_manager, auth_manager
+
+    if MULTI_USER_MODE:
+        if not _MULTIUSER_DEPS_OK:
+            raise RuntimeError(
+                "MULTI_USER_MODE=true but src/auth.py or src/container_manager.py "
+                "could not be imported. Check that docker>=7.0.0 is installed."
+            )
+
+        idle_timeout = os.environ.get("IDLE_TIMEOUT_MINUTES")
+        if not idle_timeout:
+            raise RuntimeError(
+                "IDLE_TIMEOUT_MINUTES must be set when MULTI_USER_MODE=true "
+                "(e.g. IDLE_TIMEOUT_MINUTES=30)."
+            )
+
+        data_dir = os.environ.get("DATA_DIR", "data")
+
+        auth_manager = AuthManager(data_dir=data_dir)
+        await auth_manager.initialize()
+        print(f"[QgisRemoteMCP] Auth manager ready — data_dir={data_dir}")
+
+        container_manager = ContainerManager(
+            image_name=os.environ.get("QGIS_IMAGE", "bigqgismcp:latest"),
+            base_api_port=int(os.environ.get("BASE_API_PORT", "9000")),
+            base_stream_port=int(os.environ.get("BASE_STREAM_PORT", "9100")),
+            base_novnc_port=int(os.environ.get("BASE_NOVNC_PORT", "9200")),
+            max_containers=int(os.environ.get("MAX_CONTAINERS", "50")),
+            idle_timeout_minutes=int(idle_timeout),
+            data_dir=data_dir,
+        )
+        await container_manager.initialize()
+        print(f"[QgisRemoteMCP] Multi-user mode: ON — idle_timeout={idle_timeout}min")
+    else:
+        print("[QgisRemoteMCP] Single-user mode (MULTI_USER_MODE=false)")
+
+    yield
+
+    if container_manager is not None:
+        await container_manager.shutdown()
+        print("[QgisRemoteMCP] Container manager stopped")
 
 
 # ── Create Starlette app ──────────────────────────────────────────
 
 app = Starlette(
+    lifespan=lifespan,
     routes=[
         Route("/mcp", handle_mcp, methods=["GET", "POST", "DELETE"]),
         Route("/health", handle_health, methods=["GET"]),
+        Route("/api/auth/register", handle_auth_register, methods=["POST"]),
+        Route("/api/auth/login", handle_auth_login, methods=["POST"]),
+        Route("/api/auth/me", handle_auth_me, methods=["GET"]),
+        Route("/api/auth/regenerate-key", handle_auth_regenerate, methods=["POST"]),
+        Route("/api/session", handle_session_info, methods=["GET"]),
+        Route("/api/sessions", handle_sessions_list, methods=["GET"]),
     ]
 )
 
@@ -1729,19 +2211,25 @@ app = Starlette(
 # ══════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    load_ui_html()
-
-    print("[BigQgisMCP] Waiting for QGIS bridge...")
-    for i in range(90):
-        if os.path.exists(SOCKET_PATH):
-            print(f"[BigQgisMCP] Bridge found after {i}s")
-            break
-        time.sleep(1)
+    if MULTI_USER_MODE:
+        print("[QgisRemoteMCP] Multi-user mode — skipping QGIS bridge wait (per-user containers)")
     else:
-        print("[BigQgisMCP] WARNING: Bridge not found, starting MCP server anyway")
+        print("[QgisRemoteMCP] Waiting for local QGIS api_server…")
+        for i in range(90):
+            try:
+                import urllib.request
+                urllib.request.urlopen(
+                    f"http://localhost:{_SINGLE_USER_API_PORT}/health", timeout=2
+                )
+                print(f"[QgisRemoteMCP] api_server ready after {i}s")
+                break
+            except Exception:
+                time.sleep(1)
+        else:
+            print("[QgisRemoteMCP] WARNING: api_server not responding, starting MCP server anyway")
 
-    print(f"[BigQgisMCP] Starting MCP server on :{MCP_PORT}")
-    print(f"[BigQgisMCP] MCP Apps UI: {UI_RESOURCE_URI}")
-    print(f"[BigQgisMCP] Endpoint: http://0.0.0.0:{MCP_PORT}/mcp")
+    print(f"[QgisRemoteMCP] Starting MCP server on :{MCP_PORT}")
+    print(f"[QgisRemoteMCP] MCP Apps UI: {UI_RESOURCE_URI}")
+    print(f"[QgisRemoteMCP] Endpoint: http://0.0.0.0:{MCP_PORT}/mcp")
 
     uvicorn.run(app, host="0.0.0.0", port=MCP_PORT, log_level="info")

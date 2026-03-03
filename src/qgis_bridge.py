@@ -1,5 +1,5 @@
 """
-BigQgisMCP — QGIS Bridge
+QgisRemoteMCP — QGIS Bridge
 ═══════════════════════════════════════════════════════════════════
 
 This script runs INSIDE QGIS as a startup script. It:
@@ -411,7 +411,7 @@ class QGISBridge:
         project.clear()
         crs = params.get("crs", "EPSG:2154")  # Lambert 93 default (France)
         project.setCrs(QgsCoordinateReferenceSystem(crs))
-        title = params.get("title", "BigQgisMCP Project")
+        title = params.get("title", "QgisRemoteMCP Project")
         project.setTitle(title)
         # Enable on-the-fly reprojection so layers in different CRS always display
         from qgis.core import QgsSettings
@@ -1484,9 +1484,10 @@ class QGISBridge:
         # Max realistic water depth — values above this (e.g. 9999) are sentinel "unbounded"
         HT_MAX_CAP = 5.0
 
-        def to_geojson_features(layer, limit, extra_props_fn=None, fields_filter=None):
+        def to_geojson_features(layer, limit, extra_props_fn=None, fields_filter=None, simplify=None):
             """Export layer features as GeoJSON dicts in EPSG:4326.
-            fields_filter: optional set of field names to include (None = all)."""
+            fields_filter: optional set of field names to include (None = all).
+            simplify: if float > 0, simplify geometry to this tolerance (degrees EPSG:4326)."""
             tr = QgsCoordinateTransform(layer.crs(), crs_4326, project)
             features = []
             for i, feat in enumerate(layer.getFeatures()):
@@ -1496,6 +1497,10 @@ class QGISBridge:
                 if geom.isEmpty():
                     continue
                 geom.transform(tr)
+                if simplify and simplify > 0:
+                    simp = geom.simplify(simplify)
+                    if simp and not simp.isEmpty():
+                        geom = simp
                 props = {}
                 for field in layer.fields():
                     fname = field.name()
@@ -1570,7 +1575,7 @@ class QGISBridge:
                     max_height = ht_max
 
             flood_features.extend(to_geojson_features(
-                layer, max_features, add_flood_props, fields_filter=include_fields))
+                layer, max_features, add_flood_props, fields_filter=include_fields, simplify=0.00005))
 
         # If no ISO_HT but we have extent layers, create synthetic flood polygons
         if not flood_features and extent_only_layers:
@@ -1598,7 +1603,7 @@ class QGISBridge:
                     if _max > max_height:
                         max_height = _max
 
-                flood_features.extend(to_geojson_features(layer, max_features, add_synth_props))
+                flood_features.extend(to_geojson_features(layer, max_features, add_synth_props, simplify=0.00005))
 
         flood_geojson = {"type": "FeatureCollection", "features": flood_features}
 
@@ -1728,6 +1733,67 @@ class QGISBridge:
 
         sensitive_geojson = {"type": "FeatureCollection", "features": sensitive_features}
 
+        # ── Routing zones: per-scenario flood extents for Valhalla exclude_polygons ──
+        # Uses ALEA_SYNT binary extent layers (simpler than ISO_HT depth classes).
+        # Simplified geometries (~11m tolerance) reduce JSON payload.
+        routing_zones = {}
+
+        def _detect_flood_scenario(name_lower):
+            """Map layer name to flood scenario key (t10 / t100 / t1000)."""
+            # Check most specific first to avoid substring collision (t10 ⊂ t100 ⊂ t1000)
+            if 't1000' in name_lower or 'treme' in name_lower or '01_04' in name_lower:
+                return 't1000'
+            if 't100' in name_lower or 'centennale' in name_lower or '01_02' in name_lower:
+                return 't100'
+            if 't10' in name_lower or 'quente' in name_lower or '01_01' in name_lower:
+                return 't10'
+            return None
+
+        for layer in (extent_only_layers if extent_only_layers else iso_ht_layers):
+            sc = _detect_flood_scenario(layer.name().lower())
+            if sc is None or sc in routing_zones:
+                continue
+            tr_sc = QgsCoordinateTransform(layer.crs(), crs_4326, project)
+            sc_features = []
+            for feat in layer.getFeatures():
+                geom = feat.geometry()
+                if geom.isEmpty():
+                    continue
+                geom_copy = QgsGeometry(geom)
+                geom_copy.transform(tr_sc)
+                simple = geom_copy.simplify(0.0001)  # ~11m at equator
+                target_geom = simple if (simple and not simple.isEmpty()) else geom_copy
+                sc_features.append({
+                    "type": "Feature",
+                    "geometry": json.loads(target_geom.asJson()),
+                    "properties": {}
+                })
+            if sc_features:
+                routing_zones[sc] = {"type": "FeatureCollection", "features": sc_features}
+
+        # ── Find and export routes with scenario depth fields ──
+        route_layers = find_layers('route', 'troncon')
+        route_layer_export = route_layers[0] if route_layers else None
+        routes_geojson = {"type": "FeatureCollection", "features": []}
+
+        if route_layer_export:
+            route_field_names = {f.name() for f in route_layer_export.fields()}
+            # Always export: ht_num fields (all scenarios) + basic road attributes
+            route_include = {fn for fn in route_field_names
+                             if fn in ('ht_num', 'nature', 'importance', 'sens_de_circulation')
+                             or fn.startswith('ht_num_')}
+            route_features = to_geojson_features(
+                route_layer_export, max_features,
+                fields_filter=route_include if route_include else None)
+            routes_geojson = {"type": "FeatureCollection", "features": route_features}
+
+        # ── Detect available scenarios from building layer fields ──
+        bld_field_names_lower = [f.name().lower() for f in building_layer.fields()]
+        available_scenarios = [sc for sc in ('t10', 't100', 't1000')
+                               if f'{sc}_ht_max' in bld_field_names_lower]
+        if not available_scenarios:
+            available_scenarios = ['t100']
+
         # ── Canvas center for map view ──
         canvas = self.iface.mapCanvas() if self.iface else None
         center = [0, 0]
@@ -1758,8 +1824,11 @@ class QGISBridge:
         html = html.replace("{{FLOOD_JSON}}", json.dumps(flood_geojson, default=str))
         html = html.replace("{{BUILDINGS_JSON}}", json.dumps(buildings_geojson, default=str))
         html = html.replace("{{SENSITIVE_JSON}}", json.dumps(sensitive_geojson, default=str))
+        html = html.replace("{{ROUTES_JSON}}", json.dumps(routes_geojson, default=str))
+        html = html.replace("{{SCENARIOS}}", json.dumps(available_scenarios))
         html = html.replace("{{MAX_HEIGHT}}", str(round(max_height, 1)))
         html = html.replace("{{ZONE_NAME}}", zone_name)
+        html = html.replace("{{ROUTING_ZONES_JSON}}", json.dumps(routing_zones, default=str))
 
         # Write output
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -1785,11 +1854,13 @@ class QGISBridge:
             "size_bytes": size,
             "title": title,
             "zone": zone_name,
+            "scenarios": available_scenarios,
             "max_water_height_m": round(max_height, 1),
             "flood_polygons": len(flood_features),
             "buildings": len(building_features),
             "buildings_exposed": exposed_buildings,
             "buildings_pct": round(exposed_buildings / max(len(building_features), 1) * 100, 1),
+            "routes": len(routes_geojson["features"]),
             "sensitive_facilities": len(sensitive_features),
             "sensitive_exposed": exposed_sensitive,
         }
@@ -4807,7 +4878,7 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
         if src_type == "wfs":
             bbox = params.get("bbox")
             native_crs = source.get("native_crs", "EPSG:2154")
-            max_features = params.get("max_features", 10000)
+            max_features = params.get("max_features", None)  # None = unlimited (bbox is the real filter)
             result = qgis_helpers.download_wfs_ogr(
                 url=source["url"],
                 typename=source["params"]["typename"],
@@ -5198,7 +5269,7 @@ def _open_startup_project():
         # Create a fresh default project
         project.clear()
         project.setCrs(QgsCoordinateReferenceSystem("EPSG:2154"))
-        project.setTitle("BigQgisMCP Project")
+        project.setTitle("QgisRemoteMCP Project")
 
         # Enable OTF reprojection
         from qgis.core import QgsSettings

@@ -1,1 +1,1 @@
-# BigQgisMCP — QGIS Desktop as an MCP Server
+# QgisRemoteMCP — QGIS Desktop as an MCP Server

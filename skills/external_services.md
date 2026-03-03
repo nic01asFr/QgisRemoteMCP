@@ -2,7 +2,7 @@
 
 ## Architecture
 
-BigQgisMCP does NOT embed vision models. They run as separate services
+QgisRemoteMCP does NOT embed vision models. They run as separate services
 accessible via HTTP. Your PyQGIS scripts call them with `urllib.request`.
 
 Service URLs are configured via environment variables:
