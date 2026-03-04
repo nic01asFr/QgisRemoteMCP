@@ -1,7 +1,7 @@
 {
   "id": "densite_bati",
   "name": "Carte de densité du bâti",
-  "description": "Analyse de densité des bâtiments par grille hexagonale avec rendu cartographique gradué. Produit une carte PDF avec mise en page professionnelle.",
+  "description": "Analyse de densité des bâtiments par grille hexagonale avec rendu cartographique gradué. Fond sombre + palette YlOrRd pour un rendu percutant. Produit une carte PDF et une carte web interactive.",
   "tags": ["urbanisme", "densité", "bâtiments", "grille"],
   "parameters": {
     "zone": {
@@ -26,8 +26,8 @@
     {
       "id": "basemap",
       "tool": "smart_load",
-      "params": {"id": "cartodb_positron"},
-      "description": "Ajouter le fond de carte clair"
+      "params": {"id": "cartodb_dark"},
+      "description": "Fond de carte sombre (contraste optimal pour la grille de densité)"
     },
     {
       "id": "buildings",
@@ -51,13 +51,13 @@
       "id": "count",
       "tool": "execute_python",
       "description": "Compter les bâtiments par cellule hexagonale et filtrer les cellules vides",
-      "code": "import processing\ngrid = [l for l in project.mapLayers().values() if 'Grille' in l.name()][0]\ncentroids = [l for l in project.mapLayers().values() if 'Centroide' in l.name()][0]\n\ndensity = processing.run('native:countpointsinpolygon', {\n    'POLYGONS': grid,\n    'POINTS': centroids,\n    'FIELD': 'nb_batiments',\n    'OUTPUT': 'memory:'\n})\ndl = density['OUTPUT']\ndl.setName('Densite bati')\n# Filter out empty cells for cleaner visualization\ndl.setSubsetString('nb_batiments > 0')\nproject.addMapLayer(dl)\n\n# Remove intermediate layers\nfor name in ['Grille hexagonale', 'Centroides batiments']:\n    for l in project.mapLayersByName(name):\n        project.removeMapLayer(l)\n\n# Hide raw buildings layer\nfor l in project.mapLayers().values():\n    if 'timent' in l.name() and 'Densite' not in l.name():\n        node = project.layerTreeRoot().findLayer(l)\n        if node: node.setItemVisibilityChecked(False)\n\nresult['density_features'] = dl.featureCount()\nresult['success'] = True"
+      "code": "import processing\ngrid = [l for l in project.mapLayers().values() if 'Grille' in l.name()][0]\ncentroids = [l for l in project.mapLayers().values() if 'Centroide' in l.name()][0]\n\ndensity = processing.run('native:countpointsinpolygon', {\n    'POLYGONS': grid,\n    'POINTS': centroids,\n    'FIELD': 'nb_batiments',\n    'OUTPUT': 'memory:'\n})\ndl = density['OUTPUT']\ndl.setName('Densite bati')\ndl.setSubsetString('nb_batiments > 0')\nproject.addMapLayer(dl)\n\nfor name in ['Grille hexagonale', 'Centroides batiments']:\n    for l in project.mapLayersByName(name):\n        project.removeMapLayer(l)\n\nfor l in project.mapLayers().values():\n    if 'timent' in l.name() and 'Densite' not in l.name():\n        node = project.layerTreeRoot().findLayer(l)\n        if node: node.setItemVisibilityChecked(False)\n\nresult['density_features'] = dl.featureCount()\nresult['success'] = True"
     },
     {
       "id": "style",
       "tool": "execute_python",
-      "description": "Appliquer une symbologie graduée séquentielle sur nb_batiments",
-      "code": "from qgis.core import QgsGraduatedSymbolRenderer, QgsRendererRange, QgsFillSymbol\n\nlayer = [l for l in project.mapLayers().values() if 'Densite' in l.name()][0]\n\n# Compute stats for auto-ranges\nidx = layer.fields().indexOf('nb_batiments')\nmax_val = layer.maximumValue(idx)\n\nif max_val and max_val > 0:\n    # Professional green sequential ramp (RGBA format)\n    breaks = [\n        (1, max(10, int(max_val*0.1)), '200,230,201,200', '< 10%'),\n        (max(10, int(max_val*0.1)), max(30, int(max_val*0.25)), '120,198,163,200', '10-25%'),\n        (max(30, int(max_val*0.25)), max(80, int(max_val*0.5)), '65,171,93,200', '25-50%'),\n        (max(80, int(max_val*0.5)), max(200, int(max_val*0.75)), '35,132,67,210', '50-75%'),\n        (max(200, int(max_val*0.75)), int(max_val)+1, '0,90,50,220', '75-100%'),\n    ]\n    ranges = []\n    for low, high, color, label in breaks:\n        sym = QgsFillSymbol.createSimple({'color': color, 'outline_color': '50,50,50,120', 'outline_width': '0.15'})\n        ranges.append(QgsRendererRange(low, high, sym, label))\n    renderer = QgsGraduatedSymbolRenderer('nb_batiments', ranges)\n    layer.setRenderer(renderer)\n    layer.triggerRepaint()\n    result['ranges'] = len(ranges)\n    result['max_val'] = max_val\n\n# Zoom to density layer with CRS transform\nfrom qgis.core import QgsCoordinateTransform\ncanvas = iface.mapCanvas()\ntr = QgsCoordinateTransform(layer.crs(), project.crs(), project)\next_proj = tr.transformBoundingBox(layer.extent())\ncanvas.setExtent(ext_proj)\ncanvas.zoomByFactor(1.1)\ncanvas.refresh()\n\nresult['success'] = True"
+      "description": "Appliquer une symbologie graduée YlOrRd (jaune → rouge) sur fond sombre",
+      "code": "from qgis.core import QgsGraduatedSymbolRenderer, QgsRendererRange, QgsFillSymbol, QgsCoordinateTransform\n\nlayer = [l for l in project.mapLayers().values() if 'Densite' in l.name()][0]\n\nidx = layer.fields().indexOf('nb_batiments')\nmax_val = layer.maximumValue(idx)\n\nif max_val and max_val > 0:\n    # YlOrRd: percutant sur fond sombre, standard cartographique densité\n    breaks = [\n        (1,                          max(5,  int(max_val*0.10)), '255,255,178,210', 'Faible'),\n        (max(5,  int(max_val*0.10)), max(15, int(max_val*0.25)), '254,204,92,215',  'Modérée'),\n        (max(15, int(max_val*0.25)), max(40, int(max_val*0.50)), '253,141,60,220',  'Élevée'),\n        (max(40, int(max_val*0.50)), max(100,int(max_val*0.75)), '227,26,28,225',   'Forte'),\n        (max(100,int(max_val*0.75)), int(max_val)+1,             '128,0,38,235',    'Très forte'),\n    ]\n    ranges = []\n    for low, high, color, label in breaks:\n        sym = QgsFillSymbol.createSimple({'color': color, 'outline_color': '255,255,255,20', 'outline_width': '0.08'})\n        ranges.append(QgsRendererRange(low, high, sym, label))\n    renderer = QgsGraduatedSymbolRenderer('nb_batiments', ranges)\n    layer.setRenderer(renderer)\n    layer.triggerRepaint()\n    result['max_val'] = max_val\n\ncanvas = iface.mapCanvas()\ntr = QgsCoordinateTransform(layer.crs(), project.crs(), project)\next_proj = tr.transformBoundingBox(layer.extent())\ncanvas.setExtent(ext_proj)\ncanvas.zoomByFactor(1.1)\ncanvas.refresh()\n\nresult['success'] = True"
     },
     {
       "id": "layout",
@@ -69,11 +69,21 @@
       "description": "Appliquer la mise en page A3 paysage"
     },
     {
-      "id": "export",
+      "id": "export_pdf",
       "tool": "export_pdf",
       "params": {"layout": "Export A3 Landscape"},
       "description": "Exporter en PDF"
+    },
+    {
+      "id": "export_web",
+      "tool": "export_web_map",
+      "params": {},
+      "description": "Exporter une carte web interactive Leaflet"
     }
   ],
-  "outputs": ["PDF mise en page A3", "Couche 'Densité bâti' avec champ nb_batiments"]
+  "outputs": [
+    "PDF mise en page A3 (palette YlOrRd sur fond sombre)",
+    "Carte web interactive Leaflet",
+    "Couche 'Densité bâti' avec champ nb_batiments"
+  ]
 }

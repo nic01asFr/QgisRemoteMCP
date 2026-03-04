@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════════════════
-# QgisStreamMCP — QGIS Desktop as an MCP Server
+# BigQgisMCP — QGIS Desktop as an MCP Server
 # ═══════════════════════════════════════════════════════════════════
 #
 # Single container with:

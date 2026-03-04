@@ -1,22 +1,28 @@
 # ═══════════════════════════════════════════════════════════════════
-# QgisStreamMCP — Docker Compose
+# QgisRemoteMCP — Docker Compose
 # ═══════════════════════════════════════════════════════════════════
 #
 # Usage:
 #   docker compose up -d --build       # Build & start
-#   docker compose logs -f qgisstreammcp  # View logs
+#   docker compose logs -f qgisremotemcp  # View logs
 #   docker compose down                # Stop
 #
-# Endpoints:
+# Endpoints (single-user mode, default):
 #   MCP Server:  http://localhost:8100/mcp
 #   QGIS noVNC:  http://localhost:6080
 #   REST API:    http://localhost:8080
 #   MJPEG:       http://localhost:8081/stream
+#
+# Multi-user mode — enable by setting MULTI_USER_MODE=true in .env:
+#   1. Uncomment the Docker socket volume below.
+#   2. Set JWT_SECRET, IDLE_TIMEOUT_MINUTES in .env.
+#   3. Worker containers start automatically on first MCP call.
+#      Their noVNC/API ports are dynamic (BASE_API_PORT+ etc.).
 
 services:
-  qgisstreammcp:
+  qgisremotemcp:
     build: .
-    container_name: qgisstreammcp
+    container_name: qgisremotemcp
     # GPU (optional) — Uncomment for CUDA/compute workloads.
     # QGIS rendering stays on CPU (Xvfb limitation — always uses Mesa/llvmpipe).
     # Requires NVIDIA Container Toolkit: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/
@@ -46,6 +52,18 @@ services:
       # Project to open on startup (path inside container, e.g. /data/myproject.qgz)
       # If empty or not found, a new default project is created automatically
       - QGIS_PROJECT=${QGIS_PROJECT:-}
+      # ── Multi-user mode (off by default) ─────────────────────────
+      - MULTI_USER_MODE=${MULTI_USER_MODE:-false}
+      - JWT_SECRET=${JWT_SECRET:-dev-secret-change-in-prod}
+      # Required when MULTI_USER_MODE=true:
+      - IDLE_TIMEOUT_MINUTES=${IDLE_TIMEOUT_MINUTES:-}
+      # Optional tuning:
+      - QGIS_IMAGE=${QGIS_IMAGE:-qgisremotemcp:latest}
+      - BASE_API_PORT=${BASE_API_PORT:-9000}
+      - BASE_STREAM_PORT=${BASE_STREAM_PORT:-9100}
+      - BASE_NOVNC_PORT=${BASE_NOVNC_PORT:-9200}
+      - MAX_CONTAINERS=${MAX_CONTAINERS:-50}
+      - DATA_DIR=${DATA_DIR:-/data}
     volumes:
       - ./data:/data
       # Dev: mount source for live editing (restart container to apply)
@@ -57,11 +75,14 @@ services:
       - ./skills:/app/skills:ro
       - ./templates:/app/templates:ro
       - ./recipes:/app/recipes:ro
+      # ── Multi-user: Docker socket (uncomment to enable) ───────────
+      # Required for MULTI_USER_MODE=true — lets the gateway spawn user containers.
+      # - /var/run/docker.sock:/var/run/docker.sock
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8100/health"]
       interval: 30s
       timeout: 10s
       retries: 3

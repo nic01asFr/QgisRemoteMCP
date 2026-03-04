@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "description": "Default data source catalog for QgisStreamMCP. All IGN sources are free (no API key since July 2021).",
+  "description": "Default data source catalog for QgisRemoteMCP. All IGN sources are free (no API key since July 2021).",
   "categories": ["basemap", "imagery", "topography", "administrative", "elevation", "environment", "api"],
   "sources": [
     {
@@ -353,6 +353,16 @@
       "description": "Enveloppes de crue extrême (période de retour ~1000 ans) — Directive Inondation TRI"
     },
     {
+      "id": "tri_hauteurs_eau_t10",
+      "name": "Hauteurs d'eau — Crue fréquente (T10)",
+      "category": "environment",
+      "type": "wfs",
+      "url": "https://georisques.gouv.fr/services/di_fxx_2020",
+      "params": {"typename": "ms:ISO_HT_01_01FOR_FXX", "srsname": "EPSG:4326", "version": "2.0.0"},
+      "native_crs": "EPSG:2154",
+      "description": "Classes de hauteur d'eau (ht_min/ht_max en m) pour la crue fréquente T10 — Directive Inondation TRI"
+    },
+    {
       "id": "tri_hauteurs_eau_t100",
       "name": "Hauteurs d'eau — Crue centennale (T100)",
       "category": "environment",
@@ -361,6 +371,16 @@
       "params": {"typename": "ms:ISO_HT_01_02MOY_FXX", "srsname": "EPSG:4326", "version": "2.0.0"},
       "native_crs": "EPSG:2154",
       "description": "Classes de hauteur d'eau (ht_min/ht_max en m) pour la crue centennale — Directive Inondation TRI"
+    },
+    {
+      "id": "tri_hauteurs_eau_t1000",
+      "name": "Hauteurs d'eau — Crue extrême (T1000)",
+      "category": "environment",
+      "type": "wfs",
+      "url": "https://georisques.gouv.fr/services/di_fxx_2020",
+      "params": {"typename": "ms:ISO_HT_01_04FAI_FXX", "srsname": "EPSG:4326", "version": "2.0.0"},
+      "native_crs": "EPSG:2154",
+      "description": "Classes de hauteur d'eau (ht_min/ht_max en m) pour la crue extrême T1000 — Directive Inondation TRI"
     },
     {
       "id": "tri_submersion_marine_t100",

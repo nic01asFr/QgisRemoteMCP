@@ -1,7 +1,7 @@
 {
   "id": "urbanisme_general",
   "name": "Analyse urbaine générale",
-  "description": "Vue d'ensemble urbaine : bâtiments, routes, espaces verts, hydrographie. Style par catégorie avec mise en page cartographique.",
+  "description": "Vue d'ensemble urbaine : bâtiments catégorisés par usage, routes par nature, espaces verts, hydrographie. Fond IGN pour contexte géographique complet. Produit PDF A3 et carte web interactive.",
   "tags": ["urbanisme", "vue d'ensemble", "bâtiments", "routes"],
   "parameters": {
     "zone": {
@@ -20,8 +20,8 @@
     {
       "id": "basemap",
       "tool": "smart_load",
-      "params": {"id": "cartodb_positron"},
-      "description": "Fond de carte clair"
+      "params": {"id": "ign_planign"},
+      "description": "Fond IGN Plan v2 — rues nommées, contexte géographique complet"
     },
     {
       "id": "buildings",
@@ -50,42 +50,52 @@
     {
       "id": "style_buildings",
       "tool": "execute_python",
-      "description": "Styliser les bâtiments (gris foncé, contour fin)",
-      "code": "from qgis.core import QgsFillSymbol, QgsSingleSymbolRenderer\nbat = [l for l in project.mapLayers().values() if 'atiment' in l.name()]\nif bat:\n    sym = QgsFillSymbol.createSimple({'color': '180,180,180,200', 'outline_color': '100,100,100', 'outline_width': '0.2'})\n    bat[0].setRenderer(QgsSingleSymbolRenderer(sym))\n    bat[0].triggerRepaint()\n    result['styled'] = 'buildings'\nresult['success'] = True"
+      "description": "Styliser les bâtiments par usage (résidentiel, commercial, industriel, équipements...)",
+      "code": "from qgis.core import QgsCategorizedSymbolRenderer, QgsRendererCategory, QgsFillSymbol\n\nbat = [l for l in project.mapLayers().values() if 'atiment' in l.name()]\nif not bat:\n    result['error'] = 'Building layer not found'\nelse:\n    layer = bat[0]\n    # Vérifier que le champ usage_1 existe\n    fields = [f.name() for f in layer.fields()]\n    field = 'usage_1' if 'usage_1' in fields else 'nature'\n\n    usage_colors = {\n        'Résidentiel':            ('220,180,130,220', '150,100,60',  '0.2'),\n        'Commercial et services': ('255,160,50,220',  '180,90,20',   '0.2'),\n        'Industriel':             ('150,160,180,220', '80,90,110',   '0.2'),\n        'Sportif':                ('100,200,230,210', '40,130,170',  '0.2'),\n        'Religieux':              ('210,170,210,215', '130,80,140',  '0.2'),\n        'Enseignement':           ('120,210,130,215', '50,140,70',   '0.2'),\n        'Soin':                   ('240,130,130,215', '170,50,50',   '0.2'),\n        'Agricole':               ('190,215,130,210', '110,150,65',  '0.2'),\n        'Indifférencié':          ('200,195,185,180', '120,115,105', '0.15'),\n    }\n    cats = []\n    for value, (fill, outline, width) in usage_colors.items():\n        sym = QgsFillSymbol.createSimple({'color': fill, 'outline_color': outline, 'outline_width': width})\n        cats.append(QgsRendererCategory(value, sym, value))\n    # Catchall\n    sym_other = QgsFillSymbol.createSimple({'color': '195,195,195,170', 'outline_color': '120,120,120', 'outline_width': '0.15'})\n    cats.append(QgsRendererCategory('', sym_other, 'Autre'))\n\n    renderer = QgsCategorizedSymbolRenderer(field, cats)\n    layer.setRenderer(renderer)\n    layer.triggerRepaint()\n    result['field'] = field\nresult['success'] = True"
     },
     {
       "id": "style_roads",
       "tool": "execute_python",
-      "description": "Styliser les routes (gris, largeur variable)",
-      "code": "from qgis.core import QgsLineSymbol, QgsSingleSymbolRenderer\nroutes = [l for l in project.mapLayers().values() if 'oute' in l.name() or 'Route' in l.name()]\nif routes:\n    sym = QgsLineSymbol.createSimple({'color': '80,80,80', 'width': '0.4'})\n    routes[0].setRenderer(QgsSingleSymbolRenderer(sym))\n    routes[0].triggerRepaint()\n    result['styled'] = 'roads'\nresult['success'] = True"
+      "description": "Styliser les routes par nature (autoroute → chemin, épaisseur variable)",
+      "code": "from qgis.core import QgsCategorizedSymbolRenderer, QgsRendererCategory, QgsLineSymbol\n\nroutes = [l for l in project.mapLayers().values() if 'oute' in l.name() or 'Route' in l.name()]\nif not routes:\n    result['error'] = 'Road layer not found'\nelse:\n    layer = routes[0]\n    road_styles = [\n        (['Autoroute'],                              '40,40,40,255',   '1.4'),\n        (['Quasi-autoroute'],                        '60,60,60,240',   '1.1'),\n        (['Bretelle'],                               '80,80,80,220',   '0.8'),\n        (['Route à 2 chaussées'],                    '90,90,90,210',   '0.75'),\n        (['Route à 1 chaussée'],                     '110,110,110,200','0.5'),\n        (['Chemin'],                                 '160,155,145,160','0.22'),\n        (['Sentier', 'Escalier', 'Piste cyclable'],  '170,165,155,130','0.15'),\n    ]\n    cats = []\n    for values, color, width in road_styles:\n        sym = QgsLineSymbol.createSimple({'color': color, 'width': width})\n        for v in values:\n            cats.append(QgsRendererCategory(v, sym.clone(), v))\n    sym_def = QgsLineSymbol.createSimple({'color': '130,130,130,190', 'width': '0.35'})\n    cats.append(QgsRendererCategory('', sym_def, 'Autre'))\n    renderer = QgsCategorizedSymbolRenderer('nature', cats)\n    layer.setRenderer(renderer)\n    layer.triggerRepaint()\nresult['success'] = True"
     },
     {
       "id": "style_vegetation",
       "tool": "execute_python",
       "description": "Styliser la végétation (vert semi-transparent)",
-      "code": "from qgis.core import QgsFillSymbol, QgsSingleSymbolRenderer\nveg = [l for l in project.mapLayers().values() if 'égétation' in l.name() or 'egetation' in l.name()]\nif veg:\n    sym = QgsFillSymbol.createSimple({'color': '100,180,80,140', 'outline_color': '60,120,40', 'outline_width': '0.2'})\n    veg[0].setRenderer(QgsSingleSymbolRenderer(sym))\n    veg[0].triggerRepaint()\n    result['styled'] = 'vegetation'\nresult['success'] = True"
+      "code": "from qgis.core import QgsFillSymbol, QgsSingleSymbolRenderer\nveg = [l for l in project.mapLayers().values() if 'gétation' in l.name() or 'egetation' in l.name() or 'Végétation' in l.name()]\nif veg:\n    sym = QgsFillSymbol.createSimple({'color': '105,185,85,150', 'outline_color': '60,130,45', 'outline_width': '0.15'})\n    veg[0].setRenderer(QgsSingleSymbolRenderer(sym))\n    veg[0].triggerRepaint()\nresult['success'] = True"
     },
     {
       "id": "style_hydro",
       "tool": "execute_python",
-      "description": "Styliser les cours d'eau (bleu)",
-      "code": "from qgis.core import QgsLineSymbol, QgsSingleSymbolRenderer\nhydro = [l for l in project.mapLayers().values() if 'eau' in l.name() or 'hydro' in l.name().lower()]\nif hydro:\n    sym = QgsLineSymbol.createSimple({'color': '65,105,225', 'width': '0.8'})\n    hydro[0].setRenderer(QgsSingleSymbolRenderer(sym))\n    hydro[0].triggerRepaint()\n    result['styled'] = 'hydro'\nresult['success'] = True"
+      "description": "Styliser les cours d'eau (bleu, épaisseur lisible)",
+      "code": "from qgis.core import QgsLineSymbol, QgsSingleSymbolRenderer\nhydro = [l for l in project.mapLayers().values() if 'eau' in l.name().lower() or 'hydro' in l.name().lower() or 'Hydrographie' in l.name()]\nif hydro:\n    sym = QgsLineSymbol.createSimple({'color': '50,100,220,220', 'width': '0.9'})\n    hydro[0].setRenderer(QgsSingleSymbolRenderer(sym))\n    hydro[0].triggerRepaint()\nresult['success'] = True"
     },
     {
       "id": "layout",
       "tool": "apply_layout_template",
       "params": {
         "template": "a3_landscape",
-        "variables": {"title": "Analyse urbaine — $zone", "subtitle": "Bâtiments, voirie, végétation, hydrographie — BD TOPO IGN"}
+        "variables": {"title": "Analyse urbaine — $zone", "subtitle": "Bâtiments par usage, voirie, végétation, hydrographie — BD TOPO IGN"}
       },
       "description": "Mise en page A3"
     },
     {
-      "id": "export",
+      "id": "export_pdf",
       "tool": "export_pdf",
       "params": {"layout": "Export A3 Landscape"},
       "description": "Export PDF"
+    },
+    {
+      "id": "export_web",
+      "tool": "export_web_map",
+      "params": {},
+      "description": "Exporter une carte web interactive Leaflet"
     }
   ],
-  "outputs": ["PDF A3 avec vue urbaine complète", "Couches stylisées : bâtiments, routes, végétation, hydrographie"]
+  "outputs": [
+    "PDF A3 avec vue urbaine complète (bâtiments catégorisés par usage)",
+    "Carte web interactive Leaflet",
+    "Couches stylisées : bâtiments/usage, routes/nature, végétation, hydrographie"
+  ]
 }

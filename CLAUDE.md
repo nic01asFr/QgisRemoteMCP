@@ -1,14 +1,18 @@
-# CLAUDE.md — QgisStreamMCP
+# CLAUDE.md — QgisRemoteMCP
 
 ## Project
 
-QgisStreamMCP exposes a full QGIS Desktop instance as an MCP Server.
+QgisRemoteMCP exposes a full QGIS Desktop instance as an MCP Server.
 Single Docker container with QGIS GUI + Xvfb + noVNC + MCP Server.
+
+Supports two modes:
+- **Single-user** (default, `MULTI_USER_MODE=false`) — one QGIS instance, no auth required
+- **Multi-user** (`MULTI_USER_MODE=true`) — one Docker container per authenticated user, isolated QGIS sessions
 
 ## Architecture
 
 ```
-Container (single)
+Container (single-user mode)
   supervisord
   ├── Xvfb :99 (virtual display)
   ├── fluxbox (window manager)
@@ -19,7 +23,10 @@ Container (single)
   └── stream_server.py (MJPEG :8081)
 ```
 
-Communication: MCP Server → UNIX socket → QGIS Bridge (runs inside QGIS)
+Communication (single-user): MCP Server → HTTP → `api_server.py:8080` → QGIS Bridge (UNIX socket)
+
+Multi-user gateway spawns per-user worker containers via Docker SDK.
+Each worker exposes the same REST API on dynamic ports (9000+/9100+/9200+).
 
 ## Key files
 
@@ -28,6 +35,8 @@ Communication: MCP Server → UNIX socket → QGIS Bridge (runs inside QGIS)
 - `src/qgis_helpers.py` — Python helpers injected into execute_python
 - `src/api_server.py` — FastAPI REST wrapper
 - `src/stream_server.py` — MJPEG stream
+- `src/auth.py` — API key + JWT authentication (multi-user mode)
+- `src/container_manager.py` — Docker-per-user container lifecycle (multi-user mode)
 - `skills/*.md` — MCP Resources (PyQGIS, Processing, cartography, smart loading, recipes, etc.)
 - `templates/*.qpt` — Print layout templates (A3 landscape, A4 portrait)
 - `templates/web/` — Leaflet HTML templates (standard, flood, temporal)
@@ -161,6 +170,28 @@ export_grist(document_name="my_project")
   - Camera/photo (photo via ExternalResource)
   - Free text (titre, description)
 
+## Multi-user mode
+
+Set `MULTI_USER_MODE=true` in `.env` to enable per-user isolated QGIS containers.
+
+```bash
+# .env
+MULTI_USER_MODE=true
+JWT_SECRET=your-secret-key
+IDLE_TIMEOUT_MINUTES=30
+BASE_API_PORT=9000
+```
+
+Authentication endpoints:
+- `POST /api/auth/register` — `{"email": "...", "password": "..."}` → `{"api_key": "qgis_...", "token": "..."}`
+- `POST /api/auth/login` — same
+- `GET  /api/session` — current user's container info (ports, status)
+- `GET  /api/sessions` — list all active sessions (admin)
+
+MCP calls with auth: `Authorization: Bearer qgis_xxxxx`
+
+Docker socket must be mounted (see `docker-compose.yml` comments).
+
 ## Build & Run
 
 ```bash
@@ -175,7 +206,7 @@ docker compose up -d --build
 
 Source files are mounted as volumes in dev. Edit locally, restart container:
 ```bash
-docker compose restart bigqgismcp
+docker compose restart qgisremotemcp
 ```
 
 QGIS bridge changes require full restart (loaded at QGIS startup).
