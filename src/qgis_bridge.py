@@ -1,5 +1,5 @@
 """
-QgisStreamMCP — QGIS Bridge
+QgisRemoteMCP — QGIS Bridge
 ═══════════════════════════════════════════════════════════════════
 
 This script runs INSIDE QGIS as a startup script. It:
@@ -24,7 +24,9 @@ import time
 import io
 import base64
 from pathlib import Path
-from urllib.parse import quote
+
+# Host-side API port for download URLs — injected by ContainerManager in multi-user mode
+_API_HOST_PORT = os.environ.get("API_HOST_PORT", "8080")
 
 # PyQGIS imports (available because we run inside QGIS)
 from qgis.core import (
@@ -154,7 +156,7 @@ class QGISBridge:
 
     def _build_context(self) -> dict:
         """Lightweight project state snapshot, appended to mutating action responses.
-        Lightweight project state snapshot appended to mutating action responses."""
+        Inspired by BigLocalApps' _mode_context() pattern."""
         from qgis.core import QgsExpressionContextUtils
         project = QgsProject.instance()
         scope = QgsExpressionContextUtils.projectScope(project)
@@ -204,7 +206,7 @@ class QGISBridge:
         if phase == "cartography":
             return "Apply a layout (apply_layout_template) then export (export_pdf, export_web_map)"
         if phase == "export":
-            return "Export done. Use list_files to see downloads, or export_grist to convert HTML maps to Grist documents"
+            return "Export: export_pdf, export_web_map, download_project, export_layer"
         return ""
 
     # ══════════════════════════════════════════════════════════════
@@ -412,7 +414,7 @@ class QGISBridge:
         project.clear()
         crs = params.get("crs", "EPSG:2154")  # Lambert 93 default (France)
         project.setCrs(QgsCoordinateReferenceSystem(crs))
-        title = params.get("title", "QgisStreamMCP Project")
+        title = params.get("title", "QgisRemoteMCP Project")
         project.setTitle(title)
         # Enable on-the-fly reprojection so layers in different CRS always display
         from qgis.core import QgsSettings
@@ -790,7 +792,7 @@ class QGISBridge:
                 if not img.isNull():
                     buf = QBuffer()
                     buf.open(QIODevice.WriteOnly)
-                    img.save(buf, "JPEG", 70)
+                    img.save(buf, "PNG", 85)
                     data = bytes(buf.data())
                     buf.close()
                     if len(data) > 100:
@@ -810,7 +812,7 @@ class QGISBridge:
                         pixmap = pixmap.scaled(width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                     buf = QBuffer()
                     buf.open(QIODevice.WriteOnly)
-                    pixmap.save(buf, "JPEG", 70)
+                    pixmap.save(buf, "PNG", 80)
                     data = bytes(buf.data())
                     buf.close()
                     if len(data) > 100:
@@ -831,15 +833,14 @@ class QGISBridge:
         if not data:
             import subprocess
             display = os.environ.get("DISPLAY", ":99")
-            path = f"/tmp/screenshot_{int(time.time())}.jpg"
+            path = f"/tmp/screenshot_{int(time.time())}.png"
             try:
-                # Capture full display (1920x1080) then scale to requested size as JPEG
+                # Capture full display (1920x1080) then scale to requested size
                 cmd = [
                     "ffmpeg", "-y", "-f", "x11grab",
                     "-video_size", "1920x1080",
                     "-i", display,
                     "-vf", f"scale={width}:{height}",
-                    "-q:v", "5",
                     "-frames:v", "1", "-update", "1", path
                 ]
                 subprocess.run(cmd, capture_output=True, timeout=10)
@@ -857,7 +858,7 @@ class QGISBridge:
 
         return {
             "image_base64": base64.b64encode(data).decode(),
-            "format": "jpeg",
+            "format": "png",
             "size": len(data),
         }
 
@@ -882,7 +883,7 @@ class QGISBridge:
 
         size = os.path.getsize(output_path)
         result_dict = {"success": True, "path": output_path, "size": size,
-                       "download_url": f"http://localhost:8080/api/files/{quote(Path(output_path).name)}"}
+                       "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{Path(output_path).name}"}
         if size <= MAX_INLINE_FILE:
             with open(output_path, "rb") as f:
                 result_dict["content_base64"] = base64.b64encode(f.read()).decode()
@@ -1404,7 +1405,7 @@ class QGISBridge:
         return {
             "success": True,
             "path": output_path,
-            "download_url": f"http://localhost:8080/api/files/{quote(fname)}",
+            "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{fname}",
             "size_bytes": size,
             "layers_exported": len(layer_data),
             "title": title,
@@ -1486,9 +1487,10 @@ class QGISBridge:
         # Max realistic water depth — values above this (e.g. 9999) are sentinel "unbounded"
         HT_MAX_CAP = 5.0
 
-        def to_geojson_features(layer, limit, extra_props_fn=None, fields_filter=None):
+        def to_geojson_features(layer, limit, extra_props_fn=None, fields_filter=None, simplify=None):
             """Export layer features as GeoJSON dicts in EPSG:4326.
-            fields_filter: optional set of field names to include (None = all)."""
+            fields_filter: optional set of field names to include (None = all).
+            simplify: if float > 0, simplify geometry to this tolerance (degrees EPSG:4326)."""
             tr = QgsCoordinateTransform(layer.crs(), crs_4326, project)
             features = []
             for i, feat in enumerate(layer.getFeatures()):
@@ -1498,6 +1500,10 @@ class QGISBridge:
                 if geom.isEmpty():
                     continue
                 geom.transform(tr)
+                if simplify and simplify > 0:
+                    simp = geom.simplify(simplify)
+                    if simp and not simp.isEmpty():
+                        geom = simp
                 props = {}
                 for field in layer.fields():
                     fname = field.name()
@@ -1572,7 +1578,7 @@ class QGISBridge:
                     max_height = ht_max
 
             flood_features.extend(to_geojson_features(
-                layer, max_features, add_flood_props, fields_filter=include_fields))
+                layer, max_features, add_flood_props, fields_filter=include_fields, simplify=0.00005))
 
         # If no ISO_HT but we have extent layers, create synthetic flood polygons
         if not flood_features and extent_only_layers:
@@ -1600,7 +1606,7 @@ class QGISBridge:
                     if _max > max_height:
                         max_height = _max
 
-                flood_features.extend(to_geojson_features(layer, max_features, add_synth_props))
+                flood_features.extend(to_geojson_features(layer, max_features, add_synth_props, simplify=0.00005))
 
         flood_geojson = {"type": "FeatureCollection", "features": flood_features}
 
@@ -1730,6 +1736,67 @@ class QGISBridge:
 
         sensitive_geojson = {"type": "FeatureCollection", "features": sensitive_features}
 
+        # ── Routing zones: per-scenario flood extents for Valhalla exclude_polygons ──
+        # Uses ALEA_SYNT binary extent layers (simpler than ISO_HT depth classes).
+        # Simplified geometries (~11m tolerance) reduce JSON payload.
+        routing_zones = {}
+
+        def _detect_flood_scenario(name_lower):
+            """Map layer name to flood scenario key (t10 / t100 / t1000)."""
+            # Check most specific first to avoid substring collision (t10 ⊂ t100 ⊂ t1000)
+            if 't1000' in name_lower or 'treme' in name_lower or '01_04' in name_lower:
+                return 't1000'
+            if 't100' in name_lower or 'centennale' in name_lower or '01_02' in name_lower:
+                return 't100'
+            if 't10' in name_lower or 'quente' in name_lower or '01_01' in name_lower:
+                return 't10'
+            return None
+
+        for layer in (extent_only_layers if extent_only_layers else iso_ht_layers):
+            sc = _detect_flood_scenario(layer.name().lower())
+            if sc is None or sc in routing_zones:
+                continue
+            tr_sc = QgsCoordinateTransform(layer.crs(), crs_4326, project)
+            sc_features = []
+            for feat in layer.getFeatures():
+                geom = feat.geometry()
+                if geom.isEmpty():
+                    continue
+                geom_copy = QgsGeometry(geom)
+                geom_copy.transform(tr_sc)
+                simple = geom_copy.simplify(0.0001)  # ~11m at equator
+                target_geom = simple if (simple and not simple.isEmpty()) else geom_copy
+                sc_features.append({
+                    "type": "Feature",
+                    "geometry": json.loads(target_geom.asJson()),
+                    "properties": {}
+                })
+            if sc_features:
+                routing_zones[sc] = {"type": "FeatureCollection", "features": sc_features}
+
+        # ── Find and export routes with scenario depth fields ──
+        route_layers = find_layers('route', 'troncon')
+        route_layer_export = route_layers[0] if route_layers else None
+        routes_geojson = {"type": "FeatureCollection", "features": []}
+
+        if route_layer_export:
+            route_field_names = {f.name() for f in route_layer_export.fields()}
+            # Always export: ht_num fields (all scenarios) + basic road attributes
+            route_include = {fn for fn in route_field_names
+                             if fn in ('ht_num', 'nature', 'importance', 'sens_de_circulation')
+                             or fn.startswith('ht_num_')}
+            route_features = to_geojson_features(
+                route_layer_export, max_features,
+                fields_filter=route_include if route_include else None)
+            routes_geojson = {"type": "FeatureCollection", "features": route_features}
+
+        # ── Detect available scenarios from building layer fields ──
+        bld_field_names_lower = [f.name().lower() for f in building_layer.fields()]
+        available_scenarios = [sc for sc in ('t10', 't100', 't1000')
+                               if f'{sc}_ht_max' in bld_field_names_lower]
+        if not available_scenarios:
+            available_scenarios = ['t100']
+
         # ── Canvas center for map view ──
         canvas = self.iface.mapCanvas() if self.iface else None
         center = [0, 0]
@@ -1760,8 +1827,11 @@ class QGISBridge:
         html = html.replace("{{FLOOD_JSON}}", json.dumps(flood_geojson, default=str))
         html = html.replace("{{BUILDINGS_JSON}}", json.dumps(buildings_geojson, default=str))
         html = html.replace("{{SENSITIVE_JSON}}", json.dumps(sensitive_geojson, default=str))
+        html = html.replace("{{ROUTES_JSON}}", json.dumps(routes_geojson, default=str))
+        html = html.replace("{{SCENARIOS}}", json.dumps(available_scenarios))
         html = html.replace("{{MAX_HEIGHT}}", str(round(max_height, 1)))
         html = html.replace("{{ZONE_NAME}}", zone_name)
+        html = html.replace("{{ROUTING_ZONES_JSON}}", json.dumps(routing_zones, default=str))
 
         # Write output
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -1783,15 +1853,17 @@ class QGISBridge:
         return {
             "success": True,
             "path": output_path,
-            "download_url": f"http://localhost:8080/api/files/{quote(fname)}",
+            "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{fname}",
             "size_bytes": size,
             "title": title,
             "zone": zone_name,
+            "scenarios": available_scenarios,
             "max_water_height_m": round(max_height, 1),
             "flood_polygons": len(flood_features),
             "buildings": len(building_features),
             "buildings_exposed": exposed_buildings,
             "buildings_pct": round(exposed_buildings / max(len(building_features), 1) * 100, 1),
+            "routes": len(routes_geojson["features"]),
             "sensitive_facilities": len(sensitive_features),
             "sensitive_exposed": exposed_sensitive,
         }
@@ -1986,7 +2058,7 @@ class QGISBridge:
         return {
             "success": True,
             "path": output_path,
-            "download_url": f"http://localhost:8080/api/files/{quote(fname)}",
+            "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{fname}",
             "size": size,
             "title": title,
             "zone": zone_name,
@@ -2077,7 +2149,7 @@ class QGISBridge:
         }
         if size > MAX_INLINE_FILE:
             result["too_large_for_inline"] = True
-            result["download_url"] = f"http://localhost:8080/api/files/{quote(fpath.name)}"
+            result["download_url"] = f"http://localhost:{_API_HOST_PORT}/api/files/{fpath.name}"
         else:
             result["content_base64"] = base64.b64encode(fpath.read_bytes()).decode()
         return result
@@ -2134,7 +2206,7 @@ class QGISBridge:
         return {
             "success": True, "path": output_path, "name": name,
             "format": fmt, "size": size,
-            "download_url": f"http://localhost:8080/api/files/{quote(name)}",
+            "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{name}",
         }
 
     def _action_download_project(self, params: dict) -> dict:
@@ -2154,7 +2226,7 @@ class QGISBridge:
         size = os.path.getsize(output_path)
         return {
             "success": True, "path": output_path, "name": name, "size": size,
-            "download_url": f"http://localhost:8080/api/files/{quote(name)}",
+            "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{name}",
         }
 
     # ── QField Export ────────────────────────────────────────────
@@ -2363,7 +2435,7 @@ class QGISBridge:
         return {
             "success": True,
             "path": zip_path,
-            "download_url": f"http://localhost:8080/api/files/{quote(zip_name)}",
+            "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{zip_name}",
             "size_bytes": zip_size,
             "size_mb": round(zip_size / 1024 / 1024, 1),
             "project_name": project_name,
@@ -2371,122 +2443,6 @@ class QGISBridge:
             "total_features": total_features,
             "has_observations_layer": include_obs,
             "layers": {lid: info["original_name"] for lid, info in exported_layers.items()},
-        }
-
-    # ── Package Project (portable GPKG) ──────────────────────────
-
-    def _action_package_project(self, params: dict) -> dict:
-        """Export project as a single self-contained GPKG file.
-
-        All vector layers are packaged into one GPKG (with styles embedded in
-        layer_styles table). The full project XML — including XYZ/WMS basemaps —
-        is injected into the qgis_projects table via SQLite.
-
-        Open in QGIS: Projet > Ouvrir depuis > GeoPackage
-        """
-        import sqlite3
-        import tempfile
-        import re as _re
-
-        project = QgsProject.instance()
-        name = params.get("name", project.baseName() or "project")
-        name = _re.sub(r"[^\w\-]", "_", name).strip("_") or "project"
-
-        gpkg_name = f"{name}_portable.gpkg"
-        gpkg_path = f"/data/{gpkg_name}"
-
-        # ── 1. Collect valid vector layers ───────────────────────────
-        vector_layers = [
-            lyr for lyr in project.mapLayers().values()
-            if isinstance(lyr, QgsVectorLayer) and lyr.isValid()
-        ]
-        if not vector_layers:
-            return {"error": "No valid vector layers to package"}
-
-        # ── 2. Package all layers into GPKG (with styles) ────────────
-        try:
-            result = processing.run("native:package", {
-                "LAYERS": vector_layers,
-                "OUTPUT": gpkg_path,
-                "OVERWRITE": True,
-                "SAVE_STYLES": True,
-                "EXPORT_RELATED_LAYERS": False,
-            })
-        except Exception as e:
-            return {"error": f"native:package failed: {e}"}
-
-        output_sources = result.get("OUTPUT_LAYERS", [])
-
-        # ── 3. Temporarily rewrite sources to relative GPKG paths ────
-        original_sources = {}
-        for i, layer in enumerate(vector_layers):
-            original_sources[layer.id()] = (layer.source(), layer.providerType())
-            if i < len(output_sources):
-                # e.g. /data/name_portable.gpkg|layername=Batiments
-                rel_src = output_sources[i].replace(gpkg_path, f"./{gpkg_name}")
-                layer.setDataSource(rel_src, layer.name(), "ogr")
-
-        # ── 4. Save full project to temp .qgs (XYZ/WMS preserved) ────
-        with tempfile.NamedTemporaryFile(suffix=".qgs", delete=False) as tf:
-            qgs_path = tf.name
-        ok = project.write(qgs_path)
-
-        # Restore original sources immediately
-        for lid, (src, prov) in original_sources.items():
-            lyr = project.mapLayer(lid)
-            if lyr:
-                lyr.setDataSource(src, lyr.name(), prov)
-
-        if not ok:
-            try:
-                os.unlink(qgs_path)
-            except Exception:
-                pass
-            return {"error": "Failed to write temporary project file"}
-
-        # ── 5. Inject project XML into GPKG via SQLite ───────────────
-        with open(qgs_path, "r", encoding="utf-8") as f:
-            xml_content = f.read()
-        try:
-            os.unlink(qgs_path)
-        except Exception:
-            pass
-
-        try:
-            conn = sqlite3.connect(gpkg_path)
-            cur = conn.cursor()
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS qgis_projects (
-                    name     TEXT PRIMARY KEY,
-                    metadata TEXT NOT NULL DEFAULT '',
-                    content  TEXT NOT NULL DEFAULT ''
-                )
-            """)
-            cur.execute(
-                "INSERT OR REPLACE INTO qgis_projects (name, metadata, content) VALUES (?, '', ?)",
-                (name, xml_content),
-            )
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            return {"error": f"Failed to inject project XML into GPKG: {e}"}
-
-        # ── 6. Return ─────────────────────────────────────────────────
-        size = os.path.getsize(gpkg_path)
-        layer_names = [lyr.name() for lyr in vector_layers]
-
-        return {
-            "success": True,
-            "path": gpkg_path,
-            "name": gpkg_name,
-            "download_url": f"http://127.0.0.1:8080/api/files/{quote(gpkg_name)}",
-            "size_bytes": size,
-            "size_mb": round(size / 1024 / 1024, 2),
-            "layers_packaged": len(vector_layers),
-            "layer_names": layer_names,
-            "includes_basemap_definition": True,
-            "open_in_qgis": "Projet > Ouvrir depuis > GeoPackage",
-            "note": "XYZ/WMS basemaps are referenced by URL (auto-reconnect on open with internet)",
         }
 
     # ── Grist Export ─────────────────────────────────────────────
@@ -2627,11 +2583,18 @@ class QGISBridge:
 
         def get_feature_color(renderer, feat, ctx):
             """Get the renderer color for a single feature.
-            Uses Python-level renderer inspection (safe). Avoids symbolsForFeature()
-            which can SIGSEGV on certain renderers."""
+            Falls back to computing from ranges/categories if symbolsForFeature fails."""
             if not renderer:
                 return None
             rtype = renderer.type()
+            try:
+                # Try symbolsForFeature first (works with full render context)
+                symbols = renderer.symbolsForFeature(feat, ctx)
+                if symbols:
+                    return symbols[0].color().name()
+            except Exception:
+                pass
+            # Fallback: compute from renderer definition directly
             try:
                 if rtype == 'graduatedSymbol':
                     field = renderer.classAttribute()
@@ -2652,35 +2615,6 @@ class QGISBridge:
                             return cat.symbol().color().name()
                 elif rtype == 'singleSymbol':
                     return renderer.symbol().color().name()
-            except Exception:
-                pass
-            return None
-
-        from datetime import datetime as _dt, date as _date
-        _EPOCH = _dt(1970, 1, 1)
-        _EPOCH_DATE = _EPOCH.date()
-
-        def _to_epoch(val, gtype):
-            """Convert a date/datetime value to Grist epoch number.
-            Grist Date = days since 1970-01-01 (float).
-            Grist DateTime = seconds since 1970-01-01T00:00:00 UTC (float)."""
-            try:
-                if isinstance(val, _dt):
-                    if gtype == 'Date':
-                        return float((val.date() - _EPOCH_DATE).days)
-                    return val.timestamp()
-                if isinstance(val, _date):
-                    return float((val - _EPOCH_DATE).days)
-                if isinstance(val, str) and val:
-                    # Parse ISO string
-                    if 'T' in val:
-                        dt = _dt.fromisoformat(val.replace('Z', '+00:00'))
-                        if gtype == 'Date':
-                            return float((dt.date() - _EPOCH_DATE).days)
-                        return dt.timestamp()
-                    else:
-                        d = _date.fromisoformat(val[:10])
-                        return float((d - _EPOCH_DATE).days)
             except Exception:
                 pass
             return None
@@ -2706,15 +2640,15 @@ class QGISBridge:
                     return None
                 if hasattr(val, 'toPyDateTime'):
                     val = val.toPyDateTime()
-                elif hasattr(val, 'toPyDate'):
+                    return val.isoformat() if val else None
+                if hasattr(val, 'toPyDate'):
                     val = val.toPyDate()
-                elif hasattr(val, 'toString'):
+                    return val.isoformat() if val else None
+                if hasattr(val, 'toString'):
                     fmt = 'yyyy-MM-dd HH:mm:ss' if type_name == 'QDateTime' else 'yyyy-MM-dd' if type_name == 'QDate' else 'HH:mm:ss'
-                    val = val.toString(fmt) or None
-                else:
-                    return None
-                if val is None:
-                    return None
+                    s = val.toString(fmt)
+                    return s if s else None
+                return None
             # Reject any remaining PyQt types
             mod = getattr(type(val), '__module__', '') or ''
             if 'PyQt' in mod or 'sip' in mod:
@@ -2722,9 +2656,7 @@ class QGISBridge:
             if isinstance(val, str) and val == 'NULL':
                 return None
             try:
-                if gtype == 'Date' or gtype.startswith('DateTime:'):
-                    return _to_epoch(val, gtype)
-                elif gtype == 'Int':
+                if gtype == 'Int':
                     return int(val)
                 elif gtype == 'Numeric':
                     return float(val)
@@ -2957,7 +2889,7 @@ class QGISBridge:
                             {'col_id': 'max_val', 'grist_type': 'Numeric', 'label': 'Max', 'widget_options': '', 'original_name': ''},
                         ],
                         'records': stats_records, 'is_point': False, 'is_polygon': False,
-                        'source_layer': '(computed)', 'has_lat_lon': False, 'geom_type': 'none',
+                        'source_layer': '(computed)', 'has_lat_lon': False,
                     }
                     layer_specs.append(stats_spec)
 
@@ -3145,16 +3077,14 @@ class QGISBridge:
                     role = 'form'
                 tables_meta[spec['table_name']] = {
                     'role': role,
-                    'geomType': spec.get('geom_type', 'none'),
+                    'geomType': spec['geom_type'],
                 }
 
             renderer_info = {}
             for spec in layer_specs:
-                layer_obj = spec.get('layer_obj')
-                if layer_obj:
-                    ri = extract_renderer_info(layer_obj)
-                    if ri:
-                        renderer_info[spec['table_name']] = ri
+                ri = extract_renderer_info(spec['layer_obj'])
+                if ri:
+                    renderer_info[spec['table_name']] = ri
 
             # Canvas center/zoom
             canvas = self.iface.mapCanvas() if self.iface else None
@@ -3440,7 +3370,7 @@ class QGISBridge:
         return {
             "success": True,
             "path": grist_path,
-            "download_url": f"http://localhost:8080/api/files/{quote(fname)}",
+            "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{fname}",
             "size_bytes": size,
             "size_mb": round(size / 1024 / 1024, 1),
             "document_name": doc_name,
@@ -3862,7 +3792,7 @@ class QGISBridge:
         return {
             "success": True,
             "path": grist_path,
-            "download_url": f"http://localhost:8080/api/files/{quote(fname)}",
+            "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{fname}",
             "size_bytes": size,
             "size_mb": round(size / 1024 / 1024, 1),
             "document_name": doc_name,
@@ -4676,7 +4606,7 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
 
     @staticmethod
     def _grist_create_meta_tables(c):
-        """Create required Grist meta-tables (schema version 46)."""
+        """Create all 26 required Grist meta-tables (schema version 46)."""
         c.execute("""CREATE TABLE _grist_DocInfo (
             id INTEGER PRIMARY KEY, docId TEXT, peers TEXT, basketId TEXT,
             schemaVersion INTEGER, timezone TEXT, documentSettings TEXT)""")
@@ -4951,7 +4881,7 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
         if src_type == "wfs":
             bbox = params.get("bbox")
             native_crs = source.get("native_crs", "EPSG:2154")
-            max_features = params.get("max_features", 10000)
+            max_features = params.get("max_features", None)  # None = unlimited (bbox is the real filter)
             result = qgis_helpers.download_wfs_ogr(
                 url=source["url"],
                 typename=source["params"]["typename"],
@@ -5342,7 +5272,7 @@ def _open_startup_project():
         # Create a fresh default project
         project.clear()
         project.setCrs(QgsCoordinateReferenceSystem("EPSG:2154"))
-        project.setTitle("QgisStreamMCP Project")
+        project.setTitle("QgisRemoteMCP Project")
 
         # Enable OTF reprojection
         from qgis.core import QgsSettings

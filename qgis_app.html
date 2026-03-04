@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>QGIS Desktop — QgisStreamMCP</title>
+<title>QGIS Desktop — QgisRemoteMCP</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1e1e2e; color: #cdd6f4; overflow-x: hidden; }
@@ -17,6 +17,8 @@
   .toolbar button { padding: 4px 12px; font-size: 11px; border: 1px solid #313244; background: #1e1e2e; color: #cdd6f4; border-radius: 6px; cursor: pointer; transition: all 0.15s; }
   .toolbar button:hover { background: #313244; border-color: #45475a; }
   .toolbar button.active { background: #cba6f7; color: #1e1e2e; border-color: #cba6f7; }
+  .toolbar button.vnc-btn { background: #1e3a2e; color: #a6e3a1; border-color: #a6e3a1; font-weight: 600; }
+  .toolbar button.vnc-btn:hover { background: #a6e3a1; color: #1e1e2e; border-color: #a6e3a1; }
   .toolbar .sep { width: 1px; height: 20px; background: #313244; margin: 0 4px; }
   .toolbar .spacer { flex: 1; }
 
@@ -86,12 +88,6 @@
   .file-actions button:hover { background: #45475a; }
   .file-actions button.dl:hover { color: #a6e3a1; }
   .file-actions button.del:hover { color: #f38ba8; }
-  .toolbar a { padding: 4px 12px; font-size: 11px; border: 1px solid #313244; background: #1e1e2e; color: #cdd6f4; border-radius: 6px; cursor: pointer; transition: all 0.15s; text-decoration: none; display: inline-flex; align-items: center; }
-  .toolbar a:hover { background: #313244; border-color: #45475a; }
-  .file-actions a { background: none; border: none; cursor: pointer; padding: 2px 4px; font-size: 12px; border-radius: 3px; color: #a6adc8; transition: all 0.1s; text-decoration: none; }
-  .file-actions a:hover { background: #45475a; }
-  .file-actions a.dl:hover { color: #a6e3a1; }
-  a.file-name { text-decoration: none; }
 
   .file-empty { color: #585b70; padding: 12px 8px; text-align: center; font-size: 11px; }
 
@@ -114,7 +110,7 @@
     <button onclick="doUpload()" id="btnUpload">Upload File</button>
     <button onclick="toggleFiles()" id="btnFiles">Files</button>
     <div class="spacer"></div>
-    <button onclick="openVncPopout()" id="btnPopout" title="Copy noVNC URL to clipboard">Pop-out &#x2197;</button>
+    <button onclick="openVncPopout()" id="btnPopout" class="vnc-btn" title="Open QGIS full-screen in browser via noVNC">&#x1F5D4; Open in Browser</button>
   </div>
 
   <input type="file" id="fileInput" style="display:none" multiple
@@ -137,10 +133,10 @@
 
 <script>
 // ── Config ───────────────────────────────────────────────────
-const VNC_URL    = 'http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000';
-const FRAME_URL  = 'http://127.0.0.1:8081/frame';
-const INPUT_URL  = 'http://127.0.0.1:8080/api/input';
-const API_BASE   = 'http://127.0.0.1:8080';
+const VNC_URL    = 'http://localhost:__NOVNC_PORT__/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000';
+const FRAME_URL  = 'http://localhost:__STREAM_PORT__/frame';
+const INPUT_URL  = 'http://localhost:__API_PORT__/api/input';
+const API_BASE   = 'http://localhost:__API_PORT__';
 const DISPLAY_W  = 1920;
 const DISPLAY_H  = 1080;
 
@@ -165,28 +161,16 @@ const FILE_ICONS = {
   generic: '\u{1F4CE}',  // paperclip
 };
 
-const QGIS_VECTOR_EXTS = ['.gpkg','.geojson','.shp','.gml','.kml','.kmz','.gdb','.csv','.geojsonl'];
-const QGIS_RASTER_EXTS = ['.tif','.tiff','.ecw','.jp2','.img','.asc','.dem'];
-const QGIS_PROJECT_EXTS = ['.qgz','.qgs'];
-
 function fileIcon(name) {
   const ext = (name.match(/\.[^.]+$/) || [''])[0].toLowerCase();
-  if (QGIS_VECTOR_EXTS.includes(ext)) return FILE_ICONS.vector;
-  if (QGIS_RASTER_EXTS.includes(ext)) return FILE_ICONS.raster;
-  if (QGIS_PROJECT_EXTS.includes(ext)) return FILE_ICONS.project;
-  if (['.json','.jsonl','.xlsx','.xls','.ods','.dbf'].includes(ext)) return FILE_ICONS.table;
+  if (['.gpkg','.geojson','.shp','.gml','.kml','.kmz','.gdb'].includes(ext)) return FILE_ICONS.vector;
+  if (['.tif','.tiff','.ecw','.jp2','.img','.asc','.dem'].includes(ext)) return FILE_ICONS.raster;
+  if (['.qgz','.qgs'].includes(ext)) return FILE_ICONS.project;
+  if (['.csv','.json','.jsonl','.xlsx','.xls','.ods','.dbf'].includes(ext)) return FILE_ICONS.table;
   if (['.pdf','.txt','.md','.html'].includes(ext)) return FILE_ICONS.doc;
   if (['.qml','.sld'].includes(ext)) return FILE_ICONS.style;
   if (['.zip','.tar','.gz','.7z'].includes(ext)) return FILE_ICONS.archive;
   return FILE_ICONS.generic;
-}
-
-function getQgisFileType(name) {
-  const ext = (name.match(/\.[^.]+$/) || [''])[0].toLowerCase();
-  if (QGIS_PROJECT_EXTS.includes(ext)) return 'project';
-  if (QGIS_RASTER_EXTS.includes(ext)) return 'raster';
-  if (QGIS_VECTOR_EXTS.includes(ext)) return 'vector';
-  return null;
 }
 
 // ── MCP Apps Protocol ────────────────────────────────────────
@@ -198,7 +182,7 @@ function initMcpApp() {
         method: 'ui/initialize',
         params: {
             protocolVersion: '2026-01-26',
-            appInfo: { name: 'QgisStreamMCP', version: '1.0.0' },
+            appInfo: { name: 'QgisRemoteMCP', version: '1.0.0' },
             appCapabilities: { tools: { listChanged: false }, availableDisplayModes: ['inline'] }
         }
     }, '*');
@@ -275,7 +259,7 @@ async function fetchFrame() {
 
 async function fetchFrameViaBridge() {
     try {
-        const result = await callTool('get_screenshot', { width: 960, height: 540 });
+        const result = await callTool('get_screenshot', { width: 1280, height: 720 });
         const img = result?.content?.find(c => c.type === 'image');
         if (img) {
             const el = document.getElementById('liveImg');
@@ -302,18 +286,15 @@ function startLive() {
         if (!useFetchFrames) {
             ok = await fetchFrameViaBridge();
         }
-        // Sequential polling — wait for frame before scheduling next
-        if (currentMode === 'live') {
-            liveTimer = setTimeout(poll, useFetchFrames ? 500 : 2000);
-        }
     }
     poll();
+    liveTimer = setInterval(poll, useFetchFrames ? 500 : 2000);
     setInfo('Click, scroll, and type directly on the QGIS desktop above');
     updateContext('User is interacting with QGIS desktop.');
 }
 
 function stopLive() {
-    if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; }
+    if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
     if (lastBlobUrl) { URL.revokeObjectURL(lastBlobUrl); lastBlobUrl = null; }
 }
 
@@ -339,65 +320,19 @@ function getDisplayCoords(e) {
     };
 }
 
-// ── Input: try REST fetch, fallback to MCP tools ─────────────
-let useCallToolInput = false;
-
 function sendInput(data) {
-    if (useCallToolInput) {
-        sendInputViaBridge(data);
-        return;
-    }
     fetch(INPUT_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data)
-    }).catch(() => {
-        useCallToolInput = true;
-        sendInputViaBridge(data);
-    });
+    }).catch(() => {});
 }
-
-function sendInputViaBridge(data) {
-    const t = data.type;
-    const btn = data.button === 3 ? 'right' : (data.button === 2 ? 'middle' : 'left');
-    if (t === 'mousedown') {
-        // Store for drag — actual click sent on mouseup
-        return;
-    }
-    if (t === 'mouseup') {
-        if (_dragStart && (Math.abs(data.x - _dragStart.x) > 5 || Math.abs(data.y - _dragStart.y) > 5)) {
-            callTool('mouse_drag', { start_x: _dragStart.x, start_y: _dragStart.y, end_x: data.x, end_y: data.y, button: btn }).catch(() => {});
-        } else {
-            callTool('mouse_click', { x: data.x, y: data.y, button: btn }).catch(() => {});
-        }
-        _dragStart = null;
-        return;
-    }
-    if (t === 'mousemove') return; // Can't do real-time moves via MCP
-    if (t === 'dblclick') {
-        callTool('mouse_click', { x: data.x, y: data.y, button: btn, double_click: true }).catch(() => {});
-        return;
-    }
-    if (t === 'scroll') {
-        callTool('mouse_scroll', { x: data.x, y: data.y, direction: data.direction, clicks: data.clicks || 3 }).catch(() => {});
-        return;
-    }
-    if (t === 'key') {
-        callTool('key_press', { key: data.key }).catch(() => {});
-        return;
-    }
-    if (t === 'type') {
-        callTool('key_press', { text: data.text }).catch(() => {});
-        return;
-    }
-}
-
-let _dragStart = null;
 
 function setupInteraction() {
     const wrapper = document.getElementById('canvasWrapper');
     let isMouseDown = false;
     let lastMoveTime = 0;
+    let dragStartCoords = null;
 
     // ── Mouse ────────────────────────────────────────────────
     wrapper.addEventListener('mousedown', (e) => {
@@ -407,7 +342,7 @@ function setupInteraction() {
         e.preventDefault();
         wrapper.focus();
         isMouseDown = true;
-        _dragStart = coords;
+        dragStartCoords = coords;
         sendInput({ type: 'mousedown', ...coords, button: e.button + 1 });
     });
 
@@ -418,13 +353,14 @@ function setupInteraction() {
         e.preventDefault();
         isMouseDown = false;
         sendInput({ type: 'mouseup', ...coords, button: e.button + 1 });
+        dragStartCoords = null;
         refreshAfterInput(150);
     });
 
     wrapper.addEventListener('mousemove', (e) => {
         if (!isMouseDown || currentMode !== 'live') return;
         const now = Date.now();
-        if (now - lastMoveTime < 50) return;
+        if (now - lastMoveTime < 50) return;  // throttle to ~20/sec
         lastMoveTime = now;
         const coords = getDisplayCoords(e);
         if (!coords) return;
@@ -467,9 +403,13 @@ function setupInteraction() {
 
     wrapper.addEventListener('keydown', (e) => {
         if (currentMode !== 'live') return;
+
+        // Let browser handle some shortcuts
         if (e.key === 'F5' || (e.ctrlKey && e.key === 'r')) return;
+
         e.preventDefault();
 
+        // Build xdotool key string
         let mods = [];
         if (e.ctrlKey) mods.push('ctrl');
         if (e.altKey) mods.push('alt');
@@ -478,11 +418,13 @@ function setupInteraction() {
         let key = KEY_MAP[e.key] || null;
 
         if (!key) {
+            // Single printable character without modifiers -> type it
             if (e.key.length === 1 && !e.ctrlKey && !e.altKey) {
                 sendInput({ type: 'type', text: e.key });
                 refreshAfterInput(150);
                 return;
             }
+            // With modifiers, use the key value
             key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
         }
 
@@ -493,20 +435,6 @@ function setupInteraction() {
 
     // Auto-focus on click
     wrapper.addEventListener('click', () => wrapper.focus());
-}
-
-// ── Pop-out VNC ──────────────────────────────────────────────
-function openVncPopout() {
-    const url = VNC_URL;
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(url).then(() => {
-            setInfo('URL copied! Paste in browser: ' + url);
-        }).catch(() => {
-            setInfo('Open in browser: ' + url);
-        });
-    } else {
-        setInfo('Open in browser: ' + url);
-    }
 }
 
 // ── Drag-and-drop upload ─────────────────────────────────────
@@ -545,6 +473,12 @@ function setupDragDrop() {
         if (files.length === 0) return;
         await uploadFiles(files);
     });
+}
+
+// ── Pop-out VNC ──────────────────────────────────────────────
+function openVncPopout() {
+    window.open(VNC_URL, '_blank');
+    setInfo('Opening noVNC in a new tab');
 }
 
 // ── Screenshot ──────────────────────────────────────────────
@@ -599,10 +533,16 @@ async function uploadFiles(files) {
     for (const file of files) {
         setInfo('Uploading ' + file.name + (total > 1 ? ' (' + (uploaded + 1) + '/' + total + ')' : '') + '...');
         try {
-            const formData = new FormData();
-            formData.append('file', file, file.name);
-            const resp = await fetch(API_BASE + '/api/upload', { method: 'POST', body: formData });
-            const info = await resp.json();
+            const reader = new FileReader();
+            const b64 = await new Promise((resolve, reject) => {
+                reader.onload = () => resolve(reader.result.split(',')[1]);
+                reader.onerror = reject;
+                reader.readAsDataURL(file);
+            });
+            const result = await callTool('upload_file', { name: file.name, content_base64: b64 });
+            const txt = result?.content?.find(c => c.type === 'text');
+            let info = {};
+            if (txt) { try { info = JSON.parse(txt.text); } catch {} }
             if (info.success) {
                 uploaded++;
                 updateContext('File uploaded: ' + file.name);
@@ -640,119 +580,72 @@ async function doListFiles() {
     setInfo('Loading files...');
     try {
         const result = await callTool('list_files', {});
-        let files = [];
-        if (result?.content) {
-            for (const c of result.content) {
-                if (c.type === 'text') {
-                    try { const p = JSON.parse(c.text); if (p.files) { files = p.files; break; } } catch (_) {}
-                }
-            }
-        }
+        const txt = result?.content?.find(c => c.type === 'text');
+        if (!txt) return;
+        let data; try { data = JSON.parse(txt.text); } catch { data = { files: [] }; }
 
         const panel = document.getElementById('filePanel');
         const list = document.getElementById('fileList');
         const countEl = document.getElementById('fileCount');
 
-        countEl.textContent = '(' + files.length + ')';
+        countEl.textContent = '(' + data.count + ')';
 
-        if (files.length === 0) {
+        if (data.files.length === 0) {
             list.innerHTML = '<div class="file-empty">No files — upload or export to get started</div>';
         } else {
-            list.innerHTML = files.map(f => renderFileItem(f, true)).join('');
+            list.innerHTML = data.files.map(f => renderFileItem(f, true)).join('');
         }
 
         panel.classList.add('visible');
         filePanelOpen = true;
-        setInfo(files.length + ' file(s)');
-    } catch (e) { setInfo('Failed to list files: ' + e.message); }
+        setInfo(data.count + ' file(s)');
+    } catch (e) { setInfo('Failed: ' + e.message); }
 }
 
 function renderFileItem(f, canDelete) {
     const icon = fileIcon(f.name);
+    const dlUrl = API_BASE + '/api/files/' + encodeURIComponent(f.name);
     const modDate = f.modified ? new Date(f.modified * 1000).toLocaleDateString() : '';
-    const safeName = esc(f.name).replace(/'/g, "\\'");
-    const qtype = getQgisFileType(f.name);
-    const clickFn = qtype ? 'doLoadFile' : 'doCopyFileUrl';
-    const nameTitle = qtype ? 'Click to load into QGIS' : 'Click to copy download URL';
     const deleteBtn = canDelete
-        ? '<button class="del" onclick="doDeleteFile(\'' + safeName + '\')" title="Delete">\u2716</button>'
+        ? '<button class="del" onclick="doDeleteFile(\'' + esc(f.path).replace(/'/g, "\\'") + '\',\'' + esc(f.name).replace(/'/g, "\\'") + '\')" title="Delete">\u2716</button>'
         : '';
     return '<div class="file-item">' +
         '<span class="file-icon">' + icon + '</span>' +
-        '<span class="file-name" onclick="' + clickFn + '(\'' + safeName + '\')" title="' + nameTitle + '">' + esc(f.name) + '</span>' +
+        '<span class="file-name" onclick="doDownloadFile(\'' + esc(f.name).replace(/'/g, "\\'") + '\')" title="' + esc(f.path) + '">' + esc(f.name) + '</span>' +
         '<span class="file-meta">' + formatSize(f.size) + (modDate ? ' &middot; ' + modDate : '') + '</span>' +
         '<span class="file-actions">' +
-            '<button class="dl" onclick="doCopyFileUrl(\'' + safeName + '\')" title="Copy download URL">\u2B07</button>' +
+            '<button class="dl" onclick="doDownloadFile(\'' + esc(f.name).replace(/'/g, "\\'") + '\')" title="Download">\u2B07</button>' +
             deleteBtn +
         '</span>' +
         '</div>';
 }
 
-async function doLoadFile(name) {
-    const ftype = getQgisFileType(name);
-    if (!ftype) { doCopyFileUrl(name); return; }
-    const path = '/data/' + name;
-    setInfo('Loading ' + name + ' into QGIS...');
-    try {
-        let result;
-        if (ftype === 'project') {
-            result = await callTool('open_project', { path: path });
-        } else {
-            const baseName = name.replace(/\.[^.]+$/, '');
-            result = await callTool('add_layer', { uri: path, name: baseName, layer_type: ftype });
-        }
-        const txt = result?.content?.find(c => c.type === 'text');
-        const text = txt?.text || '';
-        if (text.toLowerCase().includes('error')) {
-            setInfo('Load failed: ' + text.substring(0, 120));
-        } else {
-            setInfo('Loaded into QGIS: ' + name);
-            updateContext('File loaded into QGIS project: ' + name);
-            refreshAfterInput(500);
-        }
-    } catch (e) {
-        setInfo('Load failed: ' + e.message);
-    }
-}
-
-function doCopyFileUrl(name) {
+function doDownloadFile(name) {
     const url = API_BASE + '/api/files/' + encodeURIComponent(name);
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(url).then(() => {
-            setInfo('URL copied! Paste in browser: ' + name);
-        }).catch(() => {
-            setInfo('Download: ' + url);
-        });
-    } else {
-        setInfo('Download: ' + url);
-    }
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    a.target = '_blank';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setInfo('Downloading ' + name);
 }
 
-let pendingDelete = null;
-
-function doDeleteFile(name) {
-    if (pendingDelete === name) {
-        pendingDelete = null;
-        executeDelete(name);
-    } else {
-        pendingDelete = name;
-        setInfo('Click delete again to confirm: ' + name);
-        setTimeout(() => { if (pendingDelete === name) { pendingDelete = null; setInfo('Delete cancelled'); } }, 3000);
-    }
-}
-
-async function executeDelete(name) {
+async function doDeleteFile(path, name) {
+    if (!confirm('Delete ' + name + '?')) return;
     setInfo('Deleting ' + name + '...');
     try {
-        const result = await callTool('delete_file', { path: name });
+        const result = await callTool('delete_file', { path: path });
         const txt = result?.content?.find(c => c.type === 'text');
-        const text = txt?.text || '';
-        if (text.toLowerCase().includes('error')) {
-            setInfo('Delete failed: ' + text);
-        } else {
+        let info = {};
+        if (txt) { try { info = JSON.parse(txt.text); } catch {} }
+        if (info.success) {
             setInfo('Deleted: ' + name);
             updateContext('File deleted: ' + name);
             doListFiles();
+        } else {
+            setInfo('Delete failed: ' + (info.error || 'unknown error'));
         }
     } catch (err) {
         setInfo('Delete failed: ' + err.message);

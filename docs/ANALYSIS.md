@@ -1,4 +1,4 @@
-# QgisStreamMCP — Architecture Analysis & Evolution Plan
+# BigQgisMCP — Architecture Analysis & Evolution Plan
 
 ## 1. Current Architecture
 

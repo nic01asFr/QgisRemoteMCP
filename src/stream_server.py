@@ -1,5 +1,5 @@
 """
-QgisStreamMCP — MJPEG Stream Server
+QgisRemoteMCP — MJPEG Stream Server
 ═══════════════════════════════════════════════════════════════════
 
 Captures the X11 display and streams it as MJPEG.
