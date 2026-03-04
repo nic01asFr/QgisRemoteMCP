@@ -4,7 +4,7 @@
 #
 # Usage:
 #   docker compose up -d --build       # Build & start
-#   docker compose logs -f bigqgismcp  # View logs
+#   docker compose logs -f qgisremotemcp  # View logs
 #   docker compose down                # Stop
 #
 # Endpoints (single-user mode, default):
@@ -20,9 +20,9 @@
 #      Their noVNC/API ports are dynamic (BASE_API_PORT+ etc.).
 
 services:
-  bigqgismcp:
+  qgisremotemcp:
     build: .
-    container_name: bigqgismcp
+    container_name: qgisremotemcp
     # GPU (optional) — Uncomment for CUDA/compute workloads.
     # QGIS rendering stays on CPU (Xvfb limitation — always uses Mesa/llvmpipe).
     # Requires NVIDIA Container Toolkit: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/
@@ -58,7 +58,7 @@ services:
       # Required when MULTI_USER_MODE=true:
       - IDLE_TIMEOUT_MINUTES=${IDLE_TIMEOUT_MINUTES:-}
       # Optional tuning:
-      - QGIS_IMAGE=${QGIS_IMAGE:-bigqgismcp:latest}
+      - QGIS_IMAGE=${QGIS_IMAGE:-qgisremotemcp:latest}
       - BASE_API_PORT=${BASE_API_PORT:-9000}
       - BASE_STREAM_PORT=${BASE_STREAM_PORT:-9100}
       - BASE_NOVNC_PORT=${BASE_NOVNC_PORT:-9200}

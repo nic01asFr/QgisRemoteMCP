@@ -450,10 +450,10 @@ User's browser
 ```bash
 # Source files are mounted as volumes — edit locally
 # Restart to apply changes:
-docker compose restart bigqgismcp
+docker compose restart qgisremotemcp
 
 # View logs
-docker compose logs -f bigqgismcp
+docker compose logs -f qgisremotemcp
 
 # Test API
 curl http://localhost:8080/health

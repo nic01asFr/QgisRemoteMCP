@@ -70,7 +70,7 @@ container_manager: Optional["ContainerManager"] = None
 auth_manager: Optional["AuthManager"] = None
 
 # MCP Apps
-UI_RESOURCE_URI = "ui://bigqgismcp/qgis-desktop"
+UI_RESOURCE_URI = "ui://qgisremotemcp/qgis-desktop"
 UI_MIME_TYPE = "text/html;profile=mcp-app"
 UI_HTML_CONTENT = ""
 
@@ -899,7 +899,15 @@ def _validate_required(arguments: dict, *fields) -> Optional[str]:
 # Each function takes (arguments: dict) and returns an MCP result dict.
 
 def _tool_qgis_desktop_ui(arguments: dict) -> dict:
-    return {"content": [{"type": "text", "text": "QGIS Desktop UI opened. Use the '🖵 Open in Browser' button in the panel to open full-screen noVNC."}]}
+    novnc_port = VNC_PORT  # default single-user
+    if MULTI_USER_MODE and container_manager:
+        uid = current_user_id.get(None)
+        if uid:
+            session = container_manager.get_session(uid)
+            if session:
+                novnc_port = session.novnc_port
+    novnc_url = f"http://localhost:{novnc_port}/vnc.html?autoconnect=true&resize=scale"
+    return {"content": [{"type": "text", "text": f"QGIS Desktop UI opened. Direct noVNC access: {novnc_url}"}]}
 
 
 def _tool_execute_python(arguments: dict) -> dict:
@@ -1732,7 +1740,7 @@ Every mutating tool response includes a context line with: current phase (setup/
 - For GUI interactions, reference pixel coordinates based on the screenshot layout.
 - Default CRS is EPSG:2154 (Lambert 93, France). Change via new_project or execute_python if needed.
 - Use skill:// resources for PyQGIS patterns, Processing algorithms, cartography best practices, and data source reference.
-- Files in /data/ are accessible via REST API at http://localhost:8080/api/files/{{filename}}.
+- Files in /data/ are accessible via the REST API (port depends on mode: 8080 single-user, session-specific in multi-user).
 - Python code is syntax-validated before execution — malformed code returns a clean error instead of crashing QGIS.
 - The project is auto-saved to /data/.autosave.qgz before risky operations (execute_python, run_processing, remove_layer, new_project).
 - execute_python has a 60s timeout by default. Pass `timeout` param to adjust (e.g. timeout=180 for heavy spatial joins).
@@ -1810,6 +1818,24 @@ def handle_mcp_message(method: str, params: dict, msg_id: Any, session_id: str) 
         uri = params.get("uri", "")
 
         if uri == UI_RESOURCE_URI:
+            # Resolve session-specific ports (multi-user) or defaults (single-user)
+            novnc_port  = VNC_PORT   # default: 6080
+            stream_port = 8081       # default: 8081
+            api_port    = 8080       # default: 8080
+            if MULTI_USER_MODE and container_manager:
+                uid = current_user_id.get(None)
+                if uid:
+                    session = container_manager.get_session(uid)
+                    if session:
+                        novnc_port  = session.novnc_port
+                        stream_port = session.stream_port
+                        api_port    = session.api_port
+
+            ui_html = (UI_HTML_CONTENT
+                       .replace("__NOVNC_PORT__",  str(novnc_port))
+                       .replace("__STREAM_PORT__", str(stream_port))
+                       .replace("__API_PORT__",    str(api_port)))
+
             return {
                 "jsonrpc": "2.0",
                 "id": msg_id,
@@ -1817,13 +1843,19 @@ def handle_mcp_message(method: str, params: dict, msg_id: Any, session_id: str) 
                     "contents": [{
                         "uri": uri,
                         "mimeType": UI_MIME_TYPE,
-                        "text": UI_HTML_CONTENT,
+                        "text": ui_html,
                         "_meta": {
                             "ui": {
                                 "csp": {
-                                    "connectDomains": ["self", "http://localhost:6080", "ws://localhost:6080", "http://localhost:8080", "http://localhost:8081"],
-                                    "frameDomains": ["http://localhost:6080"],
-                                    "imgDomains": ["http://localhost:8081"]
+                                    "connectDomains": [
+                                        "self",
+                                        f"http://localhost:{novnc_port}",
+                                        f"ws://localhost:{novnc_port}",
+                                        f"http://localhost:{api_port}",
+                                        f"http://localhost:{stream_port}",
+                                    ],
+                                    "frameDomains": [f"http://localhost:{novnc_port}"],
+                                    "imgDomains":   [f"http://localhost:{stream_port}"],
                                 }
                             }
                         }
@@ -2169,7 +2201,7 @@ async def lifespan(app):
         print(f"[QgisRemoteMCP] Auth manager ready — data_dir={data_dir}")
 
         container_manager = ContainerManager(
-            image_name=os.environ.get("QGIS_IMAGE", "bigqgismcp:latest"),
+            image_name=os.environ.get("QGIS_IMAGE", "qgisremotemcp:latest"),
             base_api_port=int(os.environ.get("BASE_API_PORT", "9000")),
             base_stream_port=int(os.environ.get("BASE_STREAM_PORT", "9100")),
             base_novnc_port=int(os.environ.get("BASE_NOVNC_PORT", "9200")),

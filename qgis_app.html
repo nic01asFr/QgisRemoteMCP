@@ -133,10 +133,10 @@
 
 <script>
 // ── Config ───────────────────────────────────────────────────
-const VNC_URL    = 'http://localhost:6080/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000';
-const FRAME_URL  = 'http://localhost:8081/frame';
-const INPUT_URL  = 'http://localhost:8080/api/input';
-const API_BASE   = 'http://localhost:8080';
+const VNC_URL    = 'http://localhost:__NOVNC_PORT__/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=1000';
+const FRAME_URL  = 'http://localhost:__STREAM_PORT__/frame';
+const INPUT_URL  = 'http://localhost:__API_PORT__/api/input';
+const API_BASE   = 'http://localhost:__API_PORT__';
 const DISPLAY_W  = 1920;
 const DISPLAY_H  = 1080;
 

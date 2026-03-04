@@ -25,6 +25,9 @@ import io
 import base64
 from pathlib import Path
 
+# Host-side API port for download URLs — injected by ContainerManager in multi-user mode
+_API_HOST_PORT = os.environ.get("API_HOST_PORT", "8080")
+
 # PyQGIS imports (available because we run inside QGIS)
 from qgis.core import (
     QgsProject, QgsVectorLayer, QgsRasterLayer, QgsCoordinateReferenceSystem,
@@ -880,7 +883,7 @@ class QGISBridge:
 
         size = os.path.getsize(output_path)
         result_dict = {"success": True, "path": output_path, "size": size,
-                       "download_url": f"http://localhost:8080/api/files/{Path(output_path).name}"}
+                       "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{Path(output_path).name}"}
         if size <= MAX_INLINE_FILE:
             with open(output_path, "rb") as f:
                 result_dict["content_base64"] = base64.b64encode(f.read()).decode()
@@ -1402,7 +1405,7 @@ class QGISBridge:
         return {
             "success": True,
             "path": output_path,
-            "download_url": f"http://localhost:8080/api/files/{fname}",
+            "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{fname}",
             "size_bytes": size,
             "layers_exported": len(layer_data),
             "title": title,
@@ -1850,7 +1853,7 @@ class QGISBridge:
         return {
             "success": True,
             "path": output_path,
-            "download_url": f"http://localhost:8080/api/files/{fname}",
+            "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{fname}",
             "size_bytes": size,
             "title": title,
             "zone": zone_name,
@@ -2055,7 +2058,7 @@ class QGISBridge:
         return {
             "success": True,
             "path": output_path,
-            "download_url": f"http://localhost:8080/api/files/{fname}",
+            "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{fname}",
             "size": size,
             "title": title,
             "zone": zone_name,
@@ -2146,7 +2149,7 @@ class QGISBridge:
         }
         if size > MAX_INLINE_FILE:
             result["too_large_for_inline"] = True
-            result["download_url"] = f"http://localhost:8080/api/files/{fpath.name}"
+            result["download_url"] = f"http://localhost:{_API_HOST_PORT}/api/files/{fpath.name}"
         else:
             result["content_base64"] = base64.b64encode(fpath.read_bytes()).decode()
         return result
@@ -2203,7 +2206,7 @@ class QGISBridge:
         return {
             "success": True, "path": output_path, "name": name,
             "format": fmt, "size": size,
-            "download_url": f"http://localhost:8080/api/files/{name}",
+            "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{name}",
         }
 
     def _action_download_project(self, params: dict) -> dict:
@@ -2223,7 +2226,7 @@ class QGISBridge:
         size = os.path.getsize(output_path)
         return {
             "success": True, "path": output_path, "name": name, "size": size,
-            "download_url": f"http://localhost:8080/api/files/{name}",
+            "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{name}",
         }
 
     # ── QField Export ────────────────────────────────────────────
@@ -2432,7 +2435,7 @@ class QGISBridge:
         return {
             "success": True,
             "path": zip_path,
-            "download_url": f"http://localhost:8080/api/files/{zip_name}",
+            "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{zip_name}",
             "size_bytes": zip_size,
             "size_mb": round(zip_size / 1024 / 1024, 1),
             "project_name": project_name,
@@ -3367,7 +3370,7 @@ class QGISBridge:
         return {
             "success": True,
             "path": grist_path,
-            "download_url": f"http://localhost:8080/api/files/{fname}",
+            "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{fname}",
             "size_bytes": size,
             "size_mb": round(size / 1024 / 1024, 1),
             "document_name": doc_name,
@@ -3789,7 +3792,7 @@ class QGISBridge:
         return {
             "success": True,
             "path": grist_path,
-            "download_url": f"http://localhost:8080/api/files/{fname}",
+            "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{fname}",
             "size_bytes": size,
             "size_mb": round(size / 1024 / 1024, 1),
             "document_name": doc_name,

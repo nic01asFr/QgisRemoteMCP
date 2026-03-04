@@ -38,7 +38,7 @@ _CONTAINER_NOVNC_PORT  = 6080
 _NETWORK_NAME = "qgis-net"
 
 # Label used to identify containers managed by this gateway
-_LABEL_KEY   = "bigqgismcp.managed"
+_LABEL_KEY   = "qgisremotemcp.managed"
 _LABEL_VALUE = "true"
 
 
@@ -92,7 +92,7 @@ class ContainerManager:
 
     def __init__(
         self,
-        image_name: str = "bigqgismcp:latest",
+        image_name: str = "qgisremotemcp:latest",
         network_name: str = _NETWORK_NAME,
         base_api_port: int = 9000,
         base_stream_port: int = 9100,
@@ -194,6 +194,8 @@ class ContainerManager:
             "DEPTHPRO_URL":      os.environ.get("DEPTHPRO_URL",  "http://host.docker.internal:8003"),
             "PYTHONUNBUFFERED":  "1",
             "MULTI_USER_MODE":   "false",   # workers must not spawn further containers
+            # Host-side port so the bridge generates correct download URLs
+            "API_HOST_PORT":     str(api_p),
         }
 
         print(f"[ContainerManager] Starting container for user={user_id} "
@@ -314,9 +316,10 @@ class ContainerManager:
             environment=env,
             mem_limit="4g",
             nano_cpus=2_000_000_000,   # 2 CPUs
+            shm_size="512m",           # X11 shared memory for QGIS (prevents signal 11 crash)
             labels={
                 _LABEL_KEY:              _LABEL_VALUE,
-                "bigqgismcp.user_id":    user_id,
+                "qgisremotemcp.user_id": user_id,
             },
             extra_hosts={"host.docker.internal": "host-gateway"},
             remove=False,   # we remove manually on stop
