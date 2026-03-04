@@ -5,7 +5,7 @@
 An AI assistant controls a live QGIS Desktop — loads data, runs analysis, produces maps — while users interact with the same instance in their browser.
 
 <p align="center">
-  <img src="docs/architecture.png" alt="Architecture" width="700">
+  <img src="docs/architecture.svg" alt="Architecture" width="900">
 </p>
 
 ## Highlights
