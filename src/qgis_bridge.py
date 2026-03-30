@@ -763,13 +763,35 @@ class QGISBridge:
     # ── Screenshot ────────────────────────────────────────────────
 
     def _capture_screenshot(self, width=1920, height=1080):
-        """Capture screenshot. Priority: QgsMapRenderer > Qt screen grab > ffmpeg.
+        """Capture screenshot as JPEG ≤ 1MB. Priority: QgsMapRenderer > Qt screen grab > ffmpeg.
 
         QgsMapRendererSequentialJob renders directly to a QImage in memory,
         bypassing the X11 framebuffer entirely. This produces correct output
         even when Mesa/llvmpipe doesn't flush the canvas to Xvfb properly.
+
+        Output is always JPEG to keep preview size under 1MB for LLM context.
+        Quality is reduced iteratively if the first encode exceeds the limit.
         """
         from qgis.PyQt.QtCore import QBuffer, QIODevice
+
+        PREVIEW_MAX = 1 * 1024 * 1024  # 1MB hard limit for LLM previews
+
+        def _to_jpeg(img_or_pixmap, quality=75):
+            """Encode a QImage or QPixmap to JPEG bytes, reducing quality until ≤ 1MB."""
+            buf = QBuffer()
+            buf.open(QIODevice.WriteOnly)
+            img_or_pixmap.save(buf, "JPEG", quality)
+            data = bytes(buf.data())
+            buf.close()
+            # Reduce quality in steps if still too large
+            while len(data) > PREVIEW_MAX and quality > 20:
+                quality -= 15
+                buf = QBuffer()
+                buf.open(QIODevice.WriteOnly)
+                img_or_pixmap.save(buf, "JPEG", max(quality, 20))
+                data = bytes(buf.data())
+                buf.close()
+            return data
 
         # Method 1: QgsMapRendererSequentialJob (bypass canvas display)
         # Uses QEventLoop instead of waitForFinished() to avoid blocking
@@ -790,11 +812,7 @@ class QGISBridge:
                 loop.exec_()
                 img = job.renderedImage()
                 if not img.isNull():
-                    buf = QBuffer()
-                    buf.open(QIODevice.WriteOnly)
-                    img.save(buf, "PNG", 85)
-                    data = bytes(buf.data())
-                    buf.close()
+                    data = _to_jpeg(img)
                     if len(data) > 100:
                         return data
         except Exception as e:
@@ -810,11 +828,7 @@ class QGISBridge:
                     if pixmap.width() != width or pixmap.height() != height:
                         from qgis.PyQt.QtCore import Qt
                         pixmap = pixmap.scaled(width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                    buf = QBuffer()
-                    buf.open(QIODevice.WriteOnly)
-                    pixmap.save(buf, "PNG", 80)
-                    data = bytes(buf.data())
-                    buf.close()
+                    data = _to_jpeg(pixmap)
                     if len(data) > 100:
                         return data
         except Exception as e:
@@ -829,19 +843,21 @@ class QGISBridge:
 
         data = self._capture_screenshot(width, height)
 
-        # Fallback to ffmpeg if Qt fails
+        # Fallback to ffmpeg if Qt fails — capture as JPEG directly
         if not data:
             import subprocess
             display = os.environ.get("DISPLAY", ":99")
-            path = f"/tmp/screenshot_{int(time.time())}.png"
+            path = f"/tmp/screenshot_{int(time.time())}.jpg"
             try:
-                # Capture full display (1920x1080) then scale to requested size
+                # Capture full display (1920x1080) then scale to requested size, encode as JPEG q=75
                 cmd = [
                     "ffmpeg", "-y", "-f", "x11grab",
                     "-video_size", "1920x1080",
                     "-i", display,
                     "-vf", f"scale={width}:{height}",
-                    "-frames:v", "1", "-update", "1", path
+                    "-frames:v", "1", "-update", "1",
+                    "-q:v", "4",  # JPEG quality ~75 in ffmpeg scale (2=best, 31=worst)
+                    path
                 ]
                 subprocess.run(cmd, capture_output=True, timeout=10)
                 if os.path.exists(path):
@@ -853,12 +869,14 @@ class QGISBridge:
 
         if not data or len(data) < 100:
             return {"error": "Screenshot produced empty image"}
-        if len(data) > MAX_MESSAGE_SIZE:
-            return {"error": f"Screenshot too large: {len(data)} bytes"}
+
+        PREVIEW_MAX = 1 * 1024 * 1024  # 1MB
+        if len(data) > PREVIEW_MAX:
+            return {"error": f"Screenshot too large after compression: {len(data)} bytes"}
 
         return {
             "image_base64": base64.b64encode(data).decode(),
-            "format": "png",
+            "format": "jpeg",
             "size": len(data),
         }
 

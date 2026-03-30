@@ -87,6 +87,7 @@
   }
   .file-actions button:hover { background: #45475a; }
   .file-actions button.dl:hover { color: #a6e3a1; }
+  .file-actions button.lnk:hover { color: #89b4fa; }
   .file-actions button.del:hover { color: #f38ba8; }
 
   .file-empty { color: #585b70; padding: 12px 8px; text-align: center; font-size: 11px; }
@@ -604,7 +605,6 @@ async function doListFiles() {
 
 function renderFileItem(f, canDelete) {
     const icon = fileIcon(f.name);
-    const dlUrl = API_BASE + '/api/files/' + encodeURIComponent(f.name);
     const modDate = f.modified ? new Date(f.modified * 1000).toLocaleDateString() : '';
     const deleteBtn = canDelete
         ? '<button class="del" onclick="doDeleteFile(\'' + esc(f.path).replace(/'/g, "\\'") + '\',\'' + esc(f.name).replace(/'/g, "\\'") + '\')" title="Delete">\u2716</button>'
@@ -614,22 +614,70 @@ function renderFileItem(f, canDelete) {
         '<span class="file-name" onclick="doDownloadFile(\'' + esc(f.name).replace(/'/g, "\\'") + '\')" title="' + esc(f.path) + '">' + esc(f.name) + '</span>' +
         '<span class="file-meta">' + formatSize(f.size) + (modDate ? ' &middot; ' + modDate : '') + '</span>' +
         '<span class="file-actions">' +
-            '<button class="dl" onclick="doDownloadFile(\'' + esc(f.name).replace(/'/g, "\\'") + '\')" title="Download">\u2B07</button>' +
+            '<button class="dl" onclick="doDownloadFile(\'' + esc(f.name).replace(/'/g, "\\'") + '\')" title="Download to local machine">\u2B07</button>' +
+            '<button class="lnk" onclick="doCopyLink(\'' + esc(f.name).replace(/'/g, "\\'") + '\')" title="Copy direct link">\uD83D\uDD17</button>' +
             deleteBtn +
         '</span>' +
         '</div>';
 }
 
-function doDownloadFile(name) {
+async function doDownloadFile(name) {
     const url = API_BASE + '/api/files/' + encodeURIComponent(name);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = name;
-    a.target = '_blank';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setInfo('Downloading ' + name);
+    setInfo('Downloading ' + name + '...');
+    try {
+        const resp = await fetch(url);
+        if (!resp.ok) { setInfo('Download failed: HTTP ' + resp.status); return; }
+        const blob = await resp.blob();
+
+        // Strategy 1: File System Access API — opens native "Save As" dialog
+        // Works in Chrome/Edge, not in Firefox or restricted sandboxes
+        if (window.showSaveFilePicker) {
+            try {
+                const ext = name.split('.').pop().toLowerCase();
+                const mimeMap = { pdf:'application/pdf', html:'text/html', gpkg:'application/geopackage+sqlite3',
+                                  geojson:'application/geo+json', zip:'application/zip',
+                                  csv:'text/csv', json:'application/json' };
+                const handle = await window.showSaveFilePicker({
+                    suggestedName: name,
+                    types: [{ description: name, accept: { [mimeMap[ext] || blob.type || 'application/octet-stream']: ['.' + ext] } }]
+                });
+                const writable = await handle.createWritable();
+                await writable.write(blob);
+                await writable.close();
+                setInfo('Saved ' + name);
+                return;
+            } catch (e) {
+                if (e.name === 'AbortError') { setInfo('Cancelled'); return; }
+                // Fall through to next strategy if API fails
+            }
+        }
+
+        // Strategy 2: blob objectURL + <a download> — works in most browsers outside strict sandboxes
+        const objectUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = objectUrl;
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(objectUrl), 10000);
+        setInfo('Downloaded ' + name);
+    } catch (e) {
+        setInfo('Error: ' + e.message);
+    }
+}
+
+function doCopyLink(name) {
+    const url = API_BASE + '/api/files/' + encodeURIComponent(name);
+    // Show clickable link in status bar — user can open it directly in their browser
+    const infoEl = document.getElementById('infoBar');
+    if (infoEl) {
+        infoEl.innerHTML = 'Link: <a href="' + url + '" target="_blank" style="color:#89b4fa;text-decoration:underline;" onclick="event.stopPropagation()">' + url + '</a>';
+    }
+    // Also copy to clipboard if available
+    if (navigator.clipboard) {
+        navigator.clipboard.writeText(url).catch(() => {});
+    }
 }
 
 async function doDeleteFile(path, name) {

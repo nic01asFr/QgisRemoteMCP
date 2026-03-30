@@ -398,14 +398,15 @@ TOOLS = [
     # ── File management tools ────────────────────────────────────
     {
         "name": "upload_file",
-        "description": "Upload a file into the QGIS container (/data/). Accepts base64-encoded content. Use for shapefiles, GeoJSON, GPKG, CSV, TIFF, project files, etc.",
+        "description": "Upload a file into the QGIS container (/data/). Two modes: (1) content_base64 for small files (<5MB), (2) url for any size — the server fetches the file directly. Prefer url mode for large files. Use for shapefiles, GeoJSON, GPKG, CSV, TIFF, project files, etc.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "Target filename (e.g. 'parcels.geojson')"},
-                "content_base64": {"type": "string", "description": "Base64-encoded file content"}
+                "content_base64": {"type": "string", "description": "Base64-encoded file content (for small files <5MB)"},
+                "url": {"type": "string", "description": "URL to fetch the file from (for any size). Server downloads directly — no base64 needed."}
             },
-            "required": ["name", "content_base64"]
+            "required": ["name"]
         }
     },
     {
@@ -840,12 +841,12 @@ def _accepts_sse(accept_header: str) -> bool:
 # ══════════════════════════════════════════════════════════════════
 
 def _auto_screenshot() -> list:
-    """Take a screenshot and return it as an MCP image content block.
+    """Take a screenshot and return it as an MCP image content block (JPEG ≤ 1MB).
     Returns empty list on failure so it can be safely concatenated."""
     time.sleep(0.3)  # let QGIS render
     resp = qgis_command("screenshot", {"width": 1280, "height": 720})
     if "image_base64" in resp:
-        return [{"type": "image", "data": resp["image_base64"], "mimeType": "image/png"}]
+        return [{"type": "image", "data": resp["image_base64"], "mimeType": "image/jpeg"}]
     return []
 
 
@@ -924,10 +925,10 @@ def _tool_execute_python(arguments: dict) -> dict:
 def _tool_get_screenshot(arguments: dict) -> dict:
     width = arguments.get("width", 1280)
     height = arguments.get("height", 720)
-    response = qgis_command("screenshot", {"width": width, "height": height, "format": "png"})
+    response = qgis_command("screenshot", {"width": width, "height": height})
     if "error" in response:
         return {"content": _text(response)}
-    return {"content": [{"type": "image", "data": response.get("image_base64", ""), "mimeType": "image/png"}]}
+    return {"content": [{"type": "image", "data": response.get("image_base64", ""), "mimeType": "image/jpeg"}]}
 
 
 def _tool_get_project_info(arguments: dict) -> dict:
@@ -1033,6 +1034,8 @@ def _tool_export_pdf(arguments: dict) -> dict:
     if arguments.get("output_path"):
         params["output_path"] = arguments["output_path"]
     response = qgis_command("export_pdf", params)
+    # Bridge already caps inline content at MAX_INLINE_FILE (5MB).
+    # Files above that have no content_base64, only a download_url.
     content = [{"type": "text", "text": json.dumps({k: v for k, v in response.items() if k != "content_base64"}, default=str)}]
     if response.get("content_base64"):
         content.append({
@@ -1089,14 +1092,40 @@ def _tool_mouse_drag(arguments: dict) -> dict:
 
 
 def _tool_upload_file(arguments: dict) -> dict:
-    err = _validate_required(arguments, "name", "content_base64")
+    err = _validate_required(arguments, "name")
     if err:
         return _error(err)
-    response = qgis_command("write_file", {
-        "name": arguments["name"],
-        "content_base64": arguments["content_base64"],
-    })
-    return {"content": _text(response)}
+    name = arguments["name"]
+    url = arguments.get("url")
+    content_base64 = arguments.get("content_base64")
+
+    if url:
+        # Mode URL: server fetches the file directly — no size limit from MCP
+        api_port = _get_user_api_port()
+        try:
+            with httpx.Client(timeout=120) as client:
+                # Stream download from URL
+                with client.stream("GET", url) as dl:
+                    dl.raise_for_status()
+                    data = dl.read()
+                # Upload to QGIS container via multipart REST
+                files = {"file": (name, data, "application/octet-stream")}
+                resp = client.post(f"http://localhost:{api_port}/api/upload", files=files)
+                resp.raise_for_status()
+                return {"content": _text(resp.json())}
+        except httpx.HTTPStatusError as e:
+            return _error(f"Upload failed: HTTP {e.response.status_code}")
+        except Exception as e:
+            return _error(f"Upload failed: {e}")
+    elif content_base64:
+        # Mode base64: legacy, for small files
+        response = qgis_command("write_file", {
+            "name": name,
+            "content_base64": content_base64,
+        })
+        return {"content": _text(response)}
+    else:
+        return _error("Either 'url' or 'content_base64' is required")
 
 
 def _tool_download_file(arguments: dict) -> dict:
@@ -1106,6 +1135,7 @@ def _tool_download_file(arguments: dict) -> dict:
     response = qgis_command("read_file", {"path": arguments["path"]})
     if "error" in response:
         return {"content": _text(response)}
+    # Bridge already caps inline content at MAX_INLINE_FILE (5MB).
     content = [{"type": "text", "text": json.dumps({k: v for k, v in response.items() if k != "content_base64"}, default=str)}]
     if response.get("content_base64"):
         content.append({
@@ -1584,7 +1614,7 @@ async def stream_run_recipe(arguments: dict, msg_id: Any, session_id: str,
     ss_resp  = await asyncio.to_thread(qgis_command, "screenshot", {"width": 1280, "height": 720})
     content  = [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False, indent=2)}]
     if "image_base64" in ss_resp:
-        content.append({"type": "image", "data": ss_resp["image_base64"], "mimeType": "image/png"})
+        content.append({"type": "image", "data": ss_resp["image_base64"], "mimeType": "image/jpeg"})
 
     yield sse({"jsonrpc": "2.0", "id": msg_id, "result": {"content": content}})
     current_user_id.reset(_cv_token)
@@ -2022,7 +2052,10 @@ async def handle_mcp(request: Request) -> Response:
         else:
             user_id = "anonymous"
         # Ensure the user's QGIS container is running before we dispatch
-        await _ensure_session(user_id)
+        # Skip for lifecycle methods that don't need QGIS (initialize, ping, notifications)
+        _NEEDS_QGIS = frozenset({"tools/call", "resources/read"})
+        if method in _NEEDS_QGIS:
+            await _ensure_session(user_id)
     else:
         user_id = "default"
 
