@@ -398,20 +398,20 @@ TOOLS = [
     # ── File management tools ────────────────────────────────────
     {
         "name": "upload_file",
-        "description": "Upload a file into the QGIS container (/data/). Two modes: (1) content_base64 for small files (<5MB), (2) url for any size — the server fetches the file directly. Prefer url mode for large files. Use for shapefiles, GeoJSON, GPKG, CSV, TIFF, project files, etc.",
+        "description": "Upload a file into the QGIS container (/data/). Call with just 'name' to get the direct upload endpoint (multipart POST, any size up to 50MB). The user can then upload via: curl -F 'file=@local_file' <endpoint>. Alternatively provide 'url' for the server to fetch the file itself, or 'content_base64' for tiny inline files (<1MB).",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Target filename (e.g. 'parcels.geojson')"},
-                "content_base64": {"type": "string", "description": "Base64-encoded file content (for small files <5MB)"},
-                "url": {"type": "string", "description": "URL to fetch the file from (for any size). Server downloads directly — no base64 needed."}
+                "name": {"type": "string", "description": "Target filename in /data/ (e.g. 'parcels.geojson')"},
+                "url": {"type": "string", "description": "URL the server will fetch directly. Any public URL, or http://host.docker.internal:<port>/file for local Docker setups."},
+                "content_base64": {"type": "string", "description": "Base64-encoded content — only for tiny files (<1MB). Prefer url or multipart instead."}
             },
             "required": ["name"]
         }
     },
     {
         "name": "download_file",
-        "description": "Download a file from the QGIS container. Returns base64 content for files < 5MB, or a download URL for larger files. Restricted to /data/.",
+        "description": "Download a file from the QGIS container (/data/). Returns a download_url you can give to the user — they open it in their browser to save locally. Small files (<5MB) also include base64 inline.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1098,21 +1098,25 @@ def _tool_upload_file(arguments: dict) -> dict:
     name = arguments["name"]
     url = arguments.get("url")
     content_base64 = arguments.get("content_base64")
+    api_port = _get_user_api_port()
+
+    # Build the public multipart endpoint — always returned in response
+    # Use the MCP server's own host (request origin) for remote access
+    upload_endpoint = f"http://localhost:{api_port}/api/upload"
 
     if url:
         # Mode URL: server fetches the file directly — no size limit from MCP
-        api_port = _get_user_api_port()
         try:
             with httpx.Client(timeout=120) as client:
-                # Stream download from URL
                 with client.stream("GET", url) as dl:
                     dl.raise_for_status()
                     data = dl.read()
-                # Upload to QGIS container via multipart REST
                 files = {"file": (name, data, "application/octet-stream")}
                 resp = client.post(f"http://localhost:{api_port}/api/upload", files=files)
                 resp.raise_for_status()
-                return {"content": _text(resp.json())}
+                result = resp.json()
+                result["upload_endpoint"] = upload_endpoint
+                return {"content": _text(result)}
         except httpx.HTTPStatusError as e:
             return _error(f"Upload failed: HTTP {e.response.status_code}")
         except Exception as e:
@@ -1125,7 +1129,18 @@ def _tool_upload_file(arguments: dict) -> dict:
         })
         return {"content": _text(response)}
     else:
-        return _error("Either 'url' or 'content_base64' is required")
+        # No data provided — return the multipart endpoint for direct upload
+        # The client can POST multipart/form-data with field "file" to this URL
+        return {"content": _text({
+            "action": "upload_ready",
+            "upload_endpoint": upload_endpoint,
+            "method": "POST",
+            "content_type": "multipart/form-data",
+            "field_name": "file",
+            "max_size_mb": 50,
+            "instructions": f"POST your file as multipart/form-data (field='file') to the endpoint above. "
+                           f"Example: curl -F 'file=@{name}' {upload_endpoint}"
+        })}
 
 
 def _tool_download_file(arguments: dict) -> dict:
