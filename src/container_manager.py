@@ -124,6 +124,7 @@ class ContainerManager:
         self._used_indices: Set[int] = set()
         self._docker_client      = None
         self._cleanup_task: Optional[asyncio.Task] = None
+        self._gpu_available: bool  = False
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -150,13 +151,16 @@ class ContainerManager:
 
         self._ensure_network()
         self._cleanup_stale_containers()
+        self._detect_gpu()
 
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        gpu_str = "GPU available (NVIDIA)" if self._gpu_available else "CPU only"
         print(f"[ContainerManager] Ready — image={self.image_name} "
               f"ports API:{self.base_api_port}+ "
               f"stream:{self.base_stream_port}+ "
               f"noVNC:{self.base_novnc_port}+ "
-              f"idle={self.idle_timeout//60}min")
+              f"idle={self.idle_timeout//60}min "
+              f"compute={gpu_str}")
 
     async def shutdown(self) -> None:
         """Cancel cleanup loop. (Containers are left running for graceful reconnect.)"""
@@ -319,9 +323,9 @@ class ContainerManager:
         user_data_dir: str,
         env: dict,
     ):
-        """Synchronous Docker container.run() call (run in thread)."""
-        return self._docker_client.containers.run(
-            self.image_name,
+        """Synchronous Docker container.run() call (run in thread).
+        Passes GPU to the container if available (try/fallback)."""
+        kwargs = dict(
             detach=True,
             network=self.network_name,
             ports={
@@ -343,6 +347,24 @@ class ContainerManager:
             extra_hosts={"host.docker.internal": "host-gateway"},
             remove=False,   # we remove manually on stop
         )
+
+        # Try with GPU if available — fallback to CPU if it fails
+        if self._gpu_available:
+            try:
+                gpu_env = {**env, "NVIDIA_VISIBLE_DEVICES": "all",
+                           "NVIDIA_DRIVER_CAPABILITIES": "compute,utility"}
+                return self._docker_client.containers.run(
+                    self.image_name,
+                    **{**kwargs, "environment": gpu_env,
+                       "device_requests": [_docker.types.DeviceRequest(
+                           count=-1, capabilities=[["gpu"]]
+                       )]},
+                )
+            except Exception as e:
+                print(f"[ContainerManager] GPU launch failed for user={user_id} "
+                      f"({e.__class__.__name__}), falling back to CPU")
+
+        return self._docker_client.containers.run(self.image_name, **kwargs)
 
     def _stop_container(self, container_id: str) -> None:
         """Synchronous stop + remove (run in thread)."""
@@ -381,6 +403,31 @@ class ContainerManager:
               f"after {timeout}s")
 
     # ── Internal: network + cleanup ───────────────────────────────────────────
+
+    def _detect_gpu(self) -> None:
+        """Probe for NVIDIA GPU by running a throwaway container with --gpus all.
+        Sets self._gpu_available = True if the GPU is usable, False otherwise.
+        This never breaks startup — failures are silently caught."""
+        try:
+            result = self._docker_client.containers.run(
+                "ubuntu:22.04",
+                command="nvidia-smi --query-gpu=name --format=csv,noheader",
+                device_requests=[_docker.types.DeviceRequest(
+                    count=-1, capabilities=[["gpu"]]
+                )],
+                remove=True,
+                detach=False,
+                stdout=True,
+                stderr=True,
+            )
+            gpu_name = result.decode().strip()
+            if gpu_name:
+                self._gpu_available = True
+                print(f"[ContainerManager] GPU detected: {gpu_name}")
+            else:
+                print("[ContainerManager] GPU probe returned empty — CPU mode")
+        except Exception as e:
+            print(f"[ContainerManager] No GPU available ({e.__class__.__name__}) — CPU mode")
 
     def _ensure_network(self) -> None:
         try:

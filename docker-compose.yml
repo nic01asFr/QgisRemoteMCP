@@ -23,25 +23,25 @@ services:
   qgisremotemcp:
     build: .
     container_name: qgisremotemcp
-    # GPU (optional) — Uncomment for CUDA/compute workloads.
-    # QGIS rendering stays on CPU (Xvfb limitation — always uses Mesa/llvmpipe).
-    # Requires NVIDIA Container Toolkit: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
+    # GPU — passed through for CUDA/compute workloads (GDAL, Processing, PyQGIS scripts).
+    # QGIS rendering stays on CPU (Xvfb → Mesa llvmpipe). GPU = compute only.
+    # Requires NVIDIA Container Toolkit. Ignored gracefully if no GPU present.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     ports:
       - "${MCP_PORT:-8100}:8100"    # MCP Server
       - "${QGIS_VNC_PORT:-6080}:6080"  # noVNC (QGIS in browser)
       - "${API_PORT:-8081}:8080"      # REST API
       - "${STREAM_PORT:-8082}:8081"  # MJPEG stream
     environment:
-      # Uncomment with deploy block above for GPU support
-      # - NVIDIA_VISIBLE_DEVICES=all
-      # - NVIDIA_DRIVER_CAPABILITIES=graphics,compute,utility
+      # GPU compute — passed through automatically when available
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - QGIS_RESOLUTION=${QGIS_RESOLUTION:-1920x1080x24}
       - MCP_PORT=8100
       - VNC_HOST=${VNC_HOST:-localhost}
