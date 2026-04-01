@@ -1,79 +1,104 @@
-# QgisRemoteMCP
+# QgisRemoteMCP — QGIS Desktop as an MCP Server
 
-**QGIS Desktop as an MCP Server** — Full GUI via noVNC, PyQGIS scripting, 1000+ Processing algorithms, smart data pipeline with 30+ French national datasets.
+> Give any AI assistant a complete GIS workstation — data loading, spatial analysis, cartography, and multi-format export — all running in a live QGIS Desktop instance.
 
-An AI assistant controls a live QGIS Desktop — loads data, runs analysis, produces maps — while users interact with the same instance in their browser.
+**QgisRemoteMCP** is an [MCP](https://modelcontextprotocol.io/) server that exposes a full QGIS Desktop through Docker. The AI loads data, runs analysis, produces maps — while users interact with the same instance in their browser via noVNC.
+
+![MCP Streamable HTTP](https://img.shields.io/badge/MCP-Streamable_HTTP-blue)
+![QGIS 3.40+](https://img.shields.io/badge/QGIS-3.40+-93b023)
+![Python 3.12](https://img.shields.io/badge/Python-3.12-green)
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow)
+![Status: Production](https://img.shields.io/badge/Status-Production_(single--user)-brightgreen)
+![Multi-user: Beta](https://img.shields.io/badge/Multi--user-Beta-orange)
+
+> **Project status**: Production-ready for single-user local deployments. Multi-user mode (per-user isolated containers with GPU passthrough) is functional but in beta. Developed at [Cerema Méditerranée](https://www.cerema.fr/) — published to share the approach and invite contributions.
 
 <p align="center">
   <img src="docs/architecture.svg" alt="Architecture" width="900">
 </p>
 
-## Highlights
+---
 
-- **Smart Data Pipeline** — `set_study_zone("Montpellier")` then `smart_load("bdtopo_batiments")`. Downloads WFS as local GeoPackage with automatic pagination, R-tree spatial index, CRS transform. Processing runs 60-250x faster than live WFS.
-- **30+ Pre-configured French Datasets** — BD TOPO, Admin Express, RPG, IGN orthophotos, cadastre, DEM, Corine Land Cover, OSM, Esri. No API key needed.
-- **Full QGIS Desktop** — Live GUI via noVNC. AI and user work on the same instance simultaneously.
-- **1000+ Processing Algorithms** — Native, GDAL, GRASS, SAGA. All accessible via MCP tools.
-- **Automated Recipes** — Pre-built workflows (density analysis, flood risk, land cover, coastal pressure). One command: `run_recipe("risque_inondation", zone="Nimes")`.
-- **Multi-format Export** — PDF layouts, interactive Leaflet maps (standard, flood analysis, temporal), QField mobile packages, Grist collaborative documents.
-- **MCP App** — Interactive QGIS view embedded directly in the conversation (VNC viewer, file upload, keyboard/mouse forwarding).
+## What it does
 
-## Quick Start
+| You say to the AI | What happens |
+|---|---|
+| *"Analyse le risque inondation à Nîmes"* | Loads flood zones + buildings, computes exposure, exports interactive HTML with water height slider |
+| *"Carte de densité du bâti à Montpellier"* | Downloads 10,000 buildings as local GPKG, creates hex grid, graduated symbology, PDF A3 export |
+| *"Prépare un relevé terrain pour Sète"* | Loads data, styles layers, exports QField-ready ZIP with editable Observations layer (camera, dropdowns) |
+| *"Analyse l'évolution foncière sur la côte"* | DVF transactions 2020-2024, coastal distance bands, temporal web map with animated playback |
+
+Everything runs inside Docker — the AI calls MCP tools, QGIS does the work, the user sees results live in their browser. No local QGIS installation needed.
+
+---
+
+## Quick start
+
+### 1. Run
 
 ```bash
-git clone https://gitlab.cerema.fr/mcp/QgisRemoteMCP.git
-cd QgisRemoteMCP
+git clone https://github.com/nic01asFr/BigQgisMCP.git
+cd BigQgisMCP
+cp .env.example .env
 docker compose up -d --build
 ```
 
-### Endpoints
+### 2. Verify
 
-| Port | Service | URL |
-|------|---------|-----|
-| 6080 | noVNC (QGIS in browser) | http://localhost:6080 |
-| 8100 | MCP Server (Streamable HTTP) | http://localhost:8100/mcp |
-| 8080 | REST API | http://localhost:8080/docs |
-| 8081 | MJPEG stream | http://localhost:8081/stream |
+| Service | URL |
+|---------|-----|
+| MCP Server | http://localhost:8100/mcp |
+| noVNC (QGIS in browser) | http://localhost:6080 |
+| REST API | http://localhost:8081 |
+| MJPEG stream | http://localhost:8082/stream |
 
-### Connect to Claude Desktop
+```bash
+curl http://localhost:8100/health
+# → {"status":"ok","bridge":true,"server":"QgisRemoteMCP","multi_user":false}
+```
 
-Add to `claude_desktop_config.json`:
+### 3. Connect Claude Desktop
+
+Edit `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "qgis": {
+      "type": "http",
       "url": "http://localhost:8100/mcp"
     }
   }
 }
 ```
 
-## Smart Data Loading
+### 4. Connect Claude Code
+
+The repo includes a `.mcp.json` — Claude Code picks it up automatically when you open the project directory.
+
+---
+
+## Smart data loading
 
 The core innovation: a structured pipeline that replaces unreliable live WFS connections with fast local GeoPackage files.
-
-### Why?
 
 | Problem | Live WFS | Smart Loading |
 |---------|----------|---------------|
 | Pagination | IGN silently truncates at 5000 | ogr2ogr handles all pages automatically |
 | Spatial index | None (in-memory) | R-tree in GeoPackage |
-| Processing speed | 60-250x slower (network + no index) | Fast local file |
-| Network during analysis | HTTP requests per feature | Zero network |
+| Processing speed | 60-250x slower | Fast local file |
+| Network during analysis | HTTP per feature | Zero network |
 | CRS confusion | Mixed 4326/3857/2154 | Standardized EPSG:2154 |
 
-### Pipeline
+```
+1. set_study_zone("Montpellier")         → geocode, store bbox, zoom
+2. smart_load("osm_xyz")                 → basemap (streaming)
+3. smart_load("bdtopo_batiments")        → 10,000 buildings as local GPKG
+4. run_processing / execute_python       → analyse (fast, no network)
+5. export_pdf / export_web_map           → deliver
+```
 
-```
-1. set_study_zone(target="Montpellier")    # Geocode, store bbox, zoom
-2. smart_load(id="osm_xyz")                # Basemap (streaming)
-3. smart_load(id="bdtopo_batiments")       # Buildings (download GPKG)
-4. smart_load(id="bdtopo_routes")          # Roads (download GPKG)
-5. get_screenshot                           # Verify
-6. run_processing / execute_python          # Analyze
-7. export_pdf / export_web_map / ...        # Deliver (PDF, HTML, QField, Grist)
-```
+Downloads are cached in `/data/cache/` with bbox hash — same area = instant reload for 24h.
 
 ### Performance (Montpellier, ~10 km bbox)
 
@@ -83,442 +108,441 @@ The core innovation: a structured pipeline that replaces unreliable live WFS con
 | Download roads | 5,000 | 6.8s |
 | Cache reload (2nd call) | 10,000 | instant |
 | Buffer 50m | 10,000 | 1.8s |
-| Dissolve by usage | 10,000 | 2.2s |
 | Density grid 500m | 440 cells | 0.3s |
 
-### Caching
+---
 
-Downloads are cached in `/data/cache/` with bbox hash. Same area = instant reload for 24h.
+## Available data sources
 
-## Available Data Sources
+All sources are free (IGN open data since July 2021). No API key needed. 30+ pre-configured in `datasources.json`.
 
-All sources are free (IGN open data since July 2021). No API key needed.
+### Vector (WFS → local GPKG)
 
-### Vector Data (WFS, downloaded as GPKG)
-
-| ID | Name | Key Attributes |
+| ID | Name | Key attributes |
 |----|------|----------------|
 | `bdtopo_batiments` | Buildings | nature, usage, height, floors, materials |
 | `bdtopo_routes` | Roads | nature, importance, width, lanes, speed |
 | `bdtopo_hydrographie` | Rivers | name, class, width |
-| `bdtopo_vegetation` | Vegetation zones | nature |
-| `bdtopo_voie_ferree` | Railways | nature, nb_voies |
-| `bdtopo_hydro_surfaces` | Water bodies | nature, name |
-| `bdtopo_communes` | Communes (BD TOPO) | name, code INSEE, population |
+| `bdtopo_communes` | Communes | name, INSEE code, population |
 | `admin_express_communes` | Communes (Admin Express) | name, code, population |
-| `admin_express_departements` | Departments | name, code |
-| `admin_express_regions` | Regions | name, code |
 | `rpg` | Agricultural parcels | crop type, area |
-| `bdtopo_poi` | Points of interest | nature |
-| `bdtopo_lieu_dit` | Place names | name |
-| `bdtopo_surface_activite` | Activity zones | nature |
-| `bdtopo_equipement_transport` | Transport facilities | nature |
+| + 10 more | BD TOPO vegetation, railways, POI, activity zones... | |
 
-### Basemaps (streaming)
+### Basemaps & imagery (streaming)
 
 | ID | Name |
 |----|------|
 | `osm_xyz` | OpenStreetMap |
 | `ign_planign` | Plan IGN v2 |
-| `ign_scan25` | Cartes topo IGN 1:25000 |
-| `cartodb_positron` | Light basemap |
-| `cartodb_dark` | Dark basemap |
-| `esri_world_topo` | Esri World Topographic |
-| `stamen_terrain` | Stamen Terrain (relief) |
-
-### Imagery (streaming)
-
-| ID | Name |
-|----|------|
-| `ign_ortho_wmts` | IGN orthophotos (WMTS, fast) |
-| `ign_ortho_wms` | IGN orthophotos (WMS) |
-| `ign_ortho_irc` | IGN infrared photos |
-| `esri_world_imagery` | Esri satellite |
-
-### Other (WMS/API)
-
-| ID | Name |
-|----|------|
+| `ign_ortho_wmts` | IGN orthophotos |
 | `ign_cadastre` | Cadastral parcels |
-| `ign_dem` | High-resolution DEM |
 | `corine_land_cover` | Land cover 2018 |
-| `ban_geocode` | Address geocoding API |
-| `geo_api_communes` | Commune info API |
-| `dvf_api` | Property transactions API |
-| `panoramax` | Street-level imagery API |
-| `ign_altimetrie` | Elevation API |
+| `ign_dem` | High-resolution DEM |
+| + 10 more | Esri, Stamen, CartoDB, infrared, SCAN 25... |
+
+### APIs
+
+`ban_geocode` (address search), `geo_api_communes` (commune info), `dvf_api` (property transactions), `panoramax` (street imagery), `ign_altimetrie` (elevation).
+
+---
 
 ## Recipes
 
-Pre-built workflow templates that automate complete analyses — from data loading to styled map export.
+Pre-built workflow templates — from data loading to styled map export in one command.
 
-| ID | Name | Description |
-|----|------|-------------|
-| `densite_bati` | Building Density | Hex grid density analysis with graduated symbology |
-| `urbanisme_general` | Urban Overview | Buildings, roads, vegetation, hydrology with categorized styles |
-| `risque_inondation` | Flood Risk | Flood zones, building exposure, buffer analysis + interactive web map |
-| `occupation_sol` | Land Cover | Corine Land Cover with categorized symbology |
-| `pression_fonciere_cotiere` | Coastal Land Pressure | DVF transactions 2020-2024, coastal bands + temporal web map |
+| ID | Name | Output |
+|----|------|--------|
+| `densite_bati` | Building density | Hex grid + graduated symbology + PDF |
+| `urbanisme_general` | Urban overview | Buildings, roads, vegetation + categorized styles |
+| `risque_inondation` | Flood risk | Flood zones + building exposure + interactive web map |
+| `occupation_sol` | Land cover | Corine Land Cover + categorized symbology |
+| `pression_fonciere_cotiere` | Coastal land pressure | DVF 2020-2024 + coastal bands + temporal web map |
 
-### Usage
-
-```
-# Automated (all steps in one shot)
+```python
+# Automated — all steps in one shot
 run_recipe(id="risque_inondation", zone="Nimes")
 
-# Manual (follow steps one by one)
+# Manual — follow steps one by one
 get_recipe(id="densite_bati", zone="Montpellier")
-→ Returns step-by-step instructions to execute individually
 ```
 
-## Export Formats
+---
 
-### PDF Layout
+## Export formats
 
-Print-ready PDF via QGIS print layouts with pre-built templates (A3 landscape, A4 portrait). Includes title, legend, scalebar, north arrow, and data sources.
+| Format | Tool | Output |
+|--------|------|--------|
+| **PDF** | `export_pdf` | Print-ready layout (A3 landscape, A4 portrait) with title, legend, scalebar |
+| **Web map** | `export_web_map` | Leaflet HTML with embedded GeoJSON, layer toggle, popups |
+| **Flood map** | `export_flood_map` | Interactive HTML — water height slider, building exposure stats, animation |
+| **Temporal map** | `export_temporal_map` | Interactive HTML — year slider, trend arrows, animated playback |
+| **QField** | `export_qfield` | Portable ZIP for mobile (.qgz + GPKGs + editable Observations layer) |
+| **Grist** | `export_grist` | Collaborative document with typed columns, map widget, form pages |
+| **Layer** | `export_layer` | GPKG, GeoJSON, Shapefile, or CSV |
 
-```
-apply_layout_template(template="a3_landscape", title="Flood Risk — Nimes")
-export_pdf(layout="a3_landscape")
-```
+### Grist export — universal HTML converter
 
-### Interactive Web Map
+`export_grist` has two modes:
+1. **From QGIS project** — exports loaded layers as Grist tables with map widget
+2. **From any HTML file** — takes any Leaflet HTML containing GeoJSON (flood maps, temporal maps, qgis2web) and creates a Grist document with data in tables and the original interactive map as a custom widget
 
-Leaflet HTML files with embedded GeoJSON data. Three specialized templates:
+Auto-detected column types: `Choice` (colored dropdowns), `Date` (epoch timestamps), `Ref` (cross-table references). Form-like tables get a Grist Form page.
 
-| Template | Use case | Features |
-|----------|----------|----------|
-| **Standard** | General map | Layer toggle, popup, legend, basemap selector |
-| **Flood** | Flood risk analysis | Water height slider, building exposure stats, animation |
-| **Temporal** | Time series | Year slider, per-band statistics, trend arrows, animated playback |
+---
 
-### QField Mobile Package
+## MCP tools (40)
 
-Portable ZIP ready for [QField](https://qfield.org/) mobile data collection:
-
-- `.qgz` project with relative GPKG sources
-- All vector layers materialized as individual GeoPackages
-- Editable **Observations** layer with form widgets (dropdowns, date picker, camera, free text)
-
-```
-export_qfield(project_name="terrain_survey")
-→ /data/terrain_survey_qfield.zip
-```
-
-### Grist Document
-
-Converts QGIS project layers or any HTML map into a [Grist](https://www.getgrist.com/) collaborative document (`.grist`):
-
-- **From project** — Exports visible vector layers as Grist tables with a custom map widget
-- **From HTML** — Universal converter: takes any HTML file containing GeoJSON (flood maps, temporal maps, qgis2web exports) and creates a Grist document with data in tables and the original interactive map as a Grist custom widget
-
-Detected column types: `Choice` (colored dropdowns), `Date` (epoch timestamps), `Ref` (cross-table references). Form-like tables automatically get a Grist Form page.
-
-```
-# From QGIS project
-export_grist(title="Urban Analysis")
-
-# From any HTML with GeoJSON
-export_grist(html_path="/data/flood_map_nimes.html")
-```
-
-## MCP Tools
-
-### Smart Loading
+### Smart loading
 | Tool | Description |
 |------|-------------|
-| `set_study_zone` | Define study area (commune, address, bbox). Geocodes, stores bbox, zooms canvas. |
-| `get_study_zone` | Get current study zone (name, bbox in 4326 + 2154). |
-| `smart_load` | Load data by catalog ID. WFS → local GPKG with spatial index. Rasters stream. |
+| `set_study_zone` | Define study area (commune, address, bbox). Geocodes, stores bbox, zooms. |
+| `get_study_zone` | Get current zone (name, bbox in 4326 + 2154). |
+| `smart_load` | Load data by catalog ID. WFS → local GPKG. Rasters stream. |
+| `list_datasources` | Browse data catalog (filter by category or search). |
+| `add_from_catalog` | Add source by catalog ID. |
 
 ### Core
 | Tool | Description |
 |------|-------------|
-| `execute_python` | Run PyQGIS code with full access to iface, project, processing, `helpers` module. |
-| `get_screenshot` | Capture QGIS canvas as PNG. Auto-included after modifying tools. |
-| `get_project_info` | Current project state (layers, CRS, layouts, extents). |
+| `execute_python` | Run PyQGIS code with `helpers` module, `iface`, `project`, `processing`. |
+| `get_screenshot` | Capture QGIS canvas (JPEG ≤1MB). Auto-included after modifying tools. |
+| `get_project_info` | Project state: layers, CRS, layouts, extents. |
 | `run_processing` | Execute any of 1000+ Processing algorithms. |
-| `search_algorithms` | Find Processing algorithms by keyword. |
-| `zoom_to` | Navigate to extent, layer, or point. |
+| `search_algorithms` | Find algorithms by keyword. |
 
-### Data & Layers
+### Data & layers
 | Tool | Description |
 |------|-------------|
 | `add_layer` | Add vector/raster/WFS/WMS by URI. |
 | `remove_layer` | Remove a layer. |
 | `get_features` | Query features with attribute/spatial filters. |
-| `list_datasources` | Browse the pre-configured data catalog. |
-| `add_from_catalog` | Add a source by catalog ID. |
+| `zoom_to` | Navigate to extent, layer, or point. |
 
-### Styling
+### Styling & layout
 | Tool | Description |
 |------|-------------|
-| `set_layer_style` | Apply single color, categorized, or graduated symbology. |
+| `set_layer_style` | Single color, categorized, or graduated symbology. |
 | `set_layer_visibility` | Show/hide layers. |
-| `apply_layout_template` | Apply a print layout template (A3 landscape, A4 portrait). |
-| `list_layout_templates` | List available layout templates. |
+| `apply_layout_template` | Apply print layout template (A3/A4). |
+| `list_layout_templates` | List available templates. |
 
 ### Recipes
 | Tool | Description |
 |------|-------------|
-| `list_recipes` | Browse available workflow recipes. |
-| `get_recipe` | Get recipe details with parameter substitution. |
-| `run_recipe` | Execute a complete recipe automatically (all steps in one shot). |
+| `list_recipes` | Browse workflow recipes. |
+| `get_recipe` | Get recipe with parameter substitution. |
+| `run_recipe` | Execute all steps automatically. |
 
 ### Export
 | Tool | Description |
 |------|-------------|
-| `export_pdf` | Export print layout to PDF. |
-| `export_web_map` | Export visible layers as interactive Leaflet HTML. |
-| `export_flood_map` | Interactive flood analysis HTML (water height slider, building exposure). |
-| `export_temporal_map` | Interactive temporal analysis HTML (year slider, animated playback). |
-| `export_qfield` | QField-ready ZIP package (.qgz + GPKGs + editable Observations layer). |
-| `export_grist` | Grist document from project layers or from any HTML with GeoJSON. |
-| `export_layer` | Export vector layer to GPKG, GeoJSON, Shapefile, CSV. |
+| `export_pdf` | Print layout → PDF. |
+| `export_web_map` | Visible layers → Leaflet HTML. |
+| `export_flood_map` | Flood analysis → interactive HTML. |
+| `export_temporal_map` | Time series → interactive HTML. |
+| `export_qfield` | QField-ready ZIP (.qgz + GPKGs + Observations). |
+| `export_grist` | Grist document from project or HTML. |
+| `export_layer` | Layer → GPKG/GeoJSON/Shapefile/CSV. |
 
 ### Files
 | Tool | Description |
 |------|-------------|
-| `upload_file` | Upload file (shapefile, GeoJSON, GPKG, CSV, TIFF, project). |
-| `download_file` | Download file from /data/. |
+| `upload_file` | Upload via multipart POST (any size), URL fetch, or base64. |
+| `download_file` | Download from /data/ (URL for user, inline for small files). |
 | `list_files` | List files in /data/. |
 | `delete_file` | Delete file from /data/. |
-| `download_project` | Save project as .qgz. |
+| `download_project` | Save as .qgz. |
 
-### GUI Interaction
+### GUI interaction
 | Tool | Description |
 |------|-------------|
-| `qgis_desktop_ui` | Open interactive QGIS MCP App in conversation. |
-| `mouse_click` / `mouse_scroll` / `mouse_drag` / `key_press` | Direct GUI interaction via xdotool. |
+| `qgis_desktop_ui` | Open interactive QGIS view in conversation (MCP App). |
+| `mouse_click` / `mouse_scroll` / `mouse_drag` / `key_press` | Direct GUI interaction. |
 
-### Projects
+### Project management
 | Tool | Description |
 |------|-------------|
-| `new_project` | Create empty project. |
-| `open_project` | Open a .qgz project. |
-| `save_project` | Save current project. |
+| `new_project` / `open_project` / `save_project` | Project lifecycle. |
 
-## MCP Skills (Resources)
+---
 
-Reference documents that guide the AI assistant's expertise:
+## MCP resources & prompts
 
-| Resource URI | Content |
-|-------------|---------|
-| `skill://smart-loading` | Smart Loading Pipeline — set_study_zone + smart_load, CRS handling, caching |
+### Resources (skill documents)
+
+| URI | Content |
+|-----|---------|
+| `skill://smart-loading` | Smart loading pipeline, CRS handling, caching |
 | `skill://pyqgis` | PyQGIS scripting patterns & API usage |
 | `skill://processing` | Processing algorithms guide (native, GDAL, GRASS) |
-| `skill://cartography` | Symbology, labels, print layouts, PDF export |
-| `skill://helpers` | Ready-made Python helpers (geocode, add_wfs, zoom_to, create_point_layer...) |
+| `skill://cartography` | Symbology, labels, layouts, PDF export |
+| `skill://helpers` | Python helpers (geocode, add_wfs, zoom_to, overpass_query...) |
 | `skill://data-sources` | French national datasets reference |
 | `skill://recipes` | Workflow recipes reference |
-| `skill://external-services` | Vision services integration (Moondream, SAMGeo3, DepthPro) |
+| `skill://external-services` | Vision services integration |
 | `skill://qgis-status` | Live QGIS instance status |
 
-## MCP Prompts
+### Prompts
 
 | Prompt | Description |
 |--------|-------------|
-| `analyse_territoire` | Template for territory analysis (zone + question). |
-| `workflow_donnees` | **Guided workflow** — theme-based loading (urbanisme, environnement, transport, agriculture, risques) with step-by-step instructions. |
+| `analyse_territoire` | Territory analysis template (zone + question) |
+| `workflow_donnees` | Guided theme-based workflow (urbanisme, environnement, transport, agriculture, risques) |
 
-## MCP App
+---
 
-An interactive QGIS view embedded directly in the Claude conversation:
+## Multi-user mode (beta)
 
-- **Live VNC viewer** — See and interact with QGIS in-conversation
-- **File upload** — Drag & drop files directly into the QGIS container
-- **Keyboard/mouse forwarding** — Full interaction without leaving the chat
-- **MJPEG fallback** — Lightweight stream for quick visual feedback
+Each authenticated user gets an isolated QGIS container with its own project, data, and noVNC session.
 
-## Example Workflows
+### Enable
 
-### Manual: Urban Analysis
-
-```
-User: "Analyse l'urbanisation autour de Montpellier"
-
-AI: [set_study_zone("Montpellier")]
-    → Geocodes, stores bbox, zooms canvas
-
-    [smart_load("osm_xyz")]              → OpenStreetMap basemap
-    [smart_load("bdtopo_batiments")]     → 10,000 buildings as GPKG
-    [smart_load("bdtopo_routes")]        → 5,000 road segments
-
-    [execute_python → density grid]      → 500m hex grid, graduated symbology
-    [apply_layout_template("a3_landscape", title="Densité bâtie — Montpellier")]
-    [export_pdf]                         → /data/densite_montpellier.pdf
+```bash
+# .env
+MULTI_USER_MODE=true
+JWT_SECRET=your-secret-key
+IDLE_TIMEOUT_MINUTES=30
 ```
 
-### Automated: Flood Risk with Recipe
+Uncomment the Docker socket volume in `docker-compose.yml`.
+
+### How it works
 
 ```
-User: "Analyse le risque inondation à Nîmes"
-
-AI: [run_recipe("risque_inondation", zone="Nimes")]
-    → Executes all steps automatically:
-      1. set_study_zone("Nimes")
-      2. smart_load basemap + buildings + flood zones
-      3. Buffer analysis (50m, 100m, 200m from flood zones)
-      4. Building exposure classification
-      5. Graduated symbology
-    → Returns screenshot + statistics
-
-    [export_flood_map(include_fields=["nature","usage","height"])]
-    → Interactive HTML with water height slider
-
-    [export_grist(html_path="/data/flood_map_nimes.html")]
-    → Grist document with editable tables + embedded map widget
+Agent A (Bearer: qgis_xxx)  →  Gateway (:8100)  →  Container-A (172.22.0.3:8080)
+Agent B (Bearer: qgis_yyy)  →  Gateway (:8100)  →  Container-B (172.22.0.4:8080)
 ```
 
-### Field Survey: QField Export
+- `POST /api/auth/register` → get API key (`qgis_...`)
+- All MCP calls with `Authorization: Bearer qgis_xxx` → routed to user's container
+- Containers auto-start on first call, auto-stop after idle timeout
+- Per-user data isolation (`/data/users/<user_id>/`)
+- GPU automatically passed to workers when available (NVIDIA Container Toolkit)
 
-```
-User: "Prépare un relevé terrain pour la commune de Sète"
+### Endpoints (multi-user)
 
-AI: [set_study_zone("Sète")]
-    [smart_load("bdtopo_batiments")]
-    [smart_load("bdtopo_routes")]
-    [set_layer_style("Batiments", type="categorized", field="usage")]
+| Method | Route | Purpose |
+|--------|-------|---------|
+| `POST` | `/api/auth/register` | Register user, get API key |
+| `POST` | `/api/auth/login` | Login, get token |
+| `GET` | `/api/session` | Current user's container info |
+| `GET` | `/api/sessions` | List all active sessions |
 
-    [export_qfield(project_name="releve_sete")]
-    → ZIP with .qgz + GPKGs + Observations layer (camera, dropdowns, date picker)
-    → Ready to load on QField mobile app
-```
+---
 
-## External Vision Services
+## GPU support
 
-Optional services accessible from PyQGIS scripts via HTTP:
+GPU is automatically detected at startup and passed through to all containers for compute workloads (GDAL CUDA, PyTorch, heavy raster processing). QGIS rendering stays on CPU (Xvfb limitation).
 
-| Service | Default URL | Purpose |
-|---------|-------------|---------|
-| Moondream | http://localhost:8001 | Image captioning, object detection, VQA |
-| SAMGeo3 | http://localhost:8002 | Geospatial segmentation |
-| DepthPro | http://localhost:8003 | Monocular depth estimation |
+Requirements:
+- NVIDIA GPU
+- [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/)
+- No configuration needed — auto-detection with graceful fallback to CPU
 
-Configure via environment variables (`MOONDREAM_URL`, `SAMGEO3_URL`, `DEPTHPRO_URL`).
+---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    QgisRemoteMCP Container                      │
+┌──────────────────────────────────────────────────────────────┐
+│                 QgisRemoteMCP Container                      │
 │                                                              │
 │  supervisord                                                 │
-│  ├── Xvfb :99                (virtual display 1920x1080)    │
-│  ├── fluxbox                 (window manager)               │
-│  ├── QGIS Desktop ◄─────────────────────┐                  │
-│  │   └── qgis_bridge.py    (startup)    │ UNIX socket      │
-│  ├── x11vnc → noVNC         (:6080)     │                  │
-│  ├── api_server.py           (:8080) ───┘                   │
-│  ├── main_mcp.py             (:8100) ───┘                   │
-│  └── stream_server.py        (:8081)                        │
+│  ├── Xvfb :99              (virtual display 1920x1080)      │
+│  ├── fluxbox               (window manager)                 │
+│  ├── QGIS Desktop ◄──────────────────┐                     │
+│  │   └── qgis_bridge.py  (startup)   │ UNIX socket         │
+│  ├── x11vnc → noVNC       (:6080)    │                     │
+│  ├── api_server.py         (:8080) ──┘                     │
+│  ├── main_mcp.py           (:8100)                          │
+│  └── stream_server.py      (:8081)                          │
 │                                                              │
-│  /data/          (user files, projects)                     │
-│  /data/cache/    (smart_load GPKG cache, 24h)               │
-│  /app/skills/    (MCP skill documents)                      │
-│  /app/datasources.json  (30+ pre-configured sources)        │
-└──────────┬──────────────────────────────────────────────────┘
-           │ HTTP (optional)
-    ┌──────┼──────────┐
-    ▼      ▼          ▼
-Moondream SAMGeo3  DepthPro     (external vision services)
+│  /data/          user files, projects, exports              │
+│  /data/cache/    smart_load GPKG cache (24h)                │
+│  /app/skills/    MCP resource documents                     │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### Communication Flow
+### Communication flow
 
 ```
-Claude Desktop / MCP Client
+MCP Client (Claude Desktop, Claude Code, any MCP client)
   │ JSON-RPC over Streamable HTTP (:8100)
   ▼
-main_mcp.py (MCP Server)
-  │ UNIX socket /tmp/qgis_bridge.sock
+main_mcp.py (MCP Server, 40 tools)
+  │ HTTP → api_server.py (:8080) → UNIX socket
   ▼
-qgis_bridge.py (runs inside QGIS, main thread)
+qgis_bridge.py (runs inside QGIS, Qt main thread)
   │ PyQGIS API (iface, QgsProject, processing)
   ▼
-QGIS Desktop (Xvfb display :99)
-  │ X11
-  ▼
-x11vnc → websockify → noVNC (:6080)
-  │ WebSocket
-  ▼
-User's browser
+QGIS Desktop (Xvfb :99) → x11vnc → noVNC (:6080) → browser
 ```
 
-## Development
+### Workflow context
 
-```bash
-# Source files are mounted as volumes — edit locally
-# Restart to apply changes:
-docker compose restart qgisremotemcp
+Every mutating tool response includes a `_context` with:
+- **phase**: setup / analysis / cartography / export (auto-detected)
+- **study_zone**: current zone name
+- **layers**: loaded layers with feature counts
+- **hint**: suggested next action
 
-# View logs
-docker compose logs -f qgisremotemcp
+This guides the AI through structured workflows without hard restrictions.
 
-# Test API
-curl http://localhost:8080/health
-curl -X POST http://localhost:8080/api/execute \
-  -H "Content-Type: application/json" \
-  -d '{"code": "result[\"v\"] = Qgis.version()"}'
+---
 
-# Test smart loading
-curl -X POST http://localhost:8080/api/execute \
-  -H "Content-Type: application/json" \
-  -d '{"code": "result.update(helpers.set_study_zone(\"Montpellier\"))", "timeout": 30}'
-```
-
-## Project Structure
+## Project structure
 
 ```
 QgisRemoteMCP/
-├── main_mcp.py             # MCP Server (40 tools, 10 resources, 3 prompts)
-├── datasources.json        # 30+ pre-configured data sources catalog
-├── qgis_app.html           # MCP App (interactive QGIS in conversation)
+├── main_mcp.py              # MCP Server (40 tools, 10 resources, 3 prompts)
+├── qgis_app.html            # MCP App (interactive QGIS in conversation)
+├── datasources.json         # 30+ pre-configured French data sources
 ├── src/
-│   ├── qgis_bridge.py      # Runs inside QGIS (UNIX socket bridge, 45 actions)
-│   ├── qgis_helpers.py     # Python helpers (geocode, smart loading, etc.)
-│   ├── api_server.py       # FastAPI REST API
-│   └── stream_server.py    # MJPEG stream
-├── skills/                 # MCP Resources (AI skill documents)
-│   ├── smart_loading.md
-│   ├── pyqgis.md
-│   ├── processing.md
-│   ├── cartography.md
-│   ├── helpers.md
-│   ├── data_sources.md
-│   └── external_services.md
-├── recipes/                # Workflow recipes (JSON)
-│   ├── densite_bati.json
-│   ├── urbanisme_general.json
-│   ├── risque_inondation.json
-│   ├── occupation_sol.json
-│   └── pression_fonciere_cotiere.json
-├── templates/              # Print layout templates (.qpt)
-│   ├── a3_landscape.qpt
-│   ├── a4_portrait.qpt
-│   └── web/                # Leaflet HTML templates
-│       ├── leaflet_template.html
-│       ├── leaflet_flood_template.html
-│       └── leaflet_temporal_template.html
-├── projects/               # QGIS project files (persisted)
-├── docs/                   # Architecture diagrams
+│   ├── qgis_bridge.py       # Runs inside QGIS (45 actions, Qt main thread)
+│   ├── qgis_helpers.py      # Python helpers (geocode, smart loading, etc.)
+│   ├── api_server.py        # FastAPI REST API (file upload/download, commands)
+│   ├── stream_server.py     # MJPEG stream
+│   ├── auth.py              # Authentication (multi-user mode)
+│   └── container_manager.py # Per-user Docker containers (multi-user mode)
+├── skills/                  # MCP Resources (AI skill documents)
+├── recipes/                 # Workflow recipes (JSON)
+├── templates/               # Print layouts (.qpt) + web map templates (Leaflet)
 ├── Dockerfile
 ├── docker-compose.yml
 ├── supervisord.conf
 ├── entrypoint.sh
 ├── requirements.txt
-└── CLAUDE.md
+├── .env.example
+├── CLAUDE.md                # AI assistant instructions
+├── CONTRIBUTING.md
+└── LICENSE                  # MIT
 ```
 
-## License
+---
 
-MIT
+## Development
+
+Source files are mounted as volumes in dev — edit locally, restart to apply:
+
+```bash
+docker compose restart qgisremotemcp
+docker compose logs -f qgisremotemcp
+```
+
+QGIS bridge changes require a full restart (loaded at QGIS startup via `PYQGIS_STARTUP`).
+
+### Testing
+
+```bash
+# Health
+curl http://localhost:8100/health
+
+# Execute Python
+curl -X POST http://localhost:8081/api/execute \
+  -H "Content-Type: application/json" \
+  -d '{"code": "result[\"version\"] = Qgis.version()"}'
+
+# Run a recipe
+curl -X POST http://localhost:8100/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"run_recipe","arguments":{"id":"risque_inondation","zone":"Nimes"}}}'
+```
+
+---
+
+## What works, what doesn't
+
+### Stable (single-user, Docker)
+
+- Full MCP server: 40 tools, 10 resources, 3 prompts, SSE streaming
+- Smart data loading pipeline: WFS → GPKG with pagination, R-tree, caching
+- All export formats: PDF, Leaflet (standard/flood/temporal), QField, Grist
+- PyQGIS scripting with `helpers` module (geocode, overpass, smart loading)
+- 1000+ Processing algorithms (native, GDAL, GRASS, SAGA)
+- MCP App: interactive QGIS in conversation (noVNC + file management)
+- Workflow recipes: 5 pre-built analysis templates
+- Print layouts: A3/A4 with dynamic labels
+
+### Beta — functional, needs hardening
+
+- **Multi-user mode**: per-user Docker containers with auth, session isolation, and idle cleanup. Tested with 2 concurrent users. Not yet tested at scale or in production.
+- **GPU passthrough**: auto-detected and passed to workers for CUDA/compute. Works with NVIDIA Container Toolkit. Xvfb rendering stays CPU.
+- **Grist HTML→Grist converter**: works with all tested Leaflet HTML files but edge cases may exist with unusual GeoJSON structures.
+
+### Known limitations
+
+- QGIS rendering uses Mesa llvmpipe (CPU) — Xvfb cannot use GPU for OpenGL
+- Single-file MCP server (`main_mcp.py`, ~2300 lines) — intentional for deployment simplicity
+- In-memory sessions in multi-user mode — no persistence across gateway restarts
+- No automated tests yet
+- French-focused data sources (IGN, BD TOPO) — extend `datasources.json` for other countries
+
+---
+
+## Compatible MCP clients
+
+Tested with:
+- [Claude Desktop](https://claude.ai/download) (Windows, macOS)
+- [Claude Code](https://claude.ai/claude-code) (CLI, VS Code, JetBrains)
+- Any MCP client supporting Streamable HTTP transport
+
+---
+
+## Tech stack
+
+- **QGIS 3.40+** · PyQGIS · Processing · GDAL/OGR 3.8
+- **Python 3.12** · FastAPI · uvicorn · httpx · MCP SDK
+- **Docker** · supervisord · Xvfb · fluxbox · x11vnc · noVNC
+- **MCP transport**: Streamable HTTP (spec 2025-03-26)
+- **No database**: all state in QGIS project + filesystem
+
+---
+
+## Contributing
+
+We welcome contributions — bug reports, feature ideas, or merge requests.
+
+### Particularly interested in
+
+- **Additional data sources** — extend `datasources.json` for non-French datasets
+- **New recipes** — workflow templates for common GIS analyses
+- **Testing** — automated tests, CI/CD pipeline
+- **Multi-user hardening** — HTTPS, rate limiting, session persistence
+- **Documentation** — usage guides, video demos, tutorials
+
+### How to contribute
+
+1. Fork the repo
+2. Create a feature branch (`git checkout -b feat/my-feature`)
+3. Test with a real QGIS container (`docker compose up -d`)
+4. Submit a merge request
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed guidelines.
+
+---
+
+## External vision services (optional)
+
+| Service | Default URL | Purpose |
+|---------|-------------|---------|
+| Moondream | http://localhost:8001 | Image captioning, VQA |
+| SAMGeo3 | http://localhost:8002 | Geospatial segmentation |
+| DepthPro | http://localhost:8003 | Monocular depth estimation |
+
+Configure via `MOONDREAM_URL`, `SAMGEO3_URL`, `DEPTHPRO_URL` in `.env`.
+
+---
 
 ## Credits
 
-- **BigApp pattern** from [BigBlenderMCP](https://github.com/nic01asFr/BigBlenderMCP)
 - **QGIS** — https://qgis.org
 - **noVNC** — https://novnc.com
 - **MCP** — https://modelcontextprotocol.io
-- **IGN Geoplateforme** — https://data.geopf.fr (free French national geodata)
-- **GDAL/OGR** — https://gdal.org (data conversion & download engine)
+- **IGN Geoplateforme** — https://data.geopf.fr
+- **GDAL/OGR** — https://gdal.org
+
+---
+
+## License
+
+[MIT](LICENSE) — Nicolas LAVAL, Cerema Méditerranée
