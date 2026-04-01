@@ -390,6 +390,115 @@ This guides the AI through structured workflows without hard restrictions.
 
 ---
 
+## Customization — skills, templates, recipes, data sources
+
+QgisRemoteMCP is designed to be specialized for specific domains. All customization is file-based — no code changes needed.
+
+### Skills (MCP Resources)
+
+Skills are Markdown documents in `skills/` that teach the AI how to work. The LLM reads them on demand via `skill://` URIs.
+
+```
+skills/
+├── smart_loading.md     # Data loading pipeline, CRS, caching
+├── pyqgis.md            # PyQGIS scripting patterns
+├── processing.md        # Processing algorithms (native, GDAL, GRASS)
+├── cartography.md       # Symbology, labels, layouts, PDF export
+├── helpers.md           # Ready-made Python helpers reference
+├── data_sources.md      # French national datasets
+├── recipes.md           # Workflow recipes reference
+└── external_services.md # Vision services (Moondream, SAMGeo3, DepthPro)
+```
+
+**To add a skill**: create `skills/my_domain.md`, then register it in `main_mcp.py`:
+- Add to `RESOURCES[]` with a `skill://my-domain` URI
+- Add to the `_SKILL_MAP` dict
+
+Example: a `skills/environnement.md` skill could document environmental analysis patterns (species habitats, noise mapping, air quality), making the AI an environmental GIS specialist.
+
+### Print layout templates (.qpt)
+
+QGIS print layout templates in `templates/`:
+
+| Template | Format | Content |
+|----------|--------|---------|
+| `a3_landscape.qpt` | A3 landscape | Title, subtitle, legend, scalebar, north arrow, data sources |
+| `a4_portrait.qpt` | A4 portrait | Same elements, portrait layout |
+
+Templates use QGIS expressions for dynamic labels: `[% @title %]`, `[% @subtitle %]`, `[% @data_sources %]`. Variables are set by `apply_layout_template()`.
+
+**To add a template**: create a `.qpt` file in QGIS Layout Manager → Export as Template. Place it in `templates/`. It's automatically available via `list_layout_templates` and `apply_layout_template`.
+
+### Web map templates (Leaflet HTML)
+
+Three specialized Leaflet templates in `templates/web/`:
+
+| Template | Use case | Key features |
+|----------|----------|-------------|
+| `leaflet_template.html` | General map | Layer toggle, popups, legend, basemap selector |
+| `leaflet_flood_template.html` | Flood analysis | Water height slider, building exposure stats, animation |
+| `leaflet_temporal_template.html` | Time series | Year slider, per-band stats, trend arrows, playback |
+
+Templates are plain HTML/JS with placeholder markers (`__LAYERS_DATA__`, `__TITLE__`) replaced at export time by the bridge.
+
+**To create a custom template**: copy an existing one, modify the HTML/JS, and register it in `qgis_bridge.py` as a new export action.
+
+### Recipes (JSON workflows)
+
+Recipes are step-by-step GIS workflows in `recipes/`:
+
+```json
+{
+  "id": "densite_bati",
+  "name": "Carte de densité du bâti",
+  "description": "Hex grid density analysis...",
+  "tags": ["urbanisme", "densité"],
+  "parameters": {
+    "zone": {"type": "string", "required": true}
+  },
+  "steps": [
+    {"action": "set_study_zone", "params": {"target": "{zone}"}},
+    {"action": "smart_load", "params": {"id": "bdtopo_batiments"}},
+    {"action": "run_processing", "params": {"algorithm": "native:creategrid", ...}},
+    {"action": "set_layer_style", "params": {...}}
+  ]
+}
+```
+
+**To add a recipe**: create a JSON file in `recipes/`. It's automatically available via `list_recipes`, `get_recipe`, and `run_recipe`. Parameters like `{zone}` are substituted at runtime.
+
+### Data sources catalog
+
+`datasources.json` contains 30+ pre-configured French data sources. Each entry:
+
+```json
+{
+  "id": "bdtopo_batiments",
+  "name": "Bâtiments (BD TOPO)",
+  "category": "topography",
+  "type": "wfs",
+  "url": "https://data.geopf.fr/wfs/ows",
+  "typename": "BDTOPO_V3:batiment",
+  "description": "Buildings with usage, height, materials"
+}
+```
+
+**To add a source**: add an entry to `datasources.json`. Supported types: `wfs` (downloaded as GPKG via smart_load), `wms`, `wmts`, `xyz` (streaming), `api` (custom).
+
+### Specialization patterns
+
+To create a domain-specific QGIS MCP server:
+
+1. **Add domain skills** — `skills/urbanisme.md`, `skills/hydrologie.md`, etc.
+2. **Add domain data sources** — extend `datasources.json` with relevant WFS/WMS
+3. **Create domain recipes** — automated workflows for common analyses
+4. **Design layout templates** — branded `.qpt` with your organization's logo and style
+5. **Customize web templates** — adapt Leaflet HTML templates for your visualization needs
+
+The same Docker image serves all specializations — everything is configured through mounted files.
+
+---
+
 ## Project structure
 
 ```
