@@ -100,9 +100,27 @@ async def _ensure_session(user_id: str) -> None:
     if not MULTI_USER_MODE or container_manager is None:
         return
     session = container_manager.get_session(user_id)
-    if session and session.status == "ready":
-        container_manager.touch_session(user_id)
-        return
+    if session:
+        # Container exists and Docker reports it running (get_session checks that).
+        # If marked "unhealthy" by our wait loop, re-probe — QGIS may be ready now.
+        if session.status == "ready":
+            container_manager.touch_session(user_id)
+            return
+        if session.status == "unhealthy":
+            # Re-check health before giving up and spawning a new container
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    r = await client.get(f"{session.internal_api_url}/health")
+                    if r.status_code == 200:
+                        session.status = "ready"
+                        container_manager.touch_session(user_id)
+                        print(f"[QgisRemoteMCP] Container for user={user_id} recovered → ready")
+                        return
+            except Exception:
+                pass
+            # Still unhealthy — stop the old container before spawning a new one
+            print(f"[QgisRemoteMCP] Container for user={user_id} still unhealthy, replacing…")
+            await container_manager.stop_session(user_id)
     # Start a new container — this blocks for ~30-60 s on first call
     print(f"[QgisRemoteMCP] Starting QGIS container for user={user_id} …")
     await container_manager.start_session(user_id)
@@ -110,12 +128,24 @@ async def _ensure_session(user_id: str) -> None:
 
 # ── QGIS Bridge client ───────────────────────────────────────────
 
-def _get_user_api_port() -> int:
-    """Return the api_server port for the current user.
+def _get_user_api_base_url() -> str:
+    """Return the base URL for the current user's api_server.
 
-    Single-user mode  → fixed port (API_PORT env var, default 8080).
-    Multi-user mode   → dynamic port from container_manager session.
-    Falls back to the single-user port if no session is found.
+    Single-user mode  → http://localhost:<API_PORT>
+    Multi-user mode   → http://<container_ip>:8080 (internal Docker network)
+    Falls back to the single-user URL if no session is found.
+    """
+    if MULTI_USER_MODE and container_manager is not None:
+        uid = current_user_id.get("default")
+        session = container_manager.sessions.get(uid)
+        if session:
+            return session.internal_api_url
+    return f"http://localhost:{_SINGLE_USER_API_PORT}"
+
+
+def _get_user_api_port() -> int:
+    """Return the host-mapped api_server port (for external-facing URLs like download_url).
+    In multi-user mode returns the host port, not the internal container port.
     """
     if MULTI_USER_MODE and container_manager is not None:
         uid = current_user_id.get("default")
@@ -134,8 +164,8 @@ def qgis_command(action: str, params: dict = None, timeout: int = None) -> dict:
     POST /api/command → UNIX socket → bridge — no bridge changes needed.
     """
     effective_timeout = timeout or SOCKET_TIMEOUT
-    port = _get_user_api_port()
-    url = f"http://localhost:{port}/api/command"
+    base_url = _get_user_api_base_url()
+    url = f"{base_url}/api/command"
     try:
         with httpx.Client(timeout=effective_timeout) as client:
             resp = client.post(url, json={"action": action, "params": params or {}})
@@ -1098,10 +1128,10 @@ def _tool_upload_file(arguments: dict) -> dict:
     name = arguments["name"]
     url = arguments.get("url")
     content_base64 = arguments.get("content_base64")
+    base_url = _get_user_api_base_url()
     api_port = _get_user_api_port()
 
-    # Build the public multipart endpoint — always returned in response
-    # Use the MCP server's own host (request origin) for remote access
+    # Public endpoint for external clients (host-mapped port)
     upload_endpoint = f"http://localhost:{api_port}/api/upload"
 
     if url:
@@ -1112,7 +1142,7 @@ def _tool_upload_file(arguments: dict) -> dict:
                     dl.raise_for_status()
                     data = dl.read()
                 files = {"file": (name, data, "application/octet-stream")}
-                resp = client.post(f"http://localhost:{api_port}/api/upload", files=files)
+                resp = client.post(f"{base_url}/api/upload", files=files)
                 resp.raise_for_status()
                 result = resp.json()
                 result["upload_endpoint"] = upload_endpoint

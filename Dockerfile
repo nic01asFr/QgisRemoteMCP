@@ -129,7 +129,8 @@ COPY recipes/ /app/recipes/
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY entrypoint.sh /app/
 
-RUN chmod +x /app/entrypoint.sh /app/maximize_qgis.sh
+RUN sed -i 's/\r$//' /app/entrypoint.sh /app/maximize_qgis.sh && \
+    chmod +x /app/entrypoint.sh /app/maximize_qgis.sh
 
 # ── QGIS startup script (auto-loads bridge on QGIS launch) ──────
 RUN cp /app/src/qgis_bridge.py \

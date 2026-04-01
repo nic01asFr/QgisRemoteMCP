@@ -75,9 +75,12 @@ services:
       - ./skills:/app/skills:ro
       - ./templates:/app/templates:ro
       - ./recipes:/app/recipes:ro
-      # ── Multi-user: Docker socket (uncomment to enable) ───────────
+      # ── Multi-user: Docker socket ─────────────────────────────────
       # Required for MULTI_USER_MODE=true — lets the gateway spawn user containers.
-      # - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - default
+      - qgis-net
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
@@ -87,3 +90,7 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
+
+networks:
+  qgis-net:
+    external: true

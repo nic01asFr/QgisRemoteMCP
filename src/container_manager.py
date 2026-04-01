@@ -51,9 +51,10 @@ class UserSession:
     user_id:      str
     session_id:   str
     container_id: str
-    api_port:     int
+    api_port:     int          # host-mapped port (for external access / noVNC URLs)
     stream_port:  int
     novnc_port:   int
+    container_ip: str = ""     # internal Docker network IP (for gateway→worker calls)
     created_at:   float = field(default_factory=time.time)
     last_activity: float = field(default_factory=time.time)
     status:       str = "starting"   # starting | ready | unhealthy | stopping
@@ -66,10 +67,19 @@ class UserSession:
             "api_port":      self.api_port,
             "stream_port":   self.stream_port,
             "novnc_port":    self.novnc_port,
+            "container_ip":  self.container_ip,
             "created_at":    self.created_at,
             "last_activity": self.last_activity,
             "status":        self.status,
         }
+
+    @property
+    def internal_api_url(self) -> str:
+        """URL to reach the worker's API from within the Docker network."""
+        if self.container_ip:
+            return f"http://{self.container_ip}:{_CONTAINER_API_PORT}"
+        # Fallback to host-mapped port (works when gateway runs on host)
+        return f"http://localhost:{self.api_port}"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -211,6 +221,13 @@ class ContainerManager:
             env=env,
         )
 
+        # Get container's internal IP on the Docker network
+        container.reload()
+        container_ip = ""
+        networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+        if self.network_name in networks:
+            container_ip = networks[self.network_name].get("IPAddress", "")
+
         session = UserSession(
             user_id=user_id,
             session_id=uuid.uuid4().hex,
@@ -218,8 +235,10 @@ class ContainerManager:
             api_port=api_p,
             stream_port=str_p,
             novnc_port=vnc_p,
+            container_ip=container_ip,
         )
         self.sessions[user_id] = session
+        print(f"[ContainerManager] Container IP: {container_ip} (network={self.network_name})")
 
         # Wait for health (non-blocking from caller perspective)
         await self._wait_for_healthy(session)
@@ -276,7 +295,7 @@ class ContainerManager:
         if not session:
             return {"error": f"No active session for user {user_id}"}
 
-        url = f"http://localhost:{session.api_port}{endpoint}"
+        url = f"{session.internal_api_url}{endpoint}"
         self.touch_session(user_id)
 
         try:
@@ -338,7 +357,7 @@ class ContainerManager:
 
     async def _wait_for_healthy(self, session: UserSession, timeout: float = 120.0) -> None:
         """Poll /health until 200 or timeout."""
-        url = f"http://localhost:{session.api_port}/health"
+        url = f"{session.internal_api_url}/health"
         deadline = time.time() + timeout
         attempt = 0
 
