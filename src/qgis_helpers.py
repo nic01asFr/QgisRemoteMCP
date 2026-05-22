@@ -245,9 +245,9 @@ def _try_resolve_arrondissement(name: str) -> str | None:
             return f"6938{int(cp[3:5])}"
         return None
 
-    # 2) "Marseille|Paris|Lyon Ne arrondissement"
+    # 2a) Ville PUIS numéro : "Marseille 4e", "Paris 11ème"
     m = _re.search(
-        r"\b(marseille|paris|lyon)\b.*?\b(\d{1,2})\s*(?:e|er|ème|eme|ieme)\b",
+        r"\b(marseille|paris|lyon)\b.*?\b(\d{1,2})\s*(?:e|er|ème|eme|ieme|ième)\b",
         s,
     )
     if m:
@@ -260,10 +260,28 @@ def _try_resolve_arrondissement(name: str) -> str | None:
         if city == "lyon" and 1 <= n <= 9:
             return f"6938{n}"
 
-    # 3) "CP + ville" : "13004 Marseille", "75011 paris"
-    m = _re.search(r"\b(\d{5})\b.*?\b(marseille|paris|lyon)\b", s)
+    # 2b) Numéro PUIS ville : "4e arrondissement de Marseille", "11ème Paris"
+    m = _re.search(
+        r"\b(\d{1,2})\s*(?:e|er|ème|eme|ieme|ième)\b[^.]*?\b(marseille|paris|lyon)\b",
+        s,
+    )
     if m:
-        cp, city = m.group(1), m.group(2)
+        n_str, city = m.group(1), m.group(2)
+        n = int(n_str)
+        if city == "marseille" and 1 <= n <= 16:
+            return f"132{n:02d}"
+        if city == "paris" and 1 <= n <= 20:
+            return f"751{n:02d}"
+        if city == "lyon" and 1 <= n <= 9:
+            return f"6938{n}"
+
+    # 3) "CP + ville" : "13004 Marseille", "75011 paris" (ordre indifférent)
+    m = (_re.search(r"\b(\d{5})\b.*?\b(marseille|paris|lyon)\b", s)
+         or _re.search(r"\b(marseille|paris|lyon)\b.*?\b(\d{5})\b", s))
+    if m:
+        a, b = m.group(1), m.group(2)
+        cp = a if a.isdigit() else b
+        city = b if a.isdigit() else a
         if city == "marseille" and cp.startswith("130") and 1 <= int(cp[3:5]) <= 16:
             return f"132{int(cp[3:5]):02d}"
         if city == "paris" and cp.startswith("750") and 1 <= int(cp[3:5]) <= 20:
