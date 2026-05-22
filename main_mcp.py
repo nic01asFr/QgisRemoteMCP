@@ -732,6 +732,7 @@ RESOURCES = [
     {"uri": "skill://helpers", "name": "Python Helpers", "description": "Ready-made Python functions for execute_python (geocode, add_wfs, zoom_to, etc.).", "mimeType": "text/plain"},
     {"uri": "skill://smart-loading", "name": "Smart Loading Pipeline", "description": "Guided data loading: set_study_zone + smart_load (ogr2ogr + GeoPackage). CRS handling, caching, best practices.", "mimeType": "text/plain"},
     {"uri": "skill://recipes", "name": "Recipes Guide", "description": "Workflow recipes: reproducible step-by-step GIS analyses. Use list_recipes + get_recipe.", "mimeType": "text/plain"},
+    {"uri": "skill://solar", "name": "Solar Pipeline", "description": "Cadastre solaire: irradiance, r.sun, ray-marching, facade analysis, z-scores. Configurable profiles (rapide/standard/precision).", "mimeType": "text/plain"},
     {"uri": "skill://qgis-status", "name": "QGIS Status", "description": "Current QGIS instance status.", "mimeType": "text/plain"},
 ]
 
@@ -744,6 +745,7 @@ SKILL_MAP = {
     "skill://helpers": "helpers",
     "skill://smart-loading": "smart_loading",
     "skill://recipes": "recipes",
+    "skill://solar": "solar",
 }
 
 # ══════════════════════════════════════════════════════════════════

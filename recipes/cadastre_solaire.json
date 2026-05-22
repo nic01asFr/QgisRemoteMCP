@@ -1,0 +1,130 @@
+{
+  "id": "cadastre_solaire",
+  "name": "Cadastre solaire",
+  "description": "Analyse d'ensoleillement d'un territoire : irradiance annuelle, heures de soleil mensuelles, analyse par façade et étage. Produit un raster d'irradiance sur MNT + un GPKG de façades enrichies. Trois profils de calcul : rapide (2-5 min), standard (10-30 min), precision (30 min - 4h).",
+  "tags": ["solaire", "énergie", "urbanisme", "cadastre", "irradiance", "ensoleillement"],
+  "parameters": {
+    "zone": {
+      "type": "string",
+      "required": true,
+      "description": "Commune ou adresse (ex: 'Marseille 4ème', 'Montpellier', 'Lyon 3ème')"
+    },
+    "profil": {
+      "type": "string",
+      "required": false,
+      "default": "standard",
+      "description": "Profil de calcul : 'rapide' (10m, 4 mois, ~2-5 min), 'standard' (5m, 12 mois, ~10-30 min), 'precision' (1m, 12 mois, ~30 min-4h)"
+    }
+  },
+  "steps": [
+    {
+      "id": "zone",
+      "action": "set_study_zone",
+      "params": {"target": "{zone}", "buffer_km": 0.2},
+      "description": "Définir la zone d'étude avec buffer 200m pour les ombres"
+    },
+    {
+      "id": "basemap",
+      "action": "smart_load",
+      "params": {"id": "ign_planign"},
+      "description": "Charger le fond de plan IGN"
+    },
+    {
+      "id": "batiments",
+      "action": "smart_load",
+      "params": {"id": "bdtopo_batiments"},
+      "description": "Télécharger les bâtiments BD TOPO (emprise, hauteur, étages)"
+    },
+    {
+      "id": "voirie",
+      "action": "smart_load",
+      "params": {"id": "bdtopo_routes"},
+      "description": "Télécharger la voirie BD TOPO pour l'analyse rues"
+    },
+    {
+      "id": "rge_alti",
+      "action": "execute_python",
+      "params": {
+        "code": "# Télécharger le RGE ALTI (MNT haute résolution)\nzone = helpers.get_study_zone()\nbbox = zone['bbox_4326']\nresolution = {profil_resolution}\nresult.update(helpers.download_rge_alti(bbox, resolution=resolution))",
+        "timeout": 120
+      },
+      "description": "Télécharger le RGE ALTI IGN (MNT haute résolution)"
+    },
+    {
+      "id": "dsm_hybride",
+      "action": "execute_python",
+      "params": {
+        "code": "# Construire le DSM hybride (MNT + hauteurs bâtiments)\nimport solar_pipeline\nconfig = solar_pipeline.get_config('{profil}')\nresult.update(solar_pipeline.build_dsm(config))",
+        "timeout": 180
+      },
+      "description": "Fusion MNT + hauteurs BD TOPO → DSM hybride"
+    },
+    {
+      "id": "rsun",
+      "action": "execute_python",
+      "params": {
+        "code": "# Calculer l'irradiance avec GRASS r.sun\nimport solar_pipeline\nconfig = solar_pipeline.get_config('{profil}')\nresult.update(solar_pipeline.run_rsun(config))",
+        "timeout": 3600
+      },
+      "description": "Calcul r.sun mensuel (irradiance globale + heures d'insolation)"
+    },
+    {
+      "id": "irradiance_annuelle",
+      "action": "execute_python",
+      "params": {
+        "code": "# Agréger les 12 mois → irradiance annuelle\nimport solar_pipeline\nresult.update(solar_pipeline.aggregate_annual())",
+        "timeout": 120
+      },
+      "description": "Agrégation annuelle pondérée des 12 mois"
+    },
+    {
+      "id": "apply_raster",
+      "action": "execute_python",
+      "params": {
+        "code": "# Appliquer l'irradiance sur le MNT dans QGIS\nimport solar_pipeline\nresult.update(solar_pipeline.apply_to_mnt())",
+        "timeout": 60
+      },
+      "description": "Appliquer le raster d'irradiance sur le MNT avec rampe de couleurs"
+    },
+    {
+      "id": "facades",
+      "action": "execute_python",
+      "params": {
+        "code": "# Analyser les façades (ray-marching)\nimport solar_pipeline\nconfig = solar_pipeline.get_config('{profil}')\nresult.update(solar_pipeline.analyze_facades(config))",
+        "timeout": 3600
+      },
+      "description": "Ray-marching DSM pour chaque façade × étage × timestep"
+    },
+    {
+      "id": "scores",
+      "action": "execute_python",
+      "params": {
+        "code": "# Calculer les scores (soleil, canicule, confort, z-score)\nimport solar_pipeline\nresult.update(solar_pipeline.compute_scores())",
+        "timeout": 120
+      },
+      "description": "Scores annuels + z-score local par façade"
+    },
+    {
+      "id": "style",
+      "action": "set_layer_style",
+      "params": {
+        "layer": "irradiance_annuelle",
+        "type": "graduated",
+        "field": "irradiance_kwh",
+        "n_classes": 7,
+        "color_ramp": "RdYlBu_r"
+      },
+      "description": "Appliquer une symbologie graduée sur l'irradiance"
+    },
+    {
+      "id": "layout",
+      "action": "apply_layout_template",
+      "params": {
+        "template": "a3_landscape",
+        "title": "Cadastre solaire — {zone}",
+        "subtitle": "Irradiance annuelle (kWh/m²/an) — Profil {profil}"
+      },
+      "description": "Préparer la mise en page A3"
+    }
+  ]
+}

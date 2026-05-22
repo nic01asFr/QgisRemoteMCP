@@ -217,38 +217,94 @@ def reverse_geocode(lon, lat):
     }
 
 
-def search_commune(name):
-    """Search for a French commune using the Geo API.
+def _try_resolve_arrondissement(name: str) -> str | None:
+    """Détecte les arrondissements municipaux (Paris/Marseille/Lyon) et
+    retourne le code INSEE direct (5 chiffres). `geo.api.gouv.fr/communes?nom=`
+    n'indexe pas ces communes ; il faut utiliser `/communes/{insee}` direct.
 
-    Returns:
-        {"nom", "code", "codesPostaux", "population", "lon", "lat", "bbox"}
-        or {"error": "..."}.
+    Patterns reconnus :
+      - "Marseille 4e", "Marseille 4ème arrondissement", "Marseille 04"
+      - "Paris 11e", "Paris 11ème arrondissement"
+      - "Lyon 3e", "Lyon 3ème"
+      - "13004" (CP Marseille → 13204), "75011" (CP Paris → 75111), "69003" (CP Lyon → 69383)
 
-    Example:
-        commune = helpers.search_commune("Nimes")
+    Codes INSEE : Marseille 13201-16, Paris 75101-20, Lyon 69381-89.
     """
-    data = fetch_json("https://geo.api.gouv.fr/communes",
-                      {"nom": name, "fields": "nom,code,codesPostaux,"
-                       "population,centre,contour", "limit": 1}, timeout=5)
+    import re as _re
+    s = (name or "").strip().lower()
+
+    # 1) Code postal pur 5 chiffres → arrondissement si CP correspondant
+    m = _re.match(r"^(\d{5})$", s)
+    if m:
+        cp = m.group(1)
+        if cp.startswith("130") and 1 <= int(cp[3:5]) <= 16:  # 13001-13016
+            return f"132{int(cp[3:5]):02d}"
+        if cp.startswith("750") and 1 <= int(cp[3:5]) <= 20:  # 75001-75020
+            return f"751{int(cp[3:5]):02d}"
+        if cp.startswith("690") and 1 <= int(cp[3:5]) <= 9:   # 69001-69009
+            return f"6938{int(cp[3:5])}"
+        return None
+
+    # 2) "Marseille|Paris|Lyon Ne arrondissement"
+    m = _re.search(
+        r"\b(marseille|paris|lyon)\b.*?\b(\d{1,2})\s*(?:e|er|ème|eme|ieme)\b",
+        s,
+    )
+    if m:
+        city, n_str = m.group(1), m.group(2)
+        n = int(n_str)
+        if city == "marseille" and 1 <= n <= 16:
+            return f"132{n:02d}"
+        if city == "paris" and 1 <= n <= 20:
+            return f"751{n:02d}"
+        if city == "lyon" and 1 <= n <= 9:
+            return f"6938{n}"
+
+    # 3) "CP + ville" : "13004 Marseille", "75011 paris"
+    m = _re.search(r"\b(\d{5})\b.*?\b(marseille|paris|lyon)\b", s)
+    if m:
+        cp, city = m.group(1), m.group(2)
+        if city == "marseille" and cp.startswith("130") and 1 <= int(cp[3:5]) <= 16:
+            return f"132{int(cp[3:5]):02d}"
+        if city == "paris" and cp.startswith("750") and 1 <= int(cp[3:5]) <= 20:
+            return f"751{int(cp[3:5]):02d}"
+        if city == "lyon" and cp.startswith("690") and 1 <= int(cp[3:5]) <= 9:
+            return f"6938{int(cp[3:5])}"
+
+    return None
+
+
+def _commune_by_insee(insee: str) -> dict:
+    """Lookup direct d'une commune par code INSEE (5 chiffres), via
+    `geo.api.gouv.fr/communes/{insee}`. Cet endpoint résout aussi les
+    arrondissements municipaux que `?nom=` n'indexe pas."""
+    data = fetch_json(
+        f"https://geo.api.gouv.fr/communes/{insee}",
+        {"fields": "nom,code,codesPostaux,population,centre,contour"},
+        timeout=5,
+    )
     if "error" in data:
         return data
-    if not data or not isinstance(data, list) or len(data) == 0:
-        return {"error": f"Commune not found: {name}"}
-    c = data[0]
+    if not isinstance(data, dict) or "code" not in data:
+        return {"error": f"Commune INSEE {insee} introuvable"}
+    return _commune_to_result(data)
+
+
+def _commune_to_result(c: dict) -> dict:
+    """Transforme une réponse /communes en dict normalisé avec lon/lat/bbox."""
     result = {
         "nom": c.get("nom", ""),
         "code": c.get("code", ""),
         "codesPostaux": c.get("codesPostaux", []),
         "population": c.get("population", 0),
     }
-    centre = c.get("centre", {}).get("coordinates", [])
+    centre = (c.get("centre") or {}).get("coordinates") or []
     if centre:
         result["lon"] = centre[0]
         result["lat"] = centre[1]
-    contour = c.get("contour", {})
+    contour = c.get("contour") or {}
     geo_type = contour.get("type", "")
-    raw_coords = contour.get("coordinates", [])
-    # Flatten all coordinate points regardless of Polygon/MultiPolygon
+    raw_coords = contour.get("coordinates") or []
     all_points = []
     if geo_type == "MultiPolygon":
         for polygon in raw_coords:
@@ -258,7 +314,6 @@ def search_commune(name):
         for ring in raw_coords:
             all_points.extend(ring)
     elif raw_coords and raw_coords[0]:
-        # Fallback: try to flatten
         for ring in raw_coords:
             if isinstance(ring, list) and ring and isinstance(ring[0], (int, float)):
                 all_points.append(ring)
@@ -271,6 +326,43 @@ def search_commune(name):
         lats = [p[1] for p in all_points]
         result["bbox"] = [min(lons), min(lats), max(lons), max(lats)]
     return result
+
+
+def search_commune(name):
+    """Search for a French commune using the Geo API.
+
+    Stratégie en 2 niveaux pour gérer correctement les arrondissements
+    municipaux Paris/Marseille/Lyon (que `?nom=` n'indexe pas) :
+
+    1. Détection regex → INSEE direct (ex: "Marseille 4e" → 13204)
+    2. Fallback `?nom=...&limit=1` pour les communes "normales"
+
+    Returns:
+        {"nom", "code", "codesPostaux", "population", "lon", "lat", "bbox"}
+        or {"error": "..."}.
+
+    Example:
+        commune = helpers.search_commune("Nimes")
+        commune = helpers.search_commune("Marseille 4e arrondissement")
+        commune = helpers.search_commune("13004 Marseille")
+    """
+    # 1) Détection arrondissement municipal → lookup direct par INSEE
+    insee = _try_resolve_arrondissement(name)
+    if insee:
+        r = _commune_by_insee(insee)
+        if "error" not in r:
+            return r
+        # Si lookup INSEE échoue, on tente quand même le fallback nom
+
+    # 2) Fallback : recherche par nom (cas commun)
+    data = fetch_json("https://geo.api.gouv.fr/communes",
+                      {"nom": name, "fields": "nom,code,codesPostaux,"
+                       "population,centre,contour", "limit": 1}, timeout=5)
+    if "error" in data:
+        return data
+    if not data or not isinstance(data, list) or len(data) == 0:
+        return {"error": f"Commune not found: {name}"}
+    return _commune_to_result(data[0])
 
 
 def get_elevation(lon, lat):
