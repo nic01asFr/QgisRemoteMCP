@@ -292,6 +292,51 @@ def _try_resolve_arrondissement(name: str) -> str | None:
     return None
 
 
+# INSEE des communes principales pour Paris/Marseille/Lyon (centre-ville),
+# à utiliser quand le nom est cité sans numéro d'arrondissement.
+# Sinon `/communes?nom=Marseille` retourne "Marseillette" (Aude, 11220)
+# avant Marseille car ordre alphabétique.
+_MAJOR_CITY_INSEE = {
+    "marseille": "13055",
+    "paris": "75056",
+    "lyon": "69123",
+}
+
+
+def _try_resolve_major_city(name: str) -> str | None:
+    """Détecte Marseille/Paris/Lyon cités SEULS (sans numéro d'arrondissement,
+    sans code postal) et retourne le code INSEE de la commune principale.
+
+    Raison : `/communes?nom=Marseille` retourne "Marseillette" (11220, Aude)
+    en premier à cause de l'ordre alphabétique sur le code INSEE. Ce helper
+    intercepte ce cas avant le fallback fuzzy.
+
+    Patterns reconnus :
+      - "Marseille", "marseille", "MARSEILLE"
+      - "ville de Marseille", "à Marseille"
+      - PAS "Marseille 4e" (capturé par _try_resolve_arrondissement)
+      - PAS "13004 Marseille" (idem)
+
+    Returns:
+        Code INSEE 5 chiffres (13055, 75056, 69123) ou None.
+    """
+    import re as _re
+    s = (name or "").strip().lower()
+    if not s:
+        return None
+
+    # Rejeter si la chaîne contient un nombre (probable CP ou n° arrondt)
+    if _re.search(r"\d", s):
+        return None
+
+    # Vérifier qu'un des noms de ville majeure apparaît comme mot entier
+    for city, insee in _MAJOR_CITY_INSEE.items():
+        if _re.search(rf"\b{city}\b", s):
+            return insee
+
+    return None
+
+
 def _commune_by_insee(insee: str) -> dict:
     """Lookup direct d'une commune par code INSEE (5 chiffres), via
     `geo.api.gouv.fr/communes/{insee}`. Cet endpoint résout aussi les
@@ -349,11 +394,15 @@ def _commune_to_result(c: dict) -> dict:
 def search_commune(name):
     """Search for a French commune using the Geo API.
 
-    Stratégie en 2 niveaux pour gérer correctement les arrondissements
-    municipaux Paris/Marseille/Lyon (que `?nom=` n'indexe pas) :
+    Stratégie en 3 niveaux pour gérer correctement les arrondissements
+    municipaux Paris/Marseille/Lyon (que `?nom=` n'indexe pas) et éviter
+    les faux positifs alphabétiques (Marseille → Marseillette) :
 
-    1. Détection regex → INSEE direct (ex: "Marseille 4e" → 13204)
-    2. Fallback `?nom=...&limit=1` pour les communes "normales"
+    1. Détection arrondissement (ville + numéro / CP) → INSEE direct
+       (ex: "Marseille 4e" → 13204, "13004 Marseille" → 13204)
+    2. Détection ville majeure seule → INSEE principal direct
+       (ex: "Marseille" → 13055, pas Marseillette/Aude)
+    3. Fallback `?nom=...&limit=1` pour les communes "normales"
 
     Returns:
         {"nom", "code", "codesPostaux", "population", "lon", "lat", "bbox"}
@@ -361,8 +410,9 @@ def search_commune(name):
 
     Example:
         commune = helpers.search_commune("Nimes")
-        commune = helpers.search_commune("Marseille 4e arrondissement")
-        commune = helpers.search_commune("13004 Marseille")
+        commune = helpers.search_commune("Marseille")               # → 13055
+        commune = helpers.search_commune("Marseille 4e arrondissement")  # → 13204
+        commune = helpers.search_commune("13004 Marseille")         # → 13204
     """
     # 1) Détection arrondissement municipal → lookup direct par INSEE
     insee = _try_resolve_arrondissement(name)
@@ -372,7 +422,14 @@ def search_commune(name):
             return r
         # Si lookup INSEE échoue, on tente quand même le fallback nom
 
-    # 2) Fallback : recherche par nom (cas commun)
+    # 2) Détection ville majeure seule (Paris/Marseille/Lyon sans numéro)
+    insee = _try_resolve_major_city(name)
+    if insee:
+        r = _commune_by_insee(insee)
+        if "error" not in r:
+            return r
+
+    # 3) Fallback : recherche par nom (cas commun)
     data = fetch_json("https://geo.api.gouv.fr/communes",
                       {"nom": name, "fields": "nom,code,codesPostaux,"
                        "population,centre,contour", "limit": 1}, timeout=5)
