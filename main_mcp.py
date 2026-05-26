@@ -716,6 +716,17 @@ TOOLS = [
         }
     },
     {
+        "name": "restart_qgis_engine",
+        "description": "Force le respawn du processus QGIS quand le bridge est dégradé/deadlocké (timeouts répétés, erreurs muettes, gateway timeout). À utiliser SEULEMENT en dernier recours quand 2+ tools spatiaux consécutifs échouent avec des erreurs d'infra. NE PAS utiliser pour récupérer d'une erreur de code (NoneType, mauvais args, etc.). QGIS respawne en 5-15s ; les tools spatiaux échoueront pendant cette fenêtre. Toujours expliquer à l'user pourquoi tu redémarres avant d'appeler.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string", "description": "Raison du restart (logged)"}
+            },
+            "required": []
+        }
+    },
+    {
         "name": "publish_artifact",
         "description": "Publie un livrable (storymap, flux, recipe, dataset, pdf) sur S3 via le hub. POST {HUB_URL}/publish/{kind}/{slug}. Retourne hub_url public stable à donner à l'user. Le fichier doit déjà exister sur le workspace au chemin par défaut /data/studies/{sid}/exports/{kind}/{slug}.{ext} (ou /data/exports/{kind}/{slug}.{ext} hors étude), sauf si tu passes source explicite. Requiert HUB_URL + HUB_API_KEY env. Préfère ce tool plutôt qu'un urllib brut en execute_python.",
         "inputSchema": {
@@ -1428,6 +1439,42 @@ def _tool_get_recipe(arguments: dict) -> dict:
     return {"content": _text(response, indent=2)}
 
 
+def _tool_restart_qgis_engine(arguments: dict) -> dict:
+    """Force le respawn du processus QGIS quand le bridge est dégradé/deadlocké.
+
+    À utiliser SEULEMENT quand 2+ tools consécutifs ont échoué avec des erreurs
+    d'infra (timeouts, erreurs muettes, gateway timeout). NE PAS utiliser
+    pour récupérer d'une simple erreur de code utilisateur.
+
+    Renvoie immédiatement. QGIS respawne en ~5-15s via supervisord ; pendant
+    cette fenêtre, les appels QGIS échoueront. Attendre puis polling health.
+    """
+    import os as _os
+    import urllib.request as _ur
+    import urllib.error as _ue
+    import json as _json
+    # On cible l'api_server local (cluster-internal) car c'est lui qui sait
+    # localiser le PID qgis.bin du conteneur courant.
+    api_url = _os.environ.get("LOCAL_API_URL", "http://localhost:8080")
+    url = f"{api_url.rstrip('/')}/api/restart_qgis"
+    try:
+        req = _ur.Request(url, data=b"{}", method="POST",
+                          headers={"Content-Type": "application/json"})
+        with _ur.urlopen(req, timeout=10) as r:
+            data = _json.loads(r.read().decode("utf-8", errors="replace"))
+        return {"content": _text({
+            "success": data.get("ok", False),
+            "killed_pids": data.get("killed_pids", []),
+            "message": data.get("message")
+                       or "QGIS respawn déclenché — attends 10-15s avant de retenter.",
+        }, indent=2)}
+    except _ue.HTTPError as e:
+        body_txt = e.read().decode("utf-8", errors="replace")[:200]
+        return _error(f"Restart QGIS HTTP {e.code} : {body_txt}")
+    except Exception as e:
+        return _error(f"Restart QGIS failed ({type(e).__name__}): {e}")
+
+
 # ── Publish artifact to hub S3 (storymap, flux, recipe, dataset, pdf) ─
 
 _PUBLISH_KINDS = frozenset({"storymap", "flux", "recipe", "dataset", "pdf"})
@@ -1797,6 +1844,7 @@ TOOL_HANDLERS = {
     "get_recipe": _tool_get_recipe,
     "run_recipe": _tool_run_recipe,
     "publish_artifact": _tool_publish_artifact,
+    "restart_qgis_engine": _tool_restart_qgis_engine,
 }
 
 

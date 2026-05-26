@@ -92,6 +92,54 @@ async def health():
         )
 
 
+@app.post("/api/restart_qgis")
+async def restart_qgis():
+    """Force le redémarrage du processus QGIS (kill PID → respawn par
+    supervisord avec autorestart=true). Utilisé quand le bridge est
+    figé/deadlocké et que l'agent détecte un état dégradé.
+
+    Renvoie immédiatement (le respawn prend ~5-15s). Le client doit
+    poller /health avant de retenter des appels QGIS.
+
+    Sans auth : endpoint exposé en cluster-internal uniquement (port 8080
+    écoute sur 0.0.0.0 mais l'ingress ne le route pas — service ClusterIP
+    seulement, accessible depuis l'agent pod du même namespace).
+    """
+    import signal
+    try:
+        # Localiser le PID de qgis.bin sans dépendre du PID 32 (fragile)
+        result = subprocess.run(
+            ["pgrep", "-f", "qgis.bin"],
+            capture_output=True, text=True, timeout=5,
+        )
+        pids = [int(p) for p in result.stdout.strip().splitlines() if p.strip().isdigit()]
+        if not pids:
+            return JSONResponse(
+                status_code=404,
+                content={"ok": False, "error": "qgis.bin process not found"},
+            )
+        killed = []
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                killed.append(pid)
+            except ProcessLookupError:
+                pass
+        return {
+            "ok": True,
+            "killed_pids": killed,
+            "message": (
+                f"Signaled SIGTERM to {len(killed)} qgis.bin process(es). "
+                "Supervisord will respawn within ~5-15s. Poll /health."
+            ),
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": str(e)},
+        )
+
+
 # ── Generic command endpoint ──────────────────────────────────────
 
 @app.post("/api/command")
