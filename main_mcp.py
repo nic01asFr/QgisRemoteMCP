@@ -363,7 +363,7 @@ TOOLS = [
     },
     {
         "name": "export_pdf",
-        "description": "Export a QGIS print layout to PDF.",
+        "description": "Export a QGIS print layout to PDF. Returns un download_url interne (requires auth) — pour partage stable avec l'user, toujours suivre par publish_artifact(kind=\"pdf\", slug=...) qui retourne une hub_url publique.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -605,7 +605,7 @@ TOOLS = [
     # ── Web map export ────────────────────────────────────────────
     {
         "name": "export_web_map",
-        "description": "Export visible vector layers as an interactive Leaflet HTML page. GeoJSON inline, popup attributes, legend with toggle. Returns a download URL.",
+        "description": "Export visible vector layers as an interactive Leaflet HTML page. GeoJSON inline, popup attributes, legend with toggle. Returns un download_url interne (requires auth) — NE PAS donner ce download_url à l'user (clic browser → 401). Toujours suivre par publish_artifact(kind=\"storymap\", slug=...) pour obtenir une hub_url publique stable à partager.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -619,7 +619,7 @@ TOOLS = [
     # ── Interactive flood map ─────────────────────────────────────
     {
         "name": "export_flood_map",
-        "description": "Export an interactive flood simulation as a standalone Leaflet HTML page. Requires ISO_HT (water depth) and building layers loaded. Pre-computes building exposure by spatial intersection. The HTML includes a water height slider with play/pause animation, dynamic statistics, and graduated color legends. Best used after running the risque_inondation recipe.",
+        "description": "Export an interactive flood simulation as a standalone Leaflet HTML page. Requires ISO_HT (water depth) and building layers loaded. Pre-computes building exposure by spatial intersection. The HTML includes a water height slider with play/pause animation, dynamic statistics, and graduated color legends. Best used after running the risque_inondation recipe. Returns un download_url interne (requires auth) — toujours suivre par publish_artifact(kind=\"storymap\", slug=...) pour obtenir une hub_url publique stable.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -633,7 +633,7 @@ TOOLS = [
     },
     {
         "name": "export_temporal_map",
-        "description": "Export an interactive temporal analysis as a standalone Leaflet HTML page. Shows point data (e.g. property transactions) with a year slider, color-coded by value, with optional spatial bands (e.g. coastal proximity) and animated playback. Pre-computes per-year statistics. Best used after running a temporal recipe (e.g. pression_fonciere_cotiere).",
+        "description": "Export an interactive temporal analysis as a standalone Leaflet HTML page. Shows point data (e.g. property transactions) with a year slider, color-coded by value, with optional spatial bands (e.g. coastal proximity) and animated playback. Pre-computes per-year statistics. Best used after running a temporal recipe (e.g. pression_fonciere_cotiere). Returns un download_url interne (requires auth) — toujours suivre par publish_artifact(kind=\"storymap\", slug=...) pour obtenir une hub_url publique stable.",
         "inputSchema": {
             "type": "object",
             "properties": {
