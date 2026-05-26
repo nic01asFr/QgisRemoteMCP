@@ -268,6 +268,33 @@ class QGISBridge:
             e = self.iface.mapCanvas().extent()
             canvas_extent = [e.xMinimum(), e.yMinimum(), e.xMaximum(), e.yMaximum()]
 
+        # Zone d'étude (variables projet posées par set_study_zone). Indispensable
+        # pour que l'agent ré-utilise la bbox au lieu de re-géocoder un string.
+        from qgis.core import QgsExpressionContextUtils
+        import json as _json
+        scope = QgsExpressionContextUtils.projectScope(project)
+        study_zone = None
+        zname = scope.variable("study_zone_name")
+        if zname:
+            study_zone = {"name": str(zname), "crs": "EPSG:4326"}
+            for var_key, out_key in (("study_zone_bbox_4326", "bbox"),
+                                     ("study_zone_bbox_2154", "bbox_2154")):
+                raw = scope.variable(var_key)
+                if raw is None:
+                    continue
+                try:
+                    if isinstance(raw, str):
+                        study_zone[out_key] = _json.loads(raw)
+                    else:
+                        study_zone[out_key] = list(raw)
+                except Exception:
+                    pass
+            # Centre dérivé de la bbox 4326 si dispo (utile pour le prompt L2)
+            bbox4 = study_zone.get("bbox")
+            if isinstance(bbox4, list) and len(bbox4) == 4:
+                study_zone["center"] = [(bbox4[0] + bbox4[2]) / 2.0,
+                                        (bbox4[1] + bbox4[3]) / 2.0]
+
         return {
             "title": project.title() or project.fileName(),
             "file": project.fileName(),
@@ -277,6 +304,7 @@ class QGISBridge:
             "layer_count": len(layers),
             "print_layouts": layouts,
             "canvas_extent": canvas_extent,
+            "study_zone": study_zone,
         }
 
     # ── Execute Python (the power tool) ──────────────────────────
