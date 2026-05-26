@@ -715,6 +715,21 @@ TOOLS = [
             "required": ["id", "zone"]
         }
     },
+    {
+        "name": "publish_artifact",
+        "description": "Publie un livrable (storymap, flux, recipe, dataset, pdf) sur S3 via le hub. POST {HUB_URL}/publish/{kind}/{slug}. Retourne hub_url public stable à donner à l'user. Le fichier doit déjà exister sur le workspace au chemin par défaut /data/studies/{sid}/exports/{kind}/{slug}.{ext} (ou /data/exports/{kind}/{slug}.{ext} hors étude), sauf si tu passes source explicite. Requiert HUB_URL + HUB_API_KEY env. Préfère ce tool plutôt qu'un urllib brut en execute_python.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ["storymap", "flux", "recipe", "dataset", "pdf"], "description": "Type de livrable"},
+                "slug": {"type": "string", "description": "Identifiant URL-safe (ex: 'inondation_marseille4'). Sans accents ni espaces."},
+                "source": {"type": "string", "description": "Chemin explicite sous /data/ (optionnel). Si omis, utilise le défaut selon kind + étude active."},
+                "hub_url": {"type": "string", "description": "Override HUB_URL (test seulement)"},
+                "api_key": {"type": "string", "description": "Override HUB_API_KEY (test seulement)"}
+            },
+            "required": ["kind", "slug"]
+        }
+    },
 ]
 
 
@@ -1413,6 +1428,76 @@ def _tool_get_recipe(arguments: dict) -> dict:
     return {"content": _text(response, indent=2)}
 
 
+# ── Publish artifact to hub S3 (storymap, flux, recipe, dataset, pdf) ─
+
+_PUBLISH_KINDS = frozenset({"storymap", "flux", "recipe", "dataset", "pdf"})
+
+
+def _tool_publish_artifact(arguments: dict) -> dict:
+    """Publie un livrable (storymap, flux, recipe, dataset, pdf) sur S3 via le hub.
+
+    Lit le fichier sur le workspace pod et POST sur `{HUB_URL}/publish/{kind}/{slug}`
+    avec authentification Bearer. Retourne `hub_url` (URL publique stable, proxy hub
+    masquant MinIO) à fournir directement à l'user.
+
+    Requiert dans l'env du conteneur :
+      - HUB_URL  : URL du hub (ex: https://user-xxx-qgis-mcp-bridge.user.lab.sspcloud.fr)
+      - HUB_API_KEY : clé API émise par le hub pour ce user
+    """
+    err = _validate_required(arguments, "kind", "slug")
+    if err:
+        return _error(err)
+
+    kind = arguments["kind"]
+    slug = arguments["slug"]
+    if kind not in _PUBLISH_KINDS:
+        return _error(f"kind invalide : {kind}. Attendu : {sorted(_PUBLISH_KINDS)}")
+
+    import os as _os
+    hub_url = arguments.get("hub_url") or _os.environ.get("HUB_URL", "")
+    api_key = arguments.get("api_key") or _os.environ.get("HUB_API_KEY", "")
+    if not hub_url:
+        return _error("HUB_URL absent (env var ou arg) — impossible de joindre le hub")
+    if not api_key:
+        return _error("HUB_API_KEY absent (env var ou arg) — auth hub impossible. "
+                      "Le hub doit injecter cette clé dans le pod workspace au scale-up.")
+
+    body = {}
+    if arguments.get("source"):
+        body["source"] = arguments["source"]
+
+    import json as _json
+    import urllib.request as _ur
+    import urllib.error as _ue
+    url = f"{hub_url.rstrip('/')}/publish/{kind}/{slug}"
+    payload = _json.dumps(body).encode() if body else b"{}"
+    req = _ur.Request(
+        url, data=payload, method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with _ur.urlopen(req, timeout=120) as r:
+            data = _json.loads(r.read().decode("utf-8", errors="replace"))
+        return {"content": _text({
+            "success": True,
+            "kind": kind,
+            "slug": slug,
+            "hub_url": data.get("hub_url"),
+            "key": data.get("key"),
+            "size": data.get("size"),
+            "published_at": data.get("published_at"),
+            "study_id": data.get("study_id"),
+        }, indent=2)}
+    except _ue.HTTPError as e:
+        body_txt = e.read().decode("utf-8", errors="replace")[:500]
+        return _error(f"Hub HTTP {e.code} sur {url} : {body_txt}")
+    except Exception as e:
+        return _error(f"Publish failed ({type(e).__name__}): {e}")
+
+
 # ── Run recipe (automated execution) ─────────────────────────
 
 # Actions that need longer timeouts (WFS downloads, heavy exports)
@@ -1711,6 +1796,7 @@ TOOL_HANDLERS = {
     "list_recipes": _tool_list_recipes,
     "get_recipe": _tool_get_recipe,
     "run_recipe": _tool_run_recipe,
+    "publish_artifact": _tool_publish_artifact,
 }
 
 
