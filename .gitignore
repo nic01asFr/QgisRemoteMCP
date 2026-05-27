@@ -44,7 +44,6 @@ projects/*.qgz
 # Debug/temp artifacts
 .claude-session
 .claude/
-setup_qgis_connections.py
 
 # Test artifacts
 fix_recipe.py
