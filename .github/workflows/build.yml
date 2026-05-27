@@ -15,6 +15,12 @@ name: Build & Push QgisRemoteMCP Image
 #   - jlumbroso/free-disk-space libere ~25-30 Go (runner n'a qu'une partition /)
 #   - PAS de cache-from (pull ancienne image ~10 Go doublerait l'empreinte)
 #   - set -eu sans pipefail (SIGPIPE de head -> exit 141 ferait tomber le job)
+#
+# PREREQUIS package GHCR : le package qgisremotemcp ayant ete cree
+# manuellement (docker push via PAT), il faut autoriser ce repo en ecriture
+# dans les settings du package (Manage Actions access -> Add repository
+# BigQgisMCP -> Write), sinon le push echoue en "denied: permission_denied:
+# write_package". Fait le 2026-05-26.
 
 on:
   push:
