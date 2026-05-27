@@ -8,6 +8,7 @@
 .env.example
 .mcp.json
 data/
+data_local/
 *.log
 logs/
 *.md
