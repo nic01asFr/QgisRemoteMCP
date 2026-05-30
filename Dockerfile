@@ -2,6 +2,9 @@
 # BigQgisMCP — QGIS Desktop as an MCP Server
 # ═══════════════════════════════════════════════════════════════════
 #
+# Build: rebuild trigger 2026-05-30 (inclut fix Marseille search_commune
+# INSEE 13055 + tous les commits post-72f9462 du workflow CI initial).
+#
 # Single container with:
 #   - QGIS Desktop 3.34 LTR (full GUI)
 #   - Xvfb + fluxbox + x11vnc + noVNC (browser access)
