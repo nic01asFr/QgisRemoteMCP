@@ -61,6 +61,17 @@ MAX_MESSAGE_SIZE = 10 * 1024 * 1024  # 10MB
 MAX_INLINE_FILE = 5 * 1024 * 1024    # 5MB — files above this return a download URL instead of base64
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024   # 50MB upload limit
 
+# ── Async job runtime ────────────────────────────────────────────
+# Each async job keeps its own socket open for the lifetime of the job so the
+# watchdog can stream newline-delimited JSON frames (_ack, _heartbeat*, _result).
+# _JOB_STATUS_MIRROR is the fallback registry read by status-mode probes — it
+# answers even when the Qt main thread is frozen because it never touches Qt.
+_ASYNC_LOCK = threading.Lock()
+_ACTIVE_JOBS = {}          # job_id -> {conn, lock, action, submitted_at, started_at, stage, cancel_requested}
+_JOB_STATUS_MIRROR = {}    # job_id -> {status, stage, qt_lag_ms, heartbeat_at, finished_at?}
+_LAST_MAIN_TICK = [0.0]    # updated by main thread via watchdog probe; compared against wall clock
+_MIRROR_MAX = 500          # cap _JOB_STATUS_MIRROR growth
+
 
 def _guess_mime(suffix: str) -> str:
     """Map file extension to MIME type."""
@@ -111,7 +122,13 @@ class QGISBridge:
             if handler is None:
                 return {"error": f"Unknown action: {action}",
                         "available": self._list_actions()}
-            with self._lock:
+            # Lock only mutating actions. All actions already run on the Qt main
+            # thread (serialized by the event queue), so the lock is redundant
+            # for read-only paths and just blocks concurrent polls/status reads.
+            if action in self._MUTATING_ACTIONS:
+                with self._lock:
+                    response = handler(params)
+            else:
                 response = handler(params)
 
             # Append workflow context to mutating actions (no error)
@@ -1867,6 +1884,26 @@ class QGISBridge:
 
         template = template_path.read_text(encoding="utf-8")
 
+        # V1.1 — Metadata DSFR (branding institutionnel, tracabilite, meta HTML5)
+        import datetime, os as _os
+        analysis_date = datetime.datetime.now().strftime("%d/%m/%Y %H:%M")
+        recipe_id = params.get("recipe_id", "risque_inondation")
+        recipe_version = params.get("recipe_version", "1.0")
+        recipe_sha = (
+            params.get("recipe_sha")
+            or _os.environ.get("GIT_COMMIT_SHA", "")[:12]
+            or "n/a"
+        )
+        operator_sub = params.get("operator_sub", "Service géospatial")
+        # Description SEO/social — exposes/bldgs si dispo, sinon generique
+        meta_desc = params.get(
+            "meta_description",
+            f"Simulation de risque inondation sur {zone_name}. Données réglementaires "
+            f"Directive Inondation (Géorisques TRI). Cartographie interactive des "
+            f"zones de crue T10/T100/T1000, bâtiments exposés, routes impactées et "
+            f"établissements sensibles. Réalisé par le CEREMA via QGIS Cloud."
+        )
+
         html = template.replace("{{TITLE}}", title)
         html = html.replace("{{CENTER}}", json.dumps(center))
         html = html.replace("{{ZOOM}}", str(zoom))
@@ -1878,6 +1915,13 @@ class QGISBridge:
         html = html.replace("{{MAX_HEIGHT}}", str(round(max_height, 1)))
         html = html.replace("{{ZONE_NAME}}", zone_name)
         html = html.replace("{{ROUTING_ZONES_JSON}}", json.dumps(routing_zones, default=str))
+        # V1.1 placeholders
+        html = html.replace("{{OPERATOR_SUB}}", operator_sub)
+        html = html.replace("{{META_DESCRIPTION}}", meta_desc.replace('"', '&quot;'))
+        html = html.replace("{{ANALYSIS_DATE}}", analysis_date)
+        html = html.replace("{{RECIPE_ID}}", recipe_id)
+        html = html.replace("{{RECIPE_VERSION}}", recipe_version)
+        html = html.replace("{{RECIPE_SHA}}", recipe_sha)
 
         # Write output
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -5109,58 +5153,368 @@ def _run_on_main_thread(fn, timeout=120):
 # ══════════════════════════════════════════════════════════════════
 # SOCKET SERVER (runs in background thread)
 # ══════════════════════════════════════════════════════════════════
+#
+# Three request modes share the same UNIX socket:
+#
+#   sync (default, backward-compatible):
+#     request:  {"action": "...", "params": {...}}
+#     response: single JSON blob, then connection close.
+#
+#   async (new, opt-in via "_async": true):
+#     request:  {"action": "...", "params": {...}, "_async": true, "_job_id": "..."?}
+#     response: newline-delimited JSON frames on the same connection:
+#                 {"_ack":       {"job_id", "submitted_at"}}
+#                 {"_heartbeat": {"job_id", "ts", "qt_lag_ms", "stage", "warning"?}}
+#                 ...
+#                 {"_result":    {"job_id", "success", "result"|"error", "finished_at"}}
+#               then connection close.
+#
+#   status (new, short-circuit):
+#     request:  {"action": "_job_status", "params": {"job_id": "..."}}
+#     response: single JSON blob — read from _JOB_STATUS_MIRROR, never touches
+#               the Qt main thread, so answers even when QGIS is frozen.
+#
+#   cancel (new, short-circuit, best-effort):
+#     request:  {"action": "_cancel_job", "params": {"job_id": "..."}}
+#     response: single JSON blob. Flips cancel_requested on the active job.
+#               Only effective before dispatch; once Qt main has the job, it
+#               returns "already_dispatched_cannot_cancel".
+#
+# Each incoming connection is handled in its own daemon thread so the listener
+# never blocks on a heavy job and status probes can run while work is pending.
+
+def _generate_job_id():
+    import uuid
+    return uuid.uuid4().hex[:16]
+
+
+def _mirror_set(job_id: str, **fields):
+    """Update the status mirror, pruning oldest entries if over cap."""
+    _JOB_STATUS_MIRROR[job_id] = {**_JOB_STATUS_MIRROR.get(job_id, {}), **fields}
+    if len(_JOB_STATUS_MIRROR) > _MIRROR_MAX:
+        # Drop oldest by heartbeat_at — cheap approximation of LRU
+        victims = sorted(
+            _JOB_STATUS_MIRROR.items(),
+            key=lambda kv: kv[1].get("heartbeat_at", 0),
+        )[: max(1, _MIRROR_MAX // 10)]
+        for jid, _ in victims:
+            _JOB_STATUS_MIRROR.pop(jid, None)
+
+
+def _serve_conn(conn, bridge):
+    """Handle a single client connection: sync, async, status, or cancel mode.
+
+    Sync mode preserves the old byte-for-byte protocol (single JSON + close).
+    Async mode streams newline-delimited frames.
+    Status and cancel modes short-circuit before Qt dispatch.
+    """
+    try:
+        # ── Read request (until JSON parses, bounded by MAX_MESSAGE_SIZE) ──
+        data = b""
+        parsed = None
+        while True:
+            try:
+                chunk = conn.recv(65536)
+            except (socket.timeout, OSError):
+                break
+            if not chunk:
+                break
+            data += chunk
+            if len(data) > MAX_MESSAGE_SIZE:
+                try:
+                    conn.sendall(json.dumps({
+                        "error": f"request exceeds MAX_MESSAGE_SIZE ({MAX_MESSAGE_SIZE} bytes)"
+                    }).encode())
+                except Exception:
+                    pass
+                return
+            try:
+                parsed = json.loads(data.decode())
+                break
+            except UnicodeDecodeError:
+                # Wait for more bytes — UTF-8 multi-byte boundary
+                continue
+            except json.JSONDecodeError:
+                continue
+
+        if parsed is None:
+            if data:
+                try:
+                    conn.sendall(json.dumps({
+                        "error": "invalid JSON or incomplete request",
+                    }).encode())
+                except Exception:
+                    pass
+            return
+
+        request = parsed
+        action = request.get("action", "")
+        params = request.get("params", {}) or {}
+        is_async = bool(request.get("_async"))
+
+        # ── Status-mode short-circuit: never touches Qt ──
+        if action == "_job_status":
+            job_id = params.get("job_id", "")
+            mirror = _JOB_STATUS_MIRROR.get(job_id)
+            if mirror is None:
+                resp = {
+                    "error": f"unknown job_id: {job_id}",
+                    "known_jobs_sample": list(_JOB_STATUS_MIRROR.keys())[:20],
+                }
+            else:
+                resp = {"success": True, "job": mirror}
+            try:
+                conn.sendall(json.dumps(resp).encode())
+            except Exception:
+                pass
+            return
+
+        # ── Cancel-mode short-circuit ──
+        if action == "_cancel_job":
+            job_id = params.get("job_id", "")
+            with _ASYNC_LOCK:
+                info = _ACTIVE_JOBS.get(job_id)
+                if info is None:
+                    resp = {"success": False, "error": "unknown or already-finished job"}
+                elif info.get("stage") in ("queued",):
+                    info["cancel_requested"] = True
+                    resp = {"success": True, "status": "cancel_pending"}
+                else:
+                    info["cancel_requested"] = True
+                    resp = {"success": False, "status": "already_dispatched_cannot_cancel",
+                            "stage": info.get("stage")}
+            try:
+                conn.sendall(json.dumps(resp).encode())
+            except Exception:
+                pass
+            return
+
+        # ── Async mode: keep conn open, stream frames ──
+        if is_async:
+            job_id = request.get("_job_id") or _generate_job_id()
+            conn_lock = threading.Lock()
+            now = time.time()
+            with _ASYNC_LOCK:
+                _ACTIVE_JOBS[job_id] = {
+                    "conn": conn,
+                    "lock": conn_lock,
+                    "action": action,
+                    "submitted_at": now,
+                    "started_at": None,
+                    "stage": "queued",
+                    "cancel_requested": False,
+                }
+            _mirror_set(job_id,
+                        status="queued", stage="queued",
+                        submitted_at=now, heartbeat_at=now, action=action)
+
+            # _ack frame
+            ack = {"_ack": {"job_id": job_id, "submitted_at": now, "action": action}}
+            try:
+                with conn_lock:
+                    conn.sendall((json.dumps(ack) + "\n").encode())
+            except Exception:
+                with _ASYNC_LOCK:
+                    _ACTIVE_JOBS.pop(job_id, None)
+                return
+
+            # Cancel window before dispatch
+            with _ASYNC_LOCK:
+                info = _ACTIVE_JOBS.get(job_id, {})
+                if info.get("cancel_requested"):
+                    info["stage"] = "cancelled"
+                    cancelled = True
+                else:
+                    info["stage"] = "dispatched"
+                    info["started_at"] = time.time()
+                    cancelled = False
+
+            if cancelled:
+                _mirror_set(job_id, status="cancelled", stage="cancelled",
+                            finished_at=time.time(), heartbeat_at=time.time())
+                frame = {"_result": {"job_id": job_id, "success": False,
+                                     "error": "cancelled before dispatch",
+                                     "finished_at": time.time()}}
+                try:
+                    with conn_lock:
+                        conn.sendall((json.dumps(frame) + "\n").encode())
+                except Exception:
+                    pass
+                with _ASYNC_LOCK:
+                    _ACTIVE_JOBS.pop(job_id, None)
+                return
+
+            _mirror_set(job_id, status="running", stage="dispatched",
+                        started_at=time.time(), heartbeat_at=time.time())
+
+            # Dispatch to Qt main thread (blocks THIS worker thread, not listener)
+            user_timeout = params.get("timeout", 600)
+            dispatch_timeout = max(int(user_timeout) + 30, 120)
+            try:
+                response = _run_on_main_thread(
+                    lambda req=request: bridge.handle(req),
+                    timeout=dispatch_timeout,
+                )
+            except Exception as e:
+                response = {"error": str(e), "traceback": traceback.format_exc()}
+
+            with _ASYNC_LOCK:
+                info = _ACTIVE_JOBS.pop(job_id, None)
+
+            finished_at = time.time()
+            success = isinstance(response, dict) and "error" not in response
+            result_frame = {"_result": {
+                "job_id": job_id,
+                "success": success,
+                "result": response if success else None,
+                "error": response.get("error") if (isinstance(response, dict) and not success) else None,
+                "finished_at": finished_at,
+            }}
+            try:
+                lock = info["lock"] if info else threading.Lock()
+                with lock:
+                    conn.sendall((json.dumps(result_frame, default=str) + "\n").encode())
+            except Exception:
+                pass
+            _mirror_set(job_id,
+                        status="done" if success else "error",
+                        stage="finished",
+                        heartbeat_at=finished_at,
+                        finished_at=finished_at)
+            return
+
+        # ── Sync mode (backward-compatible) ──
+        user_timeout = params.get("timeout", 30)
+        dispatch_timeout = max(int(user_timeout) + 30, 120)
+        response = _run_on_main_thread(
+            lambda req=request: bridge.handle(req),
+            timeout=dispatch_timeout,
+        )
+        try:
+            conn.sendall(json.dumps(response, default=str).encode())
+        except Exception:
+            pass
+
+    except Exception as e:
+        try:
+            conn.sendall(json.dumps({
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+            }).encode())
+        except Exception:
+            pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 
 def socket_server(bridge: QGISBridge):
-    """Listen on UNIX socket for JSON commands."""
+    """Listen on UNIX socket, spawn one worker thread per connection.
+
+    The listener itself never blocks on request processing, so a 10-minute
+    execute_python on one connection does not prevent a status poll on another.
+    """
     if os.path.exists(SOCKET_PATH):
         os.unlink(SOCKET_PATH)
 
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(SOCKET_PATH)
-    server.listen(10)
+    server.listen(20)
     os.chmod(SOCKET_PATH, 0o777)
 
     print(f"[QGISBridge] Listening on {SOCKET_PATH}")
     print(f"[QGISBridge] Available actions: {bridge._list_actions()}")
 
     while True:
-        conn, _ = server.accept()
         try:
-            # Read until we get complete JSON
-            data = b""
-            while True:
-                chunk = conn.recv(65536)
-                if not chunk:
-                    break
-                data += chunk
-                # Try to parse — if valid JSON, we're done
-                try:
-                    json.loads(data.decode())
-                    break
-                except json.JSONDecodeError:
-                    continue
+            conn, _ = server.accept()
+        except Exception as e:
+            print(f"[QGISBridge] accept() failed: {e}", file=sys.stderr)
+            time.sleep(0.1)
+            continue
+        threading.Thread(
+            target=_serve_conn, args=(conn, bridge), daemon=True,
+            name="bridge-conn",
+        ).start()
 
-            if data:
-                request = json.loads(data.decode())
-                # Compute timeout: user timeout + margin for main thread dispatch
-                user_timeout = request.get("params", {}).get("timeout", 30)
-                dispatch_timeout = max(user_timeout + 30, 120)
-                # Dispatch to main thread — all Qt/QGIS ops must happen there
-                response = _run_on_main_thread(
-                    lambda req=request: bridge.handle(req),
-                    timeout=dispatch_timeout,
-                )
-                conn.sendall(json.dumps(response, default=str).encode())
+
+def _watchdog():
+    """Background daemon. Responsibilities:
+
+    1. Probe Qt main thread latency via postEvent → self-timestamp.
+       If the main thread is frozen, _LAST_MAIN_TICK stays old and qt_lag_ms
+       grows, letting clients detect a frozen QGIS without waiting for timeout.
+    2. Stream a _heartbeat frame every ~1s to every active async job's socket,
+       so the api_server reader sees progress and the client can poll.
+    3. Update _JOB_STATUS_MIRROR so status-mode probes work even if the job's
+       own socket has died.
+    """
+    last_scheduled = 0.0
+    # Warm _LAST_MAIN_TICK so the first few iterations don't report huge lag
+    _LAST_MAIN_TICK[0] = time.time()
+    while True:
+        try:
+            time.sleep(1.0)
+            now = time.time()
+
+            # Compute lag against the previous probe's main-thread tick
+            if _LAST_MAIN_TICK[0] > 0:
+                qt_lag_ms = max(0, int((now - _LAST_MAIN_TICK[0]) * 1000))
+            else:
+                qt_lag_ms = 0
+            frozen = qt_lag_ms > 5000
+
+            # Schedule next probe (do not wait on done — just fire-and-forget)
+            last_scheduled = now
+            def _probe():
+                _LAST_MAIN_TICK[0] = time.time()
+                return None
+            try:
+                holder = {}
+                done = threading.Event()
+                QCoreApplication.postEvent(_main_receiver, _InvokeEvent(_probe, holder, done))
+            except Exception:
+                pass  # Qt may be shutting down
+
+            # Fan out heartbeats
+            with _ASYNC_LOCK:
+                active = list(_ACTIVE_JOBS.items())
+
+            for job_id, info in active:
+                frame = {"_heartbeat": {
+                    "job_id": job_id,
+                    "ts": now,
+                    "qt_lag_ms": qt_lag_ms,
+                    "stage": info.get("stage", "running"),
+                }}
+                if frozen:
+                    frame["_heartbeat"]["warning"] = "qt_frozen"
+                payload = (json.dumps(frame) + "\n").encode()
+                try:
+                    with info["lock"]:
+                        info["conn"].sendall(payload)
+                    _mirror_set(job_id,
+                                status="qt_frozen" if frozen else "running",
+                                stage=info.get("stage", "running"),
+                                qt_lag_ms=qt_lag_ms,
+                                heartbeat_at=now)
+                except (BrokenPipeError, ConnectionError, OSError):
+                    with _ASYNC_LOCK:
+                        _ACTIVE_JOBS.pop(job_id, None)
+                    _mirror_set(job_id,
+                                status="client_disconnected",
+                                heartbeat_at=now)
+                except Exception:
+                    # One bad conn must not kill the watchdog loop
+                    pass
         except Exception as e:
             try:
-                conn.sendall(json.dumps({
-                    "error": str(e),
-                    "traceback": traceback.format_exc()
-                }).encode())
-            except:
+                print(f"[QGISBridge.watchdog] {e}", file=sys.stderr)
+            except Exception:
                 pass
-        finally:
-            conn.close()
+            # Keep alive — the watchdog is the safety net, it cannot die
 
 
 # ── Optimize rendering (GPU-aware + CPU fallback) ────────────────
@@ -5341,6 +5695,9 @@ QTimer.singleShot(5000, _configure_environment)
 
 # ── Start bridge ──────────────────────────────────────────────────
 bridge = QGISBridge()
-server_thread = threading.Thread(target=socket_server, args=(bridge,), daemon=True)
+server_thread = threading.Thread(target=socket_server, args=(bridge,), daemon=True,
+                                 name="bridge-listener")
 server_thread.start()
-print("[QGISBridge] Started successfully")
+watchdog_thread = threading.Thread(target=_watchdog, daemon=True, name="bridge-watchdog")
+watchdog_thread.start()
+print("[QGISBridge] Started successfully (listener + watchdog)")

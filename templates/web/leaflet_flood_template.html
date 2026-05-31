@@ -1,9 +1,28 @@
 <!DOCTYPE html>
-<html lang="fr">
+<html lang="fr" data-fr-scheme="light">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>{{TITLE}}</title>
+<meta name="theme-color" content="#000091"/>
+<title>{{TITLE}} — CEREMA</title>
+<meta name="description" content="{{META_DESCRIPTION}}"/>
+<meta name="robots" content="index,follow"/>
+<meta name="author" content="CEREMA"/>
+<meta name="generator" content="QgisRemoteMCP · qgis-sspcloud"/>
+<!-- Open Graph / Twitter -->
+<meta property="og:type" content="website"/>
+<meta property="og:title" content="{{TITLE}} — CEREMA"/>
+<meta property="og:description" content="{{META_DESCRIPTION}}"/>
+<meta property="og:site_name" content="CEREMA · QGIS Cloud"/>
+<meta property="og:locale" content="fr_FR"/>
+<meta name="twitter:card" content="summary_large_image"/>
+<meta name="twitter:title" content="{{TITLE}} — CEREMA"/>
+<!-- Favicon SVG drapeau France (DSFR style, pas de requete externe) -->
+<link rel="icon" type="image/svg+xml" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 3 2"><rect width="1" height="2" x="0" fill="%23000091"/><rect width="1" height="2" x="1" fill="%23FFF"/><rect width="1" height="2" x="2" fill="%23E1000F"/></svg>'/>
+<!-- DSFR officiel (gouvernement.fr) -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@gouvfr/dsfr@1.12.1/dist/dsfr.min.css"/>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@gouvfr/dsfr@1.12.1/dist/utility/utility.min.css"/>
+<!-- Leaflet + nouislider (carto + slider) -->
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/nouislider@15/dist/nouislider.min.css">
@@ -153,18 +172,58 @@
   #route-status { padding: 4px 10px 8px; font-size: 11px; line-height: 1.5; }
   body.picking-mode #map { cursor: crosshair !important; }
 
-  .info-footer {
-    position: absolute; bottom: 5px; right: 10px; z-index: 900;
-    background: rgba(255,255,255,0.7); padding: 2px 8px;
-    border-radius: 3px; font-size: 9px; color: #888;
-  }
+  /* V1.1 : ajustements DSFR header/footer integration avec map full-screen */
+  body { margin: 0; padding: 0; }
+  .cerema-header { position: relative; z-index: 1100; box-shadow: 0 2px 4px rgba(0,0,0,0.08); }
+  .cerema-header .fr-header__brand-top { padding: 8px 16px; }
+  .cerema-header .fr-header__service { padding: 0 16px 8px; }
+  .cerema-header .fr-header__service-title { font-size: 18px; font-weight: 700; color: var(--text-title-blue-france); margin: 0; }
+  .cerema-header .fr-header__service-tagline { font-size: 12px; color: var(--text-mention-grey); margin: 2px 0 0; }
+  .cerema-disclaimer { padding: 8px 16px; background: #fff4d6; border-bottom: 1px solid #ffd460; font-size: 12px; color: #6b4d00; z-index: 1099; position: relative; }
+  .cerema-disclaimer strong { color: #8a2c00; }
+  .cerema-footer { padding: 12px 16px; background: var(--background-alt-grey); border-top: 1px solid var(--border-default-grey); font-size: 11px; color: var(--text-mention-grey); z-index: 1100; position: relative; }
+  .cerema-footer-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; max-width: 1400px; margin: 0 auto; }
+  .cerema-footer-grid h6 { font-size: 11px; color: var(--text-title-blue-france); text-transform: uppercase; margin: 0 0 4px; letter-spacing: 0.5px; font-weight: 700; }
+  .cerema-footer-grid a { color: var(--text-action-high-blue-france); text-decoration: none; }
+  .cerema-footer-grid a:hover { text-decoration: underline; }
+  .cerema-footer-grid ul { list-style: none; padding: 0; margin: 0; }
+  .cerema-footer-grid li { margin: 2px 0; line-height: 1.5; }
+  .cerema-bottom { text-align: center; padding: 8px; border-top: 1px solid var(--border-default-grey); margin-top: 12px; font-size: 10px; color: var(--text-mention-grey); }
+  @media (max-width: 768px) { .cerema-footer-grid { grid-template-columns: 1fr; } }
+  /* Map prend l'espace restant entre header DSFR + disclaimer et footer DSFR */
+  #map { position: relative; height: calc(100vh - 220px); min-height: 500px; }
 </style>
 </head>
 <body>
 
-<div class="map-title">
-  {{TITLE}}
-  <small>Directive Inondation — Données Georisques TRI | Simulation de montée des eaux</small>
+<!-- ── Header DSFR officiel CEREMA ─────────────────────────────────── -->
+<header role="banner" class="fr-header cerema-header">
+  <div class="fr-header__body">
+    <div class="fr-container">
+      <div class="fr-header__body-row">
+        <div class="fr-header__brand fr-enlarge-link">
+          <div class="fr-header__brand-top">
+            <div class="fr-header__logo">
+              <p class="fr-logo">République<br>Française</p>
+            </div>
+            <div class="fr-header__operator" style="display:flex;flex-direction:column">
+              <p style="font-weight:700;font-size:15px;color:#000091;margin:0">CEREMA</p>
+              <p style="font-size:11px;color:#666;margin:0">{{OPERATOR_SUB}}</p>
+            </div>
+          </div>
+          <div class="fr-header__service">
+            <p class="fr-header__service-title">{{TITLE}}</p>
+            <p class="fr-header__service-tagline">Directive Inondation — Données Georisques TRI · Simulation de montée des eaux</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- ── Disclaimer obligatoire (donnees indicatives vs PPRi local) ───── -->
+<div class="cerema-disclaimer" role="alert">
+  <strong>⚠️ Données indicatives.</strong> Cette simulation ne se substitue pas aux études PPRi locales ni au PPR. Pour toute décision opérationnelle d'urbanisme ou de sécurité, se référer aux documents réglementaires officiels disponibles auprès des services préfectoraux.
 </div>
 
 <div class="scenario-selector" id="scenario-selector" style="display:none">
@@ -172,7 +231,42 @@
 </div>
 
 <div id="map"></div>
-<div class="info-footer">QgisRemoteMCP | Georisques, IGN, OpenStreetMap · Routing: Valhalla OSM</div>
+
+<!-- ── Footer DSFR officiel : licence + sources + tracabilite ───────── -->
+<footer role="contentinfo" class="cerema-footer">
+  <div class="cerema-footer-grid">
+    <div>
+      <h6>Sources des données</h6>
+      <ul>
+        <li><a href="https://www.georisques.gouv.fr/risques/inondations" target="_blank" rel="noopener">Géorisques — TRI Directive Inondation</a></li>
+        <li><a href="https://geoservices.ign.fr/bdtopo" target="_blank" rel="noopener">IGN — BD TOPO (bâtiments, routes)</a></li>
+        <li><a href="https://geoservices.ign.fr" target="_blank" rel="noopener">IGN — Plan IGN v2 (fond de carte)</a></li>
+        <li><a href="https://valhalla.openstreetmap.de" target="_blank" rel="noopener">Valhalla / OSM (routage secours)</a></li>
+      </ul>
+    </div>
+    <div>
+      <h6>Méthodologie & Reproductibilité</h6>
+      <ul>
+        <li>Analyse réalisée le <strong>{{ANALYSIS_DATE}}</strong></li>
+        <li>Recipe : <code>{{RECIPE_ID}}</code> · v{{RECIPE_VERSION}}</li>
+        <li>Plateforme : <a href="https://github.com/nic01asFr/qgis-sspcloud" target="_blank" rel="noopener">qgis-sspcloud</a> · <a href="https://github.com/nic01asFr/BigQgisMCP" target="_blank" rel="noopener">BigQgisMCP</a></li>
+        <li>Commit : <code>{{RECIPE_SHA}}</code></li>
+      </ul>
+    </div>
+    <div>
+      <h6>CEREMA</h6>
+      <ul>
+        <li><a href="https://www.cerema.fr" target="_blank" rel="noopener">cerema.fr</a></li>
+        <li><a href="https://www.cerema.fr/fr/mentions-legales" target="_blank" rel="noopener">Mentions légales</a></li>
+        <li><a href="https://www.cerema.fr/fr/donnees-personnelles" target="_blank" rel="noopener">Données personnelles</a></li>
+        <li>Licence Ouverte 2.0 (Etalab)</li>
+      </ul>
+    </div>
+  </div>
+  <div class="cerema-bottom">
+    Livrable public · Généré par l'agent QGIS CEREMA · {{ANALYSIS_DATE}} · Centre d'Études et d'Expertise sur les Risques, l'Environnement, la Mobilité et l'Aménagement
+  </div>
+</footer>
 
 <!-- Slider panel -->
 <div class="slider-panel" id="slider-panel">
@@ -834,8 +928,16 @@
   document.getElementById('route-calc-btn').addEventListener('click', calcRoute);
   document.getElementById('route-clear-btn').addEventListener('click', clearRoute);
 
-  // Initial render
-  updateAll(0);
+  // Initial render — V1.1 fix Bug P0 stats 0/0 :
+  // updateAll(0) au chargement ne comptait aucun batiment expose car la
+  // condition de exposition exige waterHeight > 0. On initialise a une valeur
+  // par defaut representant une crue typique (T100 ~1.5m) pour afficher des
+  // statistiques pertinentes des l'ouverture. Le user peut ensuite explorer
+  // de 0 a maxHeight via le slider.
+  var initialHeight = Math.min(Math.max(maxHeight * 0.5, 0.5), 2.0);
+  // .set() declenche l'event 'update' qui appelle updateAll(value), donc le
+  // rendu est mis a jour automatiquement (pas besoin d'appel explicite).
+  sliderEl.noUiSlider.set(initialHeight);
 
 })();
 </script>
