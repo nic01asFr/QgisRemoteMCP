@@ -1,130 +1,125 @@
 {
   "id": "cadastre_solaire",
-  "name": "Cadastre solaire",
-  "description": "Analyse d'ensoleillement d'un territoire : irradiance annuelle, heures de soleil mensuelles, analyse par façade et étage. Produit un raster d'irradiance sur MNT + un GPKG de façades enrichies. Trois profils de calcul : rapide (2-5 min), standard (10-30 min), precision (30 min - 4h).",
-  "tags": ["solaire", "énergie", "urbanisme", "cadastre", "irradiance", "ensoleillement"],
+  "name": "Cadastre solaire (V1 simplifié)",
+  "description": "Analyse de potentiel solaire toiture par bâtiment, version V1 simplifiée. Charge les bâtiments BD TOPO (avec hauteur et nombre d'étages), calcule un score de potentiel toiture (surface × facteur hauteur × facteur compacité), et produit une carte graduée + PDF + carte web. Note : V1 utilise une heuristique géométrique. La version irradiance complète (DSM hybride MNT + bâti + r.sun GRASS pour les 12 mois) est prévue en V1.5 (cf. observatoire_v15.html).",
+  "tags": [
+    "solaire",
+    "énergie",
+    "urbanisme",
+    "cadastre",
+    "toiture",
+    "transition"
+  ],
   "parameters": {
     "zone": {
       "type": "string",
       "required": true,
-      "description": "Commune ou adresse (ex: 'Marseille 4ème', 'Montpellier', 'Lyon 3ème')"
-    },
-    "profil": {
-      "type": "string",
-      "required": false,
-      "default": "standard",
-      "description": "Profil de calcul : 'rapide' (10m, 4 mois, ~2-5 min), 'standard' (5m, 12 mois, ~10-30 min), 'precision' (1m, 12 mois, ~30 min-4h)"
+      "description": "Commune ou arrondissement (ex: 'Montpellier', 'Marseille 4e')"
     }
   },
+  "recipe_schema_version": "1.0",
   "steps": [
     {
       "id": "zone",
-      "action": "set_study_zone",
-      "params": {"target": "{zone}", "buffer_km": 0.2},
-      "description": "Définir la zone d'étude avec buffer 200m pour les ombres"
+      "tool": "set_study_zone",
+      "params": {
+        "target": "$zone",
+        "buffer_km": 0.2
+      },
+      "description": "Définir la zone d'étude avec buffer 200m (contexte voisinage)"
     },
     {
       "id": "basemap",
-      "action": "smart_load",
-      "params": {"id": "ign_planign"},
-      "description": "Charger le fond de plan IGN"
-    },
-    {
-      "id": "batiments",
-      "action": "smart_load",
-      "params": {"id": "bdtopo_batiments"},
-      "description": "Télécharger les bâtiments BD TOPO (emprise, hauteur, étages)"
-    },
-    {
-      "id": "voirie",
-      "action": "smart_load",
-      "params": {"id": "bdtopo_routes"},
-      "description": "Télécharger la voirie BD TOPO pour l'analyse rues"
-    },
-    {
-      "id": "rge_alti",
-      "action": "execute_python",
+      "tool": "smart_load",
       "params": {
-        "code": "# Télécharger le RGE ALTI (MNT haute résolution)\nzone = helpers.get_study_zone()\nbbox = zone['bbox_4326']\nresolution = {profil_resolution}\nresult.update(helpers.download_rge_alti(bbox, resolution=resolution))",
-        "timeout": 120
+        "id": "ign_planign"
       },
-      "description": "Télécharger le RGE ALTI IGN (MNT haute résolution)"
+      "description": "Fond IGN Plan v2"
     },
     {
-      "id": "dsm_hybride",
-      "action": "execute_python",
+      "id": "ortho",
+      "tool": "smart_load",
       "params": {
-        "code": "# Construire le DSM hybride (MNT + hauteurs bâtiments)\nimport solar_pipeline\nconfig = solar_pipeline.get_config('{profil}')\nresult.update(solar_pipeline.build_dsm(config))",
-        "timeout": 180
+        "id": "ign_ortho"
       },
-      "description": "Fusion MNT + hauteurs BD TOPO → DSM hybride"
+      "description": "Orthophoto IGN (alternative basemap, contexte visuel toitures)"
     },
     {
-      "id": "rsun",
-      "action": "execute_python",
+      "id": "buildings",
+      "tool": "smart_load",
       "params": {
-        "code": "# Calculer l'irradiance avec GRASS r.sun\nimport solar_pipeline\nconfig = solar_pipeline.get_config('{profil}')\nresult.update(solar_pipeline.run_rsun(config))",
-        "timeout": 3600
+        "id": "bdtopo_batiments"
       },
-      "description": "Calcul r.sun mensuel (irradiance globale + heures d'insolation)"
+      "description": "Bâtiments BD TOPO (hauteur, nombre d'étages, usage)"
     },
     {
-      "id": "irradiance_annuelle",
-      "action": "execute_python",
+      "id": "roads",
+      "tool": "smart_load",
       "params": {
-        "code": "# Agréger les 12 mois → irradiance annuelle\nimport solar_pipeline\nresult.update(solar_pipeline.aggregate_annual())",
-        "timeout": 120
+        "id": "bdtopo_routes"
       },
-      "description": "Agrégation annuelle pondérée des 12 mois"
+      "description": "Routes BD TOPO (contexte)"
     },
     {
-      "id": "apply_raster",
-      "action": "execute_python",
+      "id": "score_potentiel",
+      "tool": "execute_python",
+      "description": "Calculer le score de potentiel solaire toiture par bâtiment (surface plate × facteur hauteur × facteur compacité).",
       "params": {
-        "code": "# Appliquer l'irradiance sur le MNT dans QGIS\nimport solar_pipeline\nresult.update(solar_pipeline.apply_to_mnt())",
-        "timeout": 60
+        "timeout": 300
       },
-      "description": "Appliquer le raster d'irradiance sur le MNT avec rampe de couleurs"
-    },
-    {
-      "id": "facades",
-      "action": "execute_python",
-      "params": {
-        "code": "# Analyser les façades (ray-marching)\nimport solar_pipeline\nconfig = solar_pipeline.get_config('{profil}')\nresult.update(solar_pipeline.analyze_facades(config))",
-        "timeout": 3600
-      },
-      "description": "Ray-marching DSM pour chaque façade × étage × timestep"
-    },
-    {
-      "id": "scores",
-      "action": "execute_python",
-      "params": {
-        "code": "# Calculer les scores (soleil, canicule, confort, z-score)\nimport solar_pipeline\nresult.update(solar_pipeline.compute_scores())",
-        "timeout": 120
-      },
-      "description": "Scores annuels + z-score local par façade"
+      "code": "import processing\nfrom qgis.core import QgsVectorLayer, QgsField\nfrom PyQt5.QtCore import QVariant\n\ndef find_exact(name):\n    return next((l for l in project.mapLayers().values()\n                 if isinstance(l, QgsVectorLayer) and l.name() == name), None)\n\nbat = find_exact('B\\u00e2timents (BD TOPO)')\nif not bat:\n    result['error'] = 'Couche batiments BD TOPO introuvable'\nelse:\n    # Fix + ajouter champs derives via fieldcalculator (rapide C++)\n    bat_fixed = processing.run('native:fixgeometries', {\n        'INPUT': bat, 'METHOD': 1, 'OUTPUT': 'memory:'\n    })['OUTPUT']\n\n    # Champ surface_m2 (surface au sol toiture, approximation surface utile)\n    bat_surf = processing.run('native:fieldcalculator', {\n        'INPUT': bat_fixed,\n        'FIELD_NAME': 'surface_m2',\n        'FIELD_TYPE': 0,\n        'FORMULA': 'round($area, 1)',\n        'OUTPUT': 'memory:'\n    })['OUTPUT']\n\n    # Score potentiel : surface × facteur hauteur (plus haut = moins ombrage voisin)\n    # × facteur compacite (forme regulière = mieux exploitable)\n    # Score normalise 0-100 par classes pour lisibilite.\n    # facteur_hauteur = min(hauteur/15, 1.5)  (15m = R+4, plafonne a 1.5 pour tours)\n    # facteur_compact = 4*pi*area / perimeter^2  (1 = cercle parfait, ~0.4 = rectangle long)\n    bat_score = processing.run('native:fieldcalculator', {\n        'INPUT': bat_surf,\n        'FIELD_NAME': 'score_solaire',\n        'FIELD_TYPE': 0,\n        'FORMULA': 'round(\"surface_m2\" * (CASE WHEN \"hauteur\" IS NULL OR \"hauteur\" < 1 THEN 0.8 WHEN \"hauteur\" > 15 THEN 1.5 ELSE \"hauteur\"/15.0 + 0.5 END) * (CASE WHEN $perimeter > 0 THEN minimum(4 * 3.14159 * $area / ($perimeter * $perimeter) * 2, 1.5) ELSE 1.0 END), 1)',\n        'OUTPUT': 'memory:'\n    })['OUTPUT']\n\n    # Classe potentiel : 5 categories\n    bat_class = processing.run('native:fieldcalculator', {\n        'INPUT': bat_score,\n        'FIELD_NAME': 'classe_potentiel',\n        'FIELD_TYPE': 2,\n        'FIELD_LENGTH': 20,\n        'FORMULA': 'CASE WHEN \"score_solaire\" < 30 THEN \\'tres_faible\\' WHEN \"score_solaire\" < 100 THEN \\'faible\\' WHEN \"score_solaire\" < 300 THEN \\'moyen\\' WHEN \"score_solaire\" < 800 THEN \\'fort\\' ELSE \\'tres_fort\\' END',\n        'OUTPUT': 'memory:'\n    })['OUTPUT']\n\n    bat_class.setName('Potentiel solaire toiture')\n    project.addMapLayer(bat_class)\n    project.removeMapLayer(bat.id())\n\n    # Stats\n    from qgis.core import QgsFeatureRequest\n    idx_score = bat_class.fields().indexOf('score_solaire')\n    idx_classe = bat_class.fields().indexOf('classe_potentiel')\n    counts = {'tres_faible': 0, 'faible': 0, 'moyen': 0, 'fort': 0, 'tres_fort': 0}\n    score_sum = 0.0\n    total = 0\n    req = QgsFeatureRequest().setFlags(QgsFeatureRequest.NoGeometry).setSubsetOfAttributes([idx_score, idx_classe])\n    for f in bat_class.getFeatures(req):\n        c = f.attribute(idx_classe)\n        if c in counts:\n            counts[c] += 1\n        s = f.attribute(idx_score)\n        if s is not None:\n            score_sum += float(s)\n            total += 1\n    result['stats'] = {\n        'total_batiments': total,\n        'score_moyen': round(score_sum / max(total, 1), 1),\n        'par_classe': counts,\n        'taux_fort_ou_plus_pct': round((counts['fort'] + counts['tres_fort']) / max(total, 1) * 100, 1)\n    }\n    result['success'] = True\n"
     },
     {
       "id": "style",
-      "action": "set_layer_style",
+      "tool": "execute_python",
+      "description": "Appliquer une symbologie graduée jaune→rouge sur le score de potentiel solaire. Ordre des couches : bâti en avant, ortho/plan en fond.",
       "params": {
-        "layer": "irradiance_annuelle",
-        "type": "graduated",
-        "field": "irradiance_kwh",
-        "n_classes": 7,
-        "color_ramp": "RdYlBu_r"
+        "timeout": 60
       },
-      "description": "Appliquer une symbologie graduée sur l'irradiance"
+      "code": "from qgis.core import (QgsFillSymbol, QgsGraduatedSymbolRenderer, QgsRendererRange,\n                        QgsCategorizedSymbolRenderer, QgsRendererCategory, QgsLineSymbol,\n                        QgsVectorLayer, QgsClassificationQuantile)\n\ndef find_exact(name):\n    return next((l for l in project.mapLayers().values()\n                 if isinstance(l, QgsVectorLayer) and l.name() == name), None)\n\ndef find_kw(kw):\n    return [l for l in project.mapLayers().values()\n            if isinstance(l, QgsVectorLayer) and kw.lower() in l.name().lower()]\n\n# Style bati par classe potentiel\nbat = find_exact('Potentiel solaire toiture')\nif bat:\n    cat_colors = [\n        ('tres_faible', '#888888', 'Très faible (< 30)'),\n        ('faible',      '#ffcc66', 'Faible (30-100)'),\n        ('moyen',       '#ff9933', 'Moyen (100-300)'),\n        ('fort',        '#ff6600', 'Fort (300-800)'),\n        ('tres_fort',   '#cc1100', 'Très fort (> 800)')\n    ]\n    cats = []\n    for value, color, label in cat_colors:\n        sym = QgsFillSymbol.createSimple({\n            'color': color, 'outline_color': '#333333', 'outline_width': '0.1'\n        })\n        cats.append(QgsRendererCategory(value, sym, label))\n    bat.setRenderer(QgsCategorizedSymbolRenderer('classe_potentiel', cats))\n    bat.triggerRepaint()\n\n# Style routes discrètes\nroutes = find_exact('Routes (BD TOPO)')\nif routes:\n    sym = QgsLineSymbol.createSimple({'color': '#666666', 'width': '0.2'})\n    from qgis.core import QgsSingleSymbolRenderer\n    routes.setRenderer(QgsSingleSymbolRenderer(sym))\n    routes.triggerRepaint()\n\n# Ordre des couches : bati DEVANT, routes derriere, ortho/plan en bas\nroot = project.layerTreeRoot()\nlayers_ordered = []\nseen_ids = set()\n\ndef add_l(l, visible=True):\n    if l and l.id() not in seen_ids:\n        seen_ids.add(l.id())\n        layers_ordered.append((l, visible))\n\nadd_l(bat, True)\nadd_l(routes, True)\n# Rasters basemap EN DERNIER (= rendu derriere)\nfor l in project.mapLayers().values():\n    if not isinstance(l, QgsVectorLayer) and l.id() not in seen_ids:\n        seen_ids.add(l.id())\n        # Ortho visible par defaut, plan masque\n        visible = 'ortho' in l.name().lower() or 'photo' in l.name().lower()\n        layers_ordered.append((l, visible))\n\nrender_layers = [l for l, v in layers_ordered]\nroot.setCustomLayerOrder(render_layers)\nroot.setHasCustomLayerOrder(True)\nfor layer, visible in layers_ordered:\n    node = root.findLayer(layer.id())\n    if node:\n        node.setItemVisibilityChecked(visible)\n\nresult['success'] = True\n"
     },
     {
       "id": "layout",
-      "action": "apply_layout_template",
+      "tool": "apply_layout_template",
       "params": {
         "template": "a3_landscape",
-        "title": "Cadastre solaire — {zone}",
-        "subtitle": "Irradiance annuelle (kWh/m²/an) — Profil {profil}"
+        "variables": {
+          "title": "Cadastre solaire — $zone",
+          "subtitle": "Potentiel toiture par bâtiment (score géométrie × hauteur × compacité) · V1 simplifié"
+        }
       },
-      "description": "Préparer la mise en page A3"
+      "description": "Mise en page A3 paysage"
+    },
+    {
+      "id": "export_pdf",
+      "tool": "export_pdf",
+      "params": {
+        "layout": "A3 Landscape"
+      },
+      "description": "Export PDF A3 — carte de potentiel solaire toiture"
+    },
+    {
+      "id": "export_web",
+      "tool": "export_web_map",
+      "params": {
+        "include_fields": [
+          "usage_1",
+          "nature",
+          "hauteur",
+          "nombre_d_etages",
+          "surface_m2",
+          "score_solaire",
+          "classe_potentiel"
+        ]
+      },
+      "description": "Carte web interactive (popups attributs bâtiments)"
     }
-  ]
+  ],
+  "outputs": [
+    "Couche Potentiel solaire toiture (bâtiments BD TOPO enrichis : surface_m2, score_solaire, classe_potentiel)",
+    "PDF A3 — carte graduée gris→rouge selon potentiel toiture",
+    "Carte web interactive Leaflet avec popups attributs",
+    "Statistiques : total bâtiments, score moyen, répartition par classe, taux fort+ pct"
+  ],
+  "notes": "V1 simplifié. La version irradiance complète (DSM hybride + r.sun mensuel + analyse façades étage par étage, cf. observatoire_v15.html exemple Marseille 4e) est prévue en V1.5 lorsque le solar_pipeline module sera implémenté côté workspace."
 }
