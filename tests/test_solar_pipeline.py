@@ -220,3 +220,48 @@ def test_manifest_warnings_explicit_in_degraded_mode(manifest):
     assert any("degrade" in w.lower() for w in warnings), (
         "Mode degrade doit produire un warning explicite dans le manifest"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Tests build_observatoire_html (refactor de data/build_obs_v5.py)
+# ─────────────────────────────────────────────────────────────────────
+
+def test_build_observatoire_html_creates_autonomous_html(manifest):
+    """L'observatoire HTML doit etre cree, autonome, contenir les donnees."""
+    obs = manifest.get("observatoire") or {}
+    if "error" in obs:
+        pytest.skip(f"Step 7 a echoue : {obs['error']}")
+    out_path = Path(obs.get("output_path", ""))
+    assert out_path.exists(), f"HTML observatoire absent : {out_path}"
+    # Le HTML doit etre autoportant (donnees inlinees) -> taille > 100 KB minimum
+    size_kb = out_path.stat().st_size / 1024
+    assert size_kb > 100, (
+        f"HTML observatoire trop petit ({size_kb:.0f} KB) -- "
+        "donnees probablement non injectees dans le template"
+    )
+    # Le marker doit avoir ete remplace
+    content = out_path.read_text(encoding="utf-8")
+    assert "D = __DATA__;" not in content, (
+        "Marker `D = __DATA__;` non remplace dans le HTML produit"
+    )
+    assert "D = {" in content, (
+        "Pas trouve d'injection JSON `D = {...}` dans le HTML"
+    )
+
+
+def test_build_observatoire_metadata_consistency(manifest):
+    """Les compteurs observatoire doivent etre coherents avec facades + troncons."""
+    obs = manifest.get("observatoire") or {}
+    if "error" in obs:
+        pytest.skip(f"Step 7 a echoue : {obs['error']}")
+    n_bati = obs.get("n_bati", 0)
+    n_facades = obs.get("n_facades", 0)
+    n_etages = obs.get("n_etages", 0)
+    assert n_bati > 0, "Aucun batiment dans l'observatoire"
+    assert n_facades > n_bati, (
+        f"n_facades={n_facades} doit etre > n_bati={n_bati} "
+        "(plusieurs facades par batiment)"
+    )
+    assert n_etages >= n_facades, (
+        f"n_etages={n_etages} doit etre >= n_facades={n_facades}"
+    )

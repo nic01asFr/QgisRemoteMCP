@@ -1293,6 +1293,339 @@ def link_bati_troncon(bati_path=None, voirie_path=None, max_dist=50):
 # FULL ORCHESTRATOR
 # ══════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════
+# STEP 7: BUILD OBSERVATOIRE HTML
+# ══════════════════════════════════════════════════════════════════════
+
+def build_observatoire_html(zone_name=None, template_path=None,
+                            output_path=None, bati_path=None, voirie_path=None):
+    """Assemble les sorties NumPy + injecte dans template HTML autonome.
+
+    Refactor de `data/build_obs_v5.py` rendu generic pour la recipe V2 :
+    - bati / voirie cherches dynamiquement (pas de hash hardcode)
+    - zone_name lu de /data/solar/zone.json si absent
+    - template path par defaut : `data/obs_v6_template.html`
+    - re-encodage bitmask facade LSB->MSB (correction v7/v8)
+
+    Pre-requis : `analyze_facades()` + `compute_scores()` + `analyze_troncons()`
+    + `link_bati_troncon()` deja executes. Lit /data/solar/facades.npz,
+    bits.npy, scores.npz, troncon_bits.npy, troncon_samples.npy,
+    troncon_meta.json, ts_info.json, troncon_ts.json, bati_to_troncon.json,
+    mnt_5m.tif.
+
+    Args:
+        zone_name: nom affichage zone (ex: "Marseille 4eme"). Si None,
+            lu depuis zone.json (cle "name" ou "label") sinon "Zone d'etude".
+        template_path: chemin HTML template avec marker `D = __DATA__;`.
+            Defaut : `<repo>/data/obs_v6_template.html`.
+        output_path: chemin de sortie. Defaut :
+            `/data/solar/observatoire.html`.
+        bati_path: GPKG batiments. Recherche dynamique si None.
+        voirie_path: GPKG voirie. Recherche dynamique si None.
+
+    Returns:
+        dict {success, output_path, json_size_mb, html_size_mb, n_bati,
+              n_troncons, n_facades, elapsed_s, warnings: [...]}
+    """
+    t0 = time.time()
+    warnings = []
+    S = SOLAR_DIR
+
+    # ----- Resolution chemins -----
+    if bati_path is None:
+        bati_path = _find_file("batiments",
+                                list(Path("/data/cache").glob("*batiment*.gpkg")) +
+                                list(Path("/data").glob("*batiments*.gpkg")))
+        if not bati_path:
+            return {"error": "GPKG batiments introuvable -- charger BD TOPO d'abord."}
+    if voirie_path is None:
+        voirie_path = _find_file("voirie",
+                                  list(Path("/data/cache").glob("*route*.gpkg")) +
+                                  list(Path("/data").glob("*voirie*.gpkg")))
+        if not voirie_path:
+            return {"error": "GPKG voirie introuvable -- charger BD TOPO d'abord."}
+
+    if template_path is None:
+        # Template co-localise dans le repo (data/obs_v6_template.html)
+        here = Path(__file__).resolve().parent.parent
+        candidates = [
+            here / "data" / "obs_v6_template.html",
+            here / "data" / "obs_v5_template.html",
+            Path("/app/data/obs_v6_template.html"),
+        ]
+        for c in candidates:
+            if c.exists():
+                template_path = str(c)
+                break
+        if template_path is None:
+            return {"error": "Template HTML introuvable (cherche obs_v6_template.html / obs_v5_template.html)."}
+
+    if output_path is None:
+        output_path = str(S / "observatoire.html")
+
+    # ----- Zone name -----
+    if zone_name is None:
+        zone_file = S / "zone.json"
+        if zone_file.exists():
+            zd = json.load(open(zone_file))
+            zone_name = zd.get("name") or zd.get("label") or "Zone d'etude"
+        else:
+            zone_name = "Zone d'etude"
+
+    # ----- Chargement sorties pipeline -----
+    try:
+        from qgis.core import QgsVectorLayer
+    except ImportError:
+        return {"error": "qgis.core indisponible -- executer dans le conteneur QGIS."}
+
+    required = ["facades.npz", "bits.npy", "scores.npz", "troncon_bits.npy",
+                "troncon_samples.npy", "troncon_meta.json", "ts_info.json",
+                "troncon_ts.json", "bati_to_troncon.json"]
+    missing = [n for n in required if not (S / n).exists()]
+    if missing:
+        return {"error": f"Sorties pipeline absentes : {missing}. "
+                          "Lancer analyze_facades + compute_scores + "
+                          "analyze_troncons + link_bati_troncon d'abord."}
+
+    fac = np.load(str(S / "facades.npz"))
+    fb = np.load(str(S / "bits.npy"))
+    sc = np.load(str(S / "scores.npz"))
+    tb = np.load(str(S / "troncon_bits.npy"))
+    ts_arr = np.load(str(S / "troncon_samples.npy"))
+    tm = json.load(open(str(S / "troncon_meta.json")))
+    b2t = json.load(open(str(S / "bati_to_troncon.json")))
+    ts_info = json.load(open(str(S / "ts_info.json")))
+    tts_info = json.load(open(str(S / "troncon_ts.json")))
+
+    N_TS = len(ts_info)
+    SBID = fac["bid"]
+    SETAGE = fac["etage"]
+    SNORM = fac["norm"]
+    SHY = sc["sh_year"]
+    SS = sc["sc_sun"]
+    SH2 = sc["sc_hot"]
+    SC_ = sc["sc_com"]
+    N_FAC = len(SBID)
+
+    # ----- Re-encodage bitmask facade LSB -> MSB (compat avec troncon_bits)
+    fb_new = np.zeros_like(fb)
+    for ti in range(N_TS):
+        bit = (fb[:, ti // 8] >> (ti % 8)) & 1
+        bp_new = 7 - (ti % 8)
+        fb_new[:, ti // 8] |= (bit << bp_new)
+    fb = fb_new
+
+    # ----- Groupage samples par batiment -----
+    from collections import defaultdict
+    bid_samples = defaultdict(list)
+    for i in range(N_FAC):
+        bid_samples[int(SBID[i])].append(i)
+    unique_bids = sorted(bid_samples.keys())
+
+    # ----- Layer batiments QGIS -----
+    bl = QgsVectorLayer(str(bati_path), 'b', 'ogr')
+    if not bl.isValid() or bl.featureCount() == 0:
+        sub = bl.dataProvider().subLayers()
+        if sub:
+            ln = sub[0].split('!!::!!')[1]
+            bl = QgsVectorLayer(f'{bati_path}|layername={ln}', 'b', 'ogr')
+
+    # ----- MNT pour terrain grid + centre L93 -----
+    mnt_path = str(S / "mnt_5m.tif")
+    if not os.path.exists(mnt_path):
+        return {"error": f"{mnt_path} absent -- relancer build_dsm() d'abord."}
+    ds_mnt = gdal.Open(mnt_path)
+    gt = ds_mnt.GetGeoTransform()
+    W, H = ds_mnt.RasterXSize, ds_mnt.RasterYSize
+    MNT = ds_mnt.GetRasterBand(1).ReadAsArray().astype(np.float32)
+    ds_mnt = None
+    cx_l93 = gt[0] + W * gt[1] / 2
+    cy_l93 = gt[3] + H * gt[5] / 2
+
+    # ----- Liste batiments avec facades par etage -----
+    bati_list = []
+    for bi_idx, bid in enumerate(unique_bids):
+        feat = bl.getFeature(bid)
+        if not feat.isValid():
+            continue
+        g = feat.geometry()
+        if g.isMultipart():
+            ps = g.asMultiPolygon()
+            if not ps:
+                continue
+            ring = ps[0][0]
+        else:
+            ps = g.asPolygon()
+            if not ps:
+                continue
+            ring = ps[0]
+        if len(ring) < 4:
+            continue
+        ring_l = [[round(p.x() - cx_l93, 1), round(p.y() - cy_l93, 1)] for p in ring]
+
+        h = feat['hauteur'] or 10
+        z0 = feat['altitude_minimale_sol'] or 0
+        n_et = feat['nombre_d_etages'] or max(1, int(round(float(h) / 3)))
+
+        # Groupage samples par (norm, etage)
+        samples = bid_samples[bid]
+        facs = defaultdict(dict)
+        for sid in samples:
+            nr = round(float(SNORM[sid]), 1)
+            et = int(SETAGE[sid])
+            facs[nr][et] = sid
+        fac_list = []
+        for norm, etages in facs.items():
+            ets = sorted(etages.items())
+            et_data = [{
+                'e': et, 'sid': int(sid),
+                'sh': int(SHY[sid]),
+                'ss': float(round(SS[sid], 1)),
+                'sh2': float(round(SH2[sid], 1)),
+                'sc': float(round(SC_[sid], 1)),
+            } for et, sid in ets]
+            fac_list.append({'n': norm, 'e': et_data})
+
+        link = b2t.get(str(bid))
+        all_sids = samples
+        bati_list.append({
+            'i': bi_idx, 'bid': int(bid), 'r': ring_l,
+            'h': round(float(h), 1), 'z0': round(float(z0), 1),
+            'ne': int(n_et),
+            'nl': int(feat['nombre_de_logements'] or 0),
+            'u': str(feat['usage_1'] or '')[:15],
+            'f': fac_list,
+            'tn': link['nom'] if link else None,
+            'tf': link['fid'] if link else None,
+            'sh': int(SHY[all_sids].mean()),
+            'ss': float(round(SS[all_sids].mean(), 1)),
+            'sh2': float(round(SH2[all_sids].mean(), 1)),
+            'sc': float(round(SC_[all_sids].mean(), 1)),
+        })
+
+    # ----- Liste troncons + pourcentages temporels -----
+    tfids = ts_arr['fid']
+    fi_t = defaultdict(list)
+    for i, fd in enumerate(tfids):
+        fi_t[int(fd)].append(i)
+    sorted_tfids = sorted(fi_t.keys())
+    n_tron = len(sorted_tfids)
+
+    all_sun_t = np.zeros((len(ts_arr), N_TS), dtype=np.uint8)
+    for i in range(N_TS):
+        all_sun_t[:, i] = (tb[:, i // 8] >> (7 - (i % 8))) & 1
+    tron_ts_pct = np.zeros((n_tron, N_TS), dtype=np.uint8)
+    for ti_idx, fd in enumerate(sorted_tfids):
+        idxs = fi_t[fd]
+        tron_ts_pct[ti_idx] = (all_sun_t[idxs].mean(axis=0) * 100).astype(np.uint8)
+
+    vl = QgsVectorLayer(str(voirie_path), 'v', 'ogr')
+    if not vl.isValid() or vl.featureCount() == 0:
+        sub = vl.dataProvider().subLayers()
+        if sub:
+            ln = sub[0].split('!!::!!')[1]
+            vl = QgsVectorLayer(f'{voirie_path}|layername={ln}', 'v', 'ogr')
+
+    tron_list = []
+    for ti_idx, fd in enumerate(sorted_tfids):
+        m = tm.get(str(fd), {})
+        feat = vl.getFeature(fd)
+        if not feat.isValid():
+            continue
+        g = feat.geometry()
+        if g.isMultipart():
+            lines = g.asMultiPolyline()
+            if not lines:
+                continue
+            line = max(lines, key=len)
+        else:
+            line = g.asPolyline()
+        pts = []
+        for p in line:
+            c = int((p.x() - gt[0]) / gt[1])
+            r = int((gt[3] - p.y()) / (-gt[5]))
+            z = float(MNT[r, c]) if 0 <= c < W and 0 <= r < H else 50.0
+            pts.append([round(p.x() - cx_l93, 1), round(p.y() - cy_l93, 1), round(z, 1)])
+        tron_list.append({
+            'i': ti_idx, 'f': int(fd),
+            'n': m.get('nom', ''),
+            'L': round(float(m.get('L') or 0), 0),
+            'g': pts,
+        })
+
+    # ----- Terrain grid sous-echantillonne 20m -----
+    STEP = 4
+    terr = MNT[::STEP, ::STEP]
+    tmeta = {
+        'x0': float(gt[0] - cx_l93),
+        'y0': float(gt[3] - cy_l93),
+        's': float(gt[1]) * STEP,
+        'r': int(terr.shape[0]),
+        'c': int(terr.shape[1]),
+        'zmin': float(MNT.min()),
+        'zmax': float(MNT.max()),
+    }
+
+    # ----- Bitmasks base64 -----
+    import base64
+    fb_b64 = base64.b64encode(fb.tobytes()).decode('ascii')
+    tron_ts_b64 = base64.b64encode(tron_ts_pct.tobytes()).decode('ascii')
+
+    # ----- Assemblage JSON -----
+    out = {
+        'm': {
+            'z': zone_name,
+            'cx': float(cx_l93), 'cy': float(cy_l93),
+            'nb': len(bati_list), 'nt': len(tron_list),
+            'nf': int(N_FAC),
+            'ntf': N_TS, 'ntt': N_TS,
+        },
+        'T': [[round(float(z), 1) for z in row] for row in terr],
+        'tm': tmeta,
+        'tsf': [[t[0], t[1], t[2], round(t[3], 1), round(t[4], 1)] for t in ts_info],
+        'tst': [[t[0], t[1], t[2], round(t[3], 1), round(t[4], 1)] for t in tts_info],
+        'B': bati_list, 'R': tron_list,
+        'fb': fb_b64, 'fbs': [int(N_FAC), int(fb.shape[1])],
+        'tb': tron_ts_b64, 'tbs': [int(n_tron), int(N_TS)],
+    }
+
+    # ----- Ecriture JSON + injection template -----
+    json_path = str(S / "observatoire.json")
+    with open(json_path, "w") as f:
+        json.dump(out, f, separators=(",", ":"))
+
+    tmpl = open(template_path, encoding="utf-8").read()
+    if "D = __DATA__;" not in tmpl:
+        warnings.append("Marker `D = __DATA__;` introuvable dans template -- "
+                        "HTML produit sans injection (verifier template).")
+        html = tmpl
+    else:
+        html = tmpl.replace("D = __DATA__;", f"D = {json.dumps(out, separators=(',', ':'))};")
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    json_mb = os.path.getsize(json_path) / 1024 / 1024
+    html_mb = os.path.getsize(output_path) / 1024 / 1024
+    total_etages = sum(len(f["e"]) for b in bati_list for f in b["f"])
+    elapsed = time.time() - t0
+
+    return {
+        "success": True,
+        "output_path": output_path,
+        "json_size_mb": round(json_mb, 2),
+        "html_size_mb": round(html_mb, 2),
+        "n_bati": len(bati_list),
+        "n_troncons": len(tron_list),
+        "n_facades": int(N_FAC),
+        "n_etages": int(total_etages),
+        "zone_name": zone_name,
+        "template_used": template_path,
+        "warnings": warnings,
+        "elapsed_s": round(elapsed, 1),
+    }
+
+
 def run_full(zone=None, profile="standard", skip_rsun=False, **overrides):
     """Run complete observatoire solaire pipeline.
 
@@ -1401,6 +1734,24 @@ def run_full(zone=None, profile="standard", skip_rsun=False, **overrides):
         results["links"] = {"n_linked": len(links)}
     except Exception as e:
         results["links"] = {"error": str(e)}
+
+    # Step 7: Build observatoire HTML autonome (Three.js + DSFR)
+    # Non-fatal : si le template manque ou un GPKG est absent on garde
+    # les sorties NumPy et on logue l'erreur, l'utilisateur peut relancer
+    # build_observatoire_html() seul plus tard.
+    print("[solar] === Step 7: Build observatoire HTML ===", flush=True)
+    try:
+        obs_result = build_observatoire_html(zone_name=zone)
+        results["observatoire"] = obs_result
+        if "error" in obs_result:
+            results["warnings"].append(
+                f"Step 7 build_observatoire_html : {obs_result['error']}"
+            )
+    except Exception as e:
+        msg = f"build_observatoire_html exception : {e}"
+        print(f"[solar] WARNING: {msg}", flush=True)
+        results["warnings"].append(msg)
+        results["observatoire"] = {"error": str(e)}
 
     total = time.time() - t_start
     results["total_elapsed_s"] = round(total, 1)
