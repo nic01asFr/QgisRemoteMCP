@@ -63,6 +63,9 @@ PROFILES = {
         "facade_min_length": 5,     # Min facade segment length (meters)
         "nprocs": 2,                # GRASS parallel processes
         "albedo": 0.2,
+        "terrain_resolution": 5,   # RGE Alti download resolution (meters)
+        "hour_start": 5,
+        "hour_end": 22,
     },
     "standard": {
         "resolution": 5,
@@ -70,21 +73,27 @@ PROFILES = {
         "months": list(range(1, 13)),
         "time_step": 0.5,
         "ray_step": 1.5,
-        "max_shadow_dist": 300,
+        "max_shadow_dist": 500,
         "facade_min_length": 3,
         "nprocs": 2,
         "albedo": 0.2,
+        "terrain_resolution": 1,   # RGE Alti native download (1m)
+        "hour_start": 5,
+        "hour_end": 22,
     },
     "precision": {
-        "resolution": 1,
-        "buffer_m": 300,
+        "resolution": 2,
+        "buffer_m": 500,
         "months": list(range(1, 13)),
         "time_step": 0.5,
         "ray_step": 1.0,
-        "max_shadow_dist": 500,
+        "max_shadow_dist": 800,
         "facade_min_length": 2,
         "nprocs": 4,
         "albedo": 0.2,
+        "terrain_resolution": 1,
+        "hour_start": 4,
+        "hour_end": 23,
     },
 }
 
@@ -132,10 +141,12 @@ def build_dsm(config):
     res = config["resolution"]
     buffer_m = config["buffer_m"]
 
-    # Find MNT raster
+    # Find MNT raster (must have valid CRS — skip raw TIFs without geotransform)
     mnt_path = _find_file("rge_alti", ["/data/solar/rge_alti.tif"] +
                           list(Path("/data/cache").glob("*alti*.tif")) +
-                          list(Path("/data").glob("*rge_alti*.tif")))
+                          list(Path("/data").glob("*rge_alti*.tif")) +
+                          list(Path("/data").glob("*mnt*.tif")),
+                          require_crs=True)
     if not mnt_path:
         return {"error": "RGE ALTI not found. Run helpers.download_rge_alti(bbox) first."}
 
@@ -183,10 +194,18 @@ def build_dsm(config):
     H, W = mnt.shape
     ds = None
 
-    # Rasterize buildings onto MNT
-    dsm = mnt.copy()
+    # Rasterize buildings onto MNT using proper gdal.RasterizeLayer
+    # Build memory layer with roof_z attribute and MultiPolygon geometry
+    mem_drv = ogr.GetDriverByName('Memory')
+    mem_ds = mem_drv.CreateDataSource('mem')
+    srs_ogr = osr.SpatialReference()
+    srs_ogr.ImportFromEPSG(2154)
+    mlayer = mem_ds.CreateLayer('bz', srs_ogr, ogr.wkbMultiPolygon)
+    mlayer.CreateField(ogr.FieldDefn('roof_z', ogr.OFTReal))
+
     src = ogr.Open(str(bati_path))
     layer = src.GetLayer(0)
+    n_ok = 0
     for feat in layer:
         h = feat.GetField("hauteur") or 0
         if h <= 0:
@@ -196,18 +215,30 @@ def build_dsm(config):
         geom = feat.GetGeometryRef()
         if geom is None:
             continue
-        geom = ogr.ForceToMultiPolygon(geom) if geom.GetGeometryName() in ("MULTISURFACE", "CURVEPOLYGON") else geom
-        env = geom.GetEnvelope()  # xmin, xmax, ymin, ymax
-        # Pixel range
-        c0 = max(0, int((env[0] - gt[0]) / gt[1]))
-        c1 = min(W, int((env[1] - gt[0]) / gt[1]) + 1)
-        r0 = max(0, int((gt[3] - env[3]) / (-gt[5])))
-        r1 = min(H, int((gt[3] - env[2]) / (-gt[5])) + 1)
-        # Simple rasterization: fill bounding box pixels with max(mnt, z_sol + h)
-        # (Proper rasterization via GDAL would be better for complex shapes)
-        roof_z = (z_sol if z_sol > 0 else float(mnt[max(0, (r0+r1)//2), max(0, (c0+c1)//2)])) + h
-        dsm[r0:r1, c0:c1] = np.maximum(dsm[r0:r1, c0:c1], roof_z)
+        g_mp = ogr.ForceToMultiPolygon(geom)
+        if g_mp is None or g_mp.IsEmpty():
+            continue
+        roof_z = (z_sol if z_sol > 0 else 0) + h
+        nf = ogr.Feature(mlayer.GetLayerDefn())
+        nf.SetField('roof_z', roof_z)
+        nf.SetGeometry(g_mp)
+        mlayer.CreateFeature(nf)
+        n_ok += 1
     src = None
+    print(f"[solar] Rasterizing {n_ok} buildings...", flush=True)
+
+    # Create bati raster (same grid as MNT)
+    bati_ds = gdal.GetDriverByName('MEM').Create('', W, H, 1, gdal.GDT_Float32)
+    bati_ds.SetGeoTransform(gt)
+    bati_ds.SetProjection(ds.GetProjection() if ds else srs_ogr.ExportToWkt())
+    bati_ds.GetRasterBand(1).Fill(0)
+    mlayer.ResetReading()
+    gdal.RasterizeLayer(bati_ds, [1], mlayer, options=['ATTRIBUTE=roof_z'])
+    bati_arr = bati_ds.GetRasterBand(1).ReadAsArray()
+    bati_ds = None
+    mem_ds = None
+
+    dsm = np.maximum(mnt, bati_arr).astype(np.float32)
 
     # Write DSM
     dsm_path = str(SOLAR_DIR / f"dsm_hybride_{res}m.tif")
@@ -254,6 +285,12 @@ def run_rsun(config):
         if not os.path.exists(p):
             return {"error": f"Missing: {p}. Run build_dsm() first."}
 
+    # Clean previous rasters to avoid shape mismatch in aggregate
+    for old in SOLAR_DIR.glob("glob_rad_*.tif"):
+        old.unlink()
+    for old in SOLAR_DIR.glob("insol_time_*.tif"):
+        old.unlink()
+
     # Build GRASS script
     lines = ["#!/bin/bash", "set -e"]
     lines.append(f"r.in.gdal input={dsm_path} output=dsm --overwrite")
@@ -293,7 +330,7 @@ def run_rsun(config):
     os.chmod(script_path, 0o755)
 
     result = subprocess.run(
-        ["grass", "--tmp-project", "EPSG:2154", "--exec", "bash", script_path],
+        ["grass", "--tmp-location", "EPSG:2154", "--exec", "bash", script_path],
         capture_output=True, text=True, timeout=3600,
     )
 
@@ -473,6 +510,15 @@ def analyze_facades(config):
     XMIN, YMAX, RES = gt[0], gt[3], gt[1]
     ds = None
 
+    # Load pure MNT (terrain without buildings) for accurate sample ground elevation
+    mnt_path = str(SOLAR_DIR / f"mnt_{res}m.tif")
+    if os.path.exists(mnt_path):
+        ds_mnt = gdal.Open(mnt_path)
+        MNT_PURE = ds_mnt.ReadAsArray().astype(np.float32)
+        ds_mnt = None
+    else:
+        MNT_PURE = DSM  # fallback
+
     # Load irradiance for annual values
     irr_path = str(SOLAR_DIR / "irradiance_annuelle_kwh.tif")
     if os.path.exists(irr_path):
@@ -494,9 +540,18 @@ def analyze_facades(config):
     samples = []  # list of (cx, cy, cz, normal_az, bid, etage)
     src = ogr.Open(str(bati_path))
     layer = src.GetLayer(0)
+    def _mnt_at(x, y):
+        """Sample pure MNT at L93 coords, with clamping."""
+        c = int(round((x - XMIN) / RES))
+        r = int(round((YMAX - y) / RES))
+        c = max(0, min(W - 1, c))
+        r = max(0, min(H - 1, r))
+        return float(MNT_PURE[r, c])
+
     for feat in layer:
         h = feat.GetField("hauteur") or 0
         n_et = feat.GetField("nombre_d_etages") or 1
+        alt_min = feat.GetField("altitude_minimale_sol")
         if h <= 0:
             h = max(n_et * 3.0, 3.0)
         if n_et <= 0:
@@ -514,10 +569,13 @@ def analyze_facades(config):
         ring = poly.GetGeometryRef(0)
         if ring is None or ring.GetPointCount() < 4:
             continue
-        centroid = poly.Centroid()
-        z0_px_c = int((YMAX - centroid.GetY()) / RES)
-        z0_px_r = int((centroid.GetX() - XMIN) / RES)
-        z0 = float(DSM[max(0, min(H-1, z0_px_c)), max(0, min(W-1, z0_px_r))]) - h  # ground ≈ dsm - building height
+
+        # Base elevation: prefer BD TOPO altitude_minimale_sol attribute, fallback to MNT at centroid
+        if alt_min is not None and alt_min > 0:
+            z_base = float(alt_min)
+        else:
+            centroid = poly.Centroid()
+            z_base = _mnt_at(centroid.GetX(), centroid.GetY())
 
         for i in range(ring.GetPointCount() - 1):
             ax, ay = ring.GetX(i), ring.GetY(i)
@@ -529,11 +587,16 @@ def analyze_facades(config):
             nx, ny = dy / seg_len, -dx / seg_len  # outward normal (CCW)
             az = (math.degrees(math.atan2(nx, ny)) + 360) % 360
             mx, my = (ax + bx) / 2, (ay + by) / 2
+            # Offset 1m outside facade
+            sx = mx + nx * 1.0
+            sy = my + ny * 1.0
+            # Ground level at sample position (outside building, on real terrain)
+            z_ground_at_sample = _mnt_at(sx, sy)
             for et in range(n_et):
-                cz = z0 + (et + 0.5) * et_h
-                # Offset 1m along normal
-                sx = mx + nx * 1.0
-                sy = my + ny * 1.0
+                # Compute target z: base + midpoint of etage
+                cz_target = z_base + (et + 0.5) * et_h
+                # Clamp: sample must be at least 0.5m above terrain at sample position
+                cz = max(cz_target, z_ground_at_sample + 0.5)
                 samples.append((sx, sy, cz, az, bid, et))
     src = None
 
@@ -559,14 +622,14 @@ def analyze_facades(config):
                 SIRR[i] = IRR[r, c]
 
     # Build timestep table
-    LAT, LON = 43.306, 5.4  # TODO: read from study zone
+    LAT, LON = _get_study_latlon()
     ts_info = []
     for mo in months:
-        for h in range(5, 22):
+        for h in range(config.get("hour_start", 5), config.get("hour_end", 22)):
             for m in [0, 30]:
                 if config["time_step"] >= 1.0 and m == 30:
                     continue
-                az, el = _sun_pos(2026, mo, 15, h, m, LAT, LON)
+                az, el = _sun_pos(2024, mo, 21, h, m, LAT, LON)
                 ts_info.append([mo, h, m, round(az, 1), round(el, 1)])
     N_TS = len(ts_info)
 
@@ -667,7 +730,7 @@ def compute_scores():
             hiv += bit
         if mo in (6, 7, 8):
             ete += bit
-            if 11 <= h < 15:
+            if 10 <= h < 17:
                 ete_noon += bit
 
     # Normalize to hours/year (each timestep = 0.5h × 30 days/month)
@@ -683,8 +746,8 @@ def compute_scores():
             return np.zeros_like(a, dtype=np.float32)
         return np.clip((a - p5) / (p95 - p5) * 100, 0, 100).astype(np.float32)
 
-    SC_SUN = pct(SIRR.astype(np.float32))
-    SC_HOT = pct(-SH_ETENOON.astype(np.float32))
+    SC_SUN = pct(SH_YEAR.astype(np.float32))
+    SC_HOT = pct(SH_ETENOON.astype(np.float32))
     SC_COM = pct((SH_HIV * 1.5 - SH_ETENOON * 1.0).astype(np.float32))
 
     # Z-score local (50m convolution)
@@ -737,12 +800,25 @@ def compute_scores():
 # UTILITIES
 # ══════════════════════════════════════════════════════════════════════
 
-def _find_file(keyword, candidates):
-    """Find first existing file from candidates list."""
+def _find_file(keyword, candidates, require_crs=False):
+    """Find first existing file from candidates list.
+    If require_crs=True, skip rasters without a valid CRS/geotransform."""
     for c in candidates:
         c = str(c)
-        if os.path.exists(c):
-            return c
+        if not os.path.exists(c):
+            continue
+        if require_crs and c.lower().endswith(".tif"):
+            try:
+                ds = gdal.Open(c)
+                gt = ds.GetGeoTransform()
+                # (0, 1, 0, 0, 0, -1) is the default = no real geotransform
+                if gt[0] == 0 and gt[3] == 0:
+                    ds = None
+                    continue
+                ds = None
+            except Exception:
+                continue
+        return c
     return None
 
 
@@ -768,27 +844,572 @@ def _write_raster(path, arr, geotransform, epsg):
 
 
 def _sun_pos(year, month, day, hour, minute, lat, lon):
-    """Simple solar position (NOAA-like). Returns (azimuth_deg, elevation_deg)."""
-    from datetime import datetime
-    dt = datetime(year, month, day, hour, minute)
-    n = dt.timetuple().tm_yday
-    H_local = hour + minute / 60.0
-    B = math.radians(360 / 365 * (n - 81))
-    EoT = 9.87 * math.sin(2 * B) - 7.53 * math.cos(B) - 1.5 * math.sin(B)
-    decl = math.radians(23.45 * math.sin(math.radians(360 / 365 * (n - 81))))
-    LSTM = 15 * 1  # UTC+1
-    TC = 4 * (lon - LSTM) + EoT
-    LST = H_local + TC / 60.0
-    HRA = math.radians(15 * (LST - 12))
-    lat_r = math.radians(lat)
-    sin_el = math.sin(lat_r) * math.sin(decl) + math.cos(lat_r) * math.cos(decl) * math.cos(HRA)
-    elev = math.degrees(math.asin(max(-1, min(1, sin_el))))
-    cos_el = math.cos(math.radians(elev))
-    if cos_el < 1e-6:
-        return 180.0, elev
-    cos_az = (math.sin(decl) - math.sin(math.radians(elev)) * math.sin(lat_r)) / (cos_el * math.cos(lat_r))
-    cos_az = max(-1, min(1, cos_az))
-    az = math.degrees(math.acos(cos_az))
-    if HRA > 0:
-        az = 360 - az
-    return az, elev
+    """PSA solar position (Blanco-Muriel 2001). Returns (azimuth_deg 0-360, elevation_deg).
+    Automatic France DST: UTC+2 Apr-Oct, UTC+1 Nov-Mar."""
+    tz = 2 if 4 <= month <= 10 else 1
+    dh = hour + minute / 60.0 - tz
+    a1 = int((month - 14) / 12)
+    jdi = (1461 * (year + 4800 + a1)) // 4 + (367 * (month - 2 - 12 * a1)) // 12 \
+        - (3 * ((year + 4900 + a1) // 100)) // 4 + day - 32075
+    jd = jdi - 0.5 + dh / 24.0
+    n = jd - 2451545.0
+    omega = 2.1429 - 0.0010394594 * n
+    L = 4.8950630 + 0.017202791698 * n
+    g = 6.2400600 + 0.0172019699 * n
+    eclon = L + 0.03341607 * math.sin(g) + 0.00034894 * math.sin(2 * g) \
+        - 0.0001134 - 0.0000203 * math.sin(omega)
+    eobl = 0.4090928 - 6.214e-9 * n + 0.0000396 * math.cos(omega)
+    se = math.sin(eclon)
+    ra = math.atan2(math.cos(eobl) * se, math.cos(eclon))
+    if ra < 0:
+        ra += 2 * math.pi
+    decl = math.asin(math.sin(eobl) * se)
+    gmst = 6.6974243242 + 0.0657098283 * n + dh
+    lmst = (gmst * 15 + lon) * math.pi / 180
+    ha = lmst - ra
+    lr = lat * math.pi / 180
+    cha = math.cos(ha)
+    el = math.asin(math.cos(lr) * cha * math.cos(decl) + math.sin(decl) * math.sin(lr))
+    az = math.atan2(-math.sin(ha), math.tan(decl) * math.cos(lr) - math.sin(lr) * cha)
+    if az < 0:
+        az += 2 * math.pi
+    return (math.degrees(az), math.degrees(el))
+
+
+def _get_study_latlon():
+    """Lit lat/lon du centre de la zone d'etude.
+
+    Ordre de priorite : variables projet QGIS -> /data/solar/zone.json
+    (center_lat/lon explicites OU centroide bbox_2154 reprojete). Leve
+    RuntimeError si aucune source disponible -- pas de fallback silencieux
+    (sinon les positions solaires seraient calculees pour les mauvaises
+    coordonnees et les scores faussement plausibles).
+    """
+    # 1. Variables projet QGIS
+    try:
+        from qgis.core import QgsProject
+        prj = QgsProject.instance()
+        lat_s = prj.readEntry("study_zone", "center_lat", "")[0]
+        lon_s = prj.readEntry("study_zone", "center_lon", "")[0]
+        if lat_s and lon_s:
+            return float(lat_s), float(lon_s)
+    except Exception:
+        pass
+
+    # 2. zone.json depose par set_study_zone
+    zone_file = SOLAR_DIR / "zone.json"
+    if zone_file.exists():
+        zd = json.load(open(zone_file))
+        if "center_lat" in zd and "center_lon" in zd:
+            return float(zd["center_lat"]), float(zd["center_lon"])
+        if "bbox_2154" in zd:
+            try:
+                from pyproj import Transformer
+                b = zd["bbox_2154"]
+                t = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
+                lon, lat = t.transform((b[0] + b[2]) / 2, (b[1] + b[3]) / 2)
+                return float(lat), float(lon)
+            except ImportError:
+                pass  # pyproj absent, on echoue plus bas
+
+    # 3. Echec explicite (pas de fallback silencieux)
+    raise RuntimeError(
+        "Impossible de determiner lat/lon de la zone d'etude. "
+        "Appeler set_study_zone() ou definir les variables projet "
+        "study_zone/center_lat,center_lon avant analyze_facades()."
+    )
+
+
+def _get_study_bbox():
+    """Read bbox_2154 from QGIS project or /data/solar/zone.json."""
+    zone_file = SOLAR_DIR / "zone.json"
+    if zone_file.exists():
+        return json.load(open(zone_file))["bbox_2154"]
+    try:
+        from qgis.core import QgsProject
+        s = QgsProject.instance().readEntry("study_zone", "bbox_2154", "")[0]
+        if s:
+            return [float(x) for x in s.split(",")]
+    except Exception:
+        pass
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════
+# DOWNLOAD RGE ALTI via WMS-R
+# ══════════════════════════════════════════════════════════════════════
+
+def download_mnt(bbox_2154=None, resolution=5, out_path=None, native_resolution=1):
+    """Download RGE Alti from IGN Geoplateforme WMS-R.
+
+    Downloads at native_resolution (default 1m) then resamples to target resolution for DSM.
+    Also saves a 1m version for terrain display.
+
+    Args:
+        bbox_2154: [xmin, ymin, xmax, ymax] in EPSG:2154. If None, reads from study zone.
+        resolution: target pixel size in meters for DSM (default 5m)
+        out_path: output GeoTIFF path for DSM-resolution (default /data/solar/rge_alti.tif)
+        native_resolution: download resolution (1m = native RGE Alti)
+
+    Returns dict with path + stats.
+    """
+    import urllib.request
+
+    if bbox_2154 is None:
+        bbox_2154 = _get_study_bbox()
+    if bbox_2154 is None:
+        return {"error": "No bbox. Call set_study_zone() first or pass bbox_2154."}
+
+    xmin, ymin, xmax, ymax = bbox_2154
+    if out_path is None:
+        out_path = str(SOLAR_DIR / "rge_alti.tif")
+
+    # Download at native_resolution
+    w_px = int((xmax - xmin) / native_resolution)
+    h_px = int((ymax - ymin) / native_resolution)
+    # Cap to 4096 px per dimension (WMS limit) — adjust resolution if needed
+    MAX_PX = 4096
+    actual_res = native_resolution
+    if w_px > MAX_PX or h_px > MAX_PX:
+        actual_res = max((xmax - xmin), (ymax - ymin)) / MAX_PX
+        w_px = int((xmax - xmin) / actual_res)
+        h_px = int((ymax - ymin) / actual_res)
+        print(f"[solar] Area too large for {native_resolution}m, using {actual_res:.1f}m", flush=True)
+
+    url = (
+        f"https://data.geopf.fr/wms-r?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap"
+        f"&LAYERS=ELEVATION.ELEVATIONGRIDCOVERAGE.HIGHRES"
+        f"&CRS=EPSG:2154&BBOX={xmin},{ymin},{xmax},{ymax}"
+        f"&WIDTH={w_px}&HEIGHT={h_px}"
+        f"&FORMAT=image/tiff&STYLES="
+    )
+
+    t0 = time.time()
+    print(f"[solar] Downloading RGE Alti {w_px}x{h_px} px...", flush=True)
+    raw_path = out_path + ".raw.tif"
+    urllib.request.urlretrieve(url, raw_path)
+
+    # The WMS response is a raw TIFF without proper geotransform — add it
+    ds = gdal.Open(raw_path, gdal.GA_Update)
+    if ds is None:
+        return {"error": f"Downloaded file is not a valid TIFF"}
+    px_x = (xmax - xmin) / ds.RasterXSize
+    px_y = (ymax - ymin) / ds.RasterYSize
+    ds.SetGeoTransform([xmin, px_x, 0, ymax, 0, -px_y])
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(2154)
+    ds.SetProjection(srs.ExportToWkt())
+    ds.FlushCache()
+    ds = None
+
+    # Save native resolution version for terrain display
+    native_path = str(SOLAR_DIR / f"rge_alti_native_{int(actual_res)}m.tif")
+    if actual_res != resolution:
+        import shutil
+        shutil.copy(raw_path, native_path)
+
+    # Resample to target DSM resolution
+    if resolution > actual_res:
+        _run_gdal(f"gdalwarp -overwrite -tr {resolution} {resolution} -r bilinear "
+                  f"-te {xmin} {ymin} {xmax} {ymax} "
+                  f"-t_srs EPSG:2154 {raw_path} {out_path}")
+        os.remove(raw_path)
+    else:
+        os.rename(raw_path, out_path)
+        native_path = out_path  # same file
+
+    ds = gdal.Open(out_path)
+    band = ds.GetRasterBand(1)
+    arr = band.ReadAsArray()
+    stats = {"min": float(arr.min()), "max": float(arr.max()), "mean": float(arr.mean())}
+    w, h = ds.RasterXSize, ds.RasterYSize
+    ds = None
+
+    elapsed = time.time() - t0
+    print(f"[solar] RGE Alti downloaded: {w}x{h} px, z={stats['min']:.0f}-{stats['max']:.0f}m ({elapsed:.1f}s)", flush=True)
+    return {"success": True, "path": out_path, "size_px": f"{w}x{h}", "stats": stats, "elapsed_s": round(elapsed, 1)}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# TRONCON SAMPLING + RAYCAST
+# ══════════════════════════════════════════════════════════════════════
+
+def sample_troncons(voirie_path=None, dsm_path=None, mnt_path=None, step_m=5.0):
+    """Sample points along BD TOPO troncons within DSM extent.
+
+    Returns (samples_array, troncon_meta_dict).
+    """
+    if voirie_path is None:
+        voirie_path = str(_find_file("voirie", list(Path("/data/cache").glob("*route*.gpkg")) +
+                                     list(Path("/data").glob("*voirie*.gpkg"))))
+    if dsm_path is None:
+        res = 5  # default
+        dsm_path = str(SOLAR_DIR / f"dsm_hybride_{res}m.tif")
+    if mnt_path is None:
+        mnt_path = str(SOLAR_DIR / "rge_alti.tif")
+
+    from qgis.core import QgsVectorLayer, QgsRectangle
+
+    ds = gdal.Open(dsm_path)
+    gt = ds.GetGeoTransform()
+    W, H = ds.RasterXSize, ds.RasterYSize
+    PIX = gt[1]
+    X0, Y0 = gt[0], gt[3]
+    ds2 = gdal.Open(mnt_path)
+    MNT = ds2.GetRasterBand(1).ReadAsArray().astype(np.float32)
+    ds2 = None
+
+    lidar_box = QgsRectangle(X0, Y0 + H * gt[5], X0 + W * PIX, Y0)
+
+    vl = QgsVectorLayer(voirie_path, 'v', 'ogr')
+    if not vl.isValid():
+        # try with sublayer
+        sub = vl.dataProvider().subLayers()
+        if sub:
+            ln = sub[0].split('!!::!!')[1]
+            vl = QgsVectorLayer(f'{voirie_path}|layername={ln}', 'v', 'ogr')
+
+    samples = []
+    meta = {}
+    sid = 0
+
+    def _san(v):
+        if v is None:
+            return None
+        try:
+            if hasattr(v, 'isNull') and v.isNull():
+                return None
+        except Exception:
+            pass
+        s = str(v)
+        if s in ('NULL', 'None'):
+            return None
+        try:
+            return float(s) if '.' in s else int(s)
+        except Exception:
+            return s
+
+    for f in vl.getFeatures():
+        g = f.geometry()
+        bb = g.boundingBox()
+        if not lidar_box.intersects(bb):
+            continue
+        L = g.length()
+        if L < 5:
+            continue
+        fid = f.id()
+        nom = f['nom_voie_ban_gauche'] or f['nom_voie_ban_droite']
+        if not nom:
+            try:
+                nom = f['cpx_toponyme_route_nommee']
+            except Exception:
+                nom = None
+        nom = _san(nom)
+        n = max(2, int(L / step_m) + 1)
+        start = sid
+        n_added = 0
+        for k in range(n):
+            s = min(L, k * step_m)
+            p = g.interpolate(s).asPoint()
+            if not (X0 <= p.x() < X0 + W * PIX and Y0 + H * gt[5] <= p.y() < Y0):
+                continue
+            col = int((p.x() - X0) / PIX)
+            row = int((Y0 - p.y()) / PIX)
+            if not (0 <= col < W and 0 <= row < H):
+                continue
+            z = float(MNT[row, col]) + 1.5
+            samples.append((sid, fid, round(s, 1), p.x(), p.y(), z, col, row))
+            sid += 1
+            n_added += 1
+        if n_added > 0:
+            orient = _san(f['orientation_deg']) if 'orientation_deg' in [fl.name() for fl in vl.fields()] else None
+            meta[fid] = {'nom': nom, 'L': round(L, 1), 'orient': orient, 'start': start, 'n': n_added}
+
+    arr = np.array(samples, dtype=[('sid', 'i4'), ('fid', 'i4'), ('s', 'f4'),
+                                    ('x', 'f8'), ('y', 'f8'), ('z', 'f4'), ('col', 'i4'), ('row', 'i4')])
+    print(f"[solar] Troncons: {len(meta)} troncons, {len(arr)} samples", flush=True)
+    return arr, meta
+
+
+def analyze_troncons(config, voirie_path=None):
+    """Run raycast for troncon samples. Same engine as facades but z=MNT+1.5m.
+
+    Saves /data/solar/troncon_bits.npy, /data/solar/troncon_samples.npy, /data/solar/troncon_meta.json
+    """
+    t0 = time.time()
+    res = config["resolution"]
+    dsm_path = str(SOLAR_DIR / f"dsm_hybride_{res}m.tif")
+    mnt_path = str(SOLAR_DIR / f"mnt_{res}m.tif")
+    if not os.path.exists(mnt_path):
+        mnt_path = str(SOLAR_DIR / "rge_alti.tif")
+
+    arr, meta = sample_troncons(voirie_path, dsm_path, mnt_path, step_m=config.get("troncon_step", 5.0))
+    if len(arr) == 0:
+        return {"error": "No troncon samples generated."}
+
+    np.save(str(SOLAR_DIR / "troncon_samples.npy"), arr)
+    with open(str(SOLAR_DIR / "troncon_meta.json"), "w") as f:
+        json.dump({str(k): v for k, v in meta.items()}, f, ensure_ascii=False)
+
+    # Load DSM
+    ds = gdal.Open(dsm_path)
+    gt = ds.GetGeoTransform()
+    W, H = ds.RasterXSize, ds.RasterYSize
+    PIX = float(gt[1])
+    X0, Y0 = gt[0], gt[3]
+    DSM = ds.GetRasterBand(1).ReadAsArray().astype(np.float32)
+    ds = None
+
+    # Load MNT for EYE level
+    ds2 = gdal.Open(mnt_path)
+    MNT = ds2.GetRasterBand(1).ReadAsArray().astype(np.float32)
+    ds2 = None
+
+    LAT, LON = _get_study_latlon()
+    months = config["months"]
+    ts_info = []
+    for mo in months:
+        for h in range(config.get("hour_start", 5), config.get("hour_end", 22)):
+            for m in [0, 30]:
+                if config["time_step"] >= 1.0 and m == 30:
+                    continue
+                az, el = _sun_pos(2024, mo, 21, h, m, LAT, LON)
+                ts_info.append([mo, h, m, round(az, 1), round(el, 1)])
+    N_TS = len(ts_info)
+
+    # Vectorized shadow map approach (fast — 30ms per timestep)
+    N = len(arr)
+    N_BYTES = (N_TS + 7) // 8
+    bits = np.zeros((N, N_BYTES), dtype=np.uint8)
+    EYE = MNT + 1.5
+    max_steps = int(config["max_shadow_dist"] / PIX)
+
+    for ti in range(N_TS):
+        mo, h, m, az, el = ts_info[ti]
+        if el <= 0:
+            continue
+        # Full shadow map (vectorized over all pixels)
+        az_r, el_r = math.radians(az), math.radians(el)
+        dxh, dyh, te = math.sin(az_r), math.cos(az_r), math.tan(el_r)
+        shadow = np.zeros((H, W), dtype=bool)
+        for s in range(1, max_steps + 1):
+            d = s * PIX
+            rz = EYE + te * d
+            sc = int(round(s * dxh))
+            sr = int(round(s * -dyh))
+            out = np.full((H, W), -1e9, dtype=np.float32)
+            r0s, r1s = max(0, sr), min(H, H + sr)
+            c0s, c1s = max(0, sc), min(W, W + sc)
+            if r1s > r0s and c1s > c0s:
+                out[r0s - sr:r1s - sr, c0s - sc:c1s - sc] = DSM[r0s:r1s, c0s:c1s]
+            shadow |= out > (rz + 0.5)
+        # Sample at troncon positions
+        sun = ~shadow[arr['row'], arr['col']]
+        bi = ti // 8
+        bp = 7 - (ti % 8)
+        bits[sun, bi] |= (1 << bp)
+
+    np.save(str(SOLAR_DIR / "troncon_bits.npy"), bits)
+    with open(str(SOLAR_DIR / "troncon_ts.json"), "w") as f:
+        json.dump(ts_info, f)
+
+    elapsed = time.time() - t0
+    print(f"[solar] Troncon raycast: {N} samples × {N_TS} ts in {elapsed:.1f}s", flush=True)
+    return {"success": True, "n_samples": N, "n_ts": N_TS, "elapsed_s": round(elapsed, 1)}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# LINK BATI ↔ TRONCON
+# ══════════════════════════════════════════════════════════════════════
+
+def link_bati_troncon(bati_path=None, voirie_path=None, max_dist=50):
+    """For each bati, find nearest named troncon. Returns dict bati_fid → {fid, nom, dist}."""
+    from qgis.core import QgsVectorLayer, QgsSpatialIndex, QgsGeometry
+    from collections import defaultdict
+
+    if bati_path is None:
+        bati_path = str(_find_file("batiments", list(Path("/data/cache").glob("*batiment*.gpkg")) +
+                                   list(Path("/data").glob("*batiments*.gpkg"))))
+    if voirie_path is None:
+        voirie_path = str(_find_file("voirie", list(Path("/data/cache").glob("*route*.gpkg")) +
+                                     list(Path("/data").glob("*voirie*.gpkg"))))
+
+    vl = QgsVectorLayer(voirie_path, 'v', 'ogr')
+    if not vl.isValid():
+        sub = vl.dataProvider().subLayers()
+        if sub:
+            vl = QgsVectorLayer(f'{voirie_path}|layername={sub[0].split("!!::!!")[1]}', 'v', 'ogr')
+
+    bl = QgsVectorLayer(bati_path, 'b', 'ogr')
+    if not bl.isValid():
+        sub = bl.dataProvider().subLayers()
+        if sub:
+            bl = QgsVectorLayer(f'{bati_path}|layername={sub[0].split("!!::!!")[1]}', 'b', 'ogr')
+
+    idx = QgsSpatialIndex()
+    tronc_geoms = {}
+    tronc_nom = {}
+    for f in vl.getFeatures():
+        nm = None
+        for field in ['nom_voie_ban_gauche', 'nom_voie_ban_droite', 'cpx_toponyme_route_nommee']:
+            try:
+                v = f[field]
+                if v and str(v) not in ('NULL', 'None'):
+                    nm = str(v)
+                    break
+            except Exception:
+                continue
+        if not nm:
+            continue
+        idx.addFeature(f)
+        tronc_geoms[f.id()] = QgsGeometry(f.geometry())
+        tronc_nom[f.id()] = nm
+
+    bati2tron = {}
+    for f in bl.getFeatures():
+        h = f['hauteur']
+        if h is None or h < 2:
+            continue
+        g = f.geometry()
+        c = g.centroid().asPoint()
+        cands = idx.nearestNeighbor(c, 5, max_dist)
+        best, best_d = None, 1e9
+        for fid in cands:
+            d = tronc_geoms[fid].distance(g)
+            if d < best_d:
+                best_d, best = d, fid
+        if best is not None and best_d < max_dist:
+            bati2tron[f.id()] = {'fid': best, 'nom': tronc_nom[best], 'dist': round(best_d, 1)}
+
+    out_path = str(SOLAR_DIR / "bati_to_troncon.json")
+    with open(out_path, "w") as fp:
+        json.dump({str(k): v for k, v in bati2tron.items()}, fp, ensure_ascii=False)
+
+    print(f"[solar] Linked {len(bati2tron)} batis to troncons", flush=True)
+    return bati2tron
+
+
+# ══════════════════════════════════════════════════════════════════════
+# FULL ORCHESTRATOR
+# ══════════════════════════════════════════════════════════════════════
+
+def run_full(zone=None, profile="standard", skip_rsun=False, **overrides):
+    """Run complete observatoire solaire pipeline.
+
+    Args:
+        zone: commune name or address (triggers set_study_zone + smart_load)
+        profile: 'rapide', 'standard', or 'precision'
+        skip_rsun: si True, saute run_rsun() + aggregate_annual() (mode degrade
+            "heures de soleil seules", sans valeurs kWh/m2 reelles -- a utiliser
+            uniquement si GRASS GIS est absent du conteneur). Par defaut False :
+            le pipeline complet calcule l'irradiance r.sun et l'agregation
+            annuelle, sans quoi `SIRR` reste nul dans `facades.npz` et les
+            z-scores locaux sont inutilisables.
+        **overrides: override any config param
+
+    Returns dict with all output paths + warnings explicites si mode degrade.
+    """
+    t_start = time.time()
+    config = get_config(profile, **overrides)
+    results = {"config": config, "skip_rsun": skip_rsun, "warnings": []}
+
+    # Step 0: Set study zone if provided
+    if zone:
+        try:
+            from qgis.core import QgsProject
+            # Import helpers to set study zone
+            import sys
+            if '/app/src' not in sys.path:
+                sys.path.insert(0, '/app/src')
+            from qgis_helpers import set_study_zone as _set_zone
+            _set_zone(zone)
+            print(f"[solar] Study zone set: {zone}", flush=True)
+        except Exception as e:
+            print(f"[solar] Warning: could not set study zone: {e}", flush=True)
+
+    bbox = _get_study_bbox()
+    if bbox is None:
+        return {"error": "No study zone set. Call set_study_zone() or pass zone=."}
+
+    buffer_m = config["buffer_m"]
+    bbox_ext = [bbox[0] - buffer_m, bbox[1] - buffer_m, bbox[2] + buffer_m, bbox[3] + buffer_m]
+
+    # Step 1: Download MNT
+    print("[solar] === Step 1: Download RGE Alti ===", flush=True)
+    mnt_result = download_mnt(bbox_ext, config["resolution"],
+                               native_resolution=config.get("terrain_resolution", 1))
+    if "error" in mnt_result:
+        return mnt_result
+    results["mnt"] = mnt_result
+
+    # Step 2: Build DSM
+    print("[solar] === Step 2: Build DSM ===", flush=True)
+    dsm_result = build_dsm(config)
+    if "error" in dsm_result:
+        return dsm_result
+    results["dsm"] = dsm_result
+
+    # Step 2b: r.sun -- irradiance raster mensuelle (GRASS GIS)
+    # Step 2c: aggregate_annual -- somme 12 mois -> irradiance_annuelle_kwh.tif
+    # Sans ces deux etapes, analyze_facades ne trouve pas le raster
+    # irradiance -> SIRR = zeros -> z-scores locaux faux. Le flag skip_rsun
+    # permet le mode degrade quand GRASS est absent du conteneur.
+    if skip_rsun:
+        msg = ("Mode degrade : run_rsun() + aggregate_annual() sautes "
+               "(skip_rsun=True). SIRR=0 dans facades.npz, z-scores locaux "
+               "inutilisables, seuls SC_SUN/SC_HOT/SC_COM (heures de soleil "
+               "geometriques) sont valides.")
+        print(f"[solar] WARNING: {msg}", flush=True)
+        results["warnings"].append(msg)
+    else:
+        print("[solar] === Step 2b: r.sun monthly irradiance ===", flush=True)
+        rsun_result = run_rsun(config)
+        if "error" in rsun_result:
+            return rsun_result
+        results["rsun"] = rsun_result
+
+        print("[solar] === Step 2c: Aggregate annual ===", flush=True)
+        agg_result = aggregate_annual()
+        if "error" in agg_result:
+            return agg_result
+        results["aggregate"] = agg_result
+
+    # Step 3: Facade raycast
+    print("[solar] === Step 3: Facade raycast ===", flush=True)
+    facade_result = analyze_facades(config)
+    if "error" in facade_result:
+        return facade_result
+    results["facades"] = facade_result
+
+    # Step 4: Troncon raycast
+    print("[solar] === Step 4: Troncon raycast ===", flush=True)
+    troncon_result = analyze_troncons(config)
+    if "error" in troncon_result:
+        results["troncons"] = troncon_result  # non-fatal
+    else:
+        results["troncons"] = troncon_result
+
+    # Step 5: Scores
+    print("[solar] === Step 5: Compute scores ===", flush=True)
+    scores_result = compute_scores()
+    results["scores"] = scores_result
+
+    # Step 6: Link bati↔troncon
+    print("[solar] === Step 6: Link bati↔troncon ===", flush=True)
+    try:
+        links = link_bati_troncon()
+        results["links"] = {"n_linked": len(links)}
+    except Exception as e:
+        results["links"] = {"error": str(e)}
+
+    total = time.time() - t_start
+    results["total_elapsed_s"] = round(total, 1)
+    results["success"] = True
+
+    # Save manifest
+    manifest_path = str(SOLAR_DIR / "manifest.json")
+    with open(manifest_path, "w") as f:
+        json.dump(results, f, indent=2, default=str)
+
+    print(f"[solar] === Pipeline complete in {total:.0f}s ===", flush=True)
+    return results
