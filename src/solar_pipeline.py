@@ -877,15 +877,14 @@ def _sun_pos(year, month, day, hour, minute, lat, lon):
 
 
 def _get_study_latlon():
-    """Lit lat/lon du centre de la zone d'etude.
-
-    Ordre de priorite : variables projet QGIS -> /data/solar/zone.json
-    (center_lat/lon explicites OU centroide bbox_2154 reprojete). Leve
-    RuntimeError si aucune source disponible -- pas de fallback silencieux
-    (sinon les positions solaires seraient calculees pour les mauvaises
-    coordonnees et les scores faussement plausibles).
-    """
-    # 1. Variables projet QGIS
+    """Read lat/lon from zone.json or QGIS project variables. Raises if unavailable."""
+    zone_file = SOLAR_DIR / "zone.json"
+    if zone_file.exists():
+        z = json.load(open(zone_file))
+        if "center_4326" in z:
+            return z["center_4326"][1], z["center_4326"][0]
+        if "lat" in z:
+            return z["lat"], z["lon"]
     try:
         from qgis.core import QgsProject
         prj = QgsProject.instance()
@@ -895,29 +894,7 @@ def _get_study_latlon():
             return float(lat_s), float(lon_s)
     except Exception:
         pass
-
-    # 2. zone.json depose par set_study_zone
-    zone_file = SOLAR_DIR / "zone.json"
-    if zone_file.exists():
-        zd = json.load(open(zone_file))
-        if "center_lat" in zd and "center_lon" in zd:
-            return float(zd["center_lat"]), float(zd["center_lon"])
-        if "bbox_2154" in zd:
-            try:
-                from pyproj import Transformer
-                b = zd["bbox_2154"]
-                t = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
-                lon, lat = t.transform((b[0] + b[2]) / 2, (b[1] + b[3]) / 2)
-                return float(lat), float(lon)
-            except ImportError:
-                pass  # pyproj absent, on echoue plus bas
-
-    # 3. Echec explicite (pas de fallback silencieux)
-    raise RuntimeError(
-        "Impossible de determiner lat/lon de la zone d'etude. "
-        "Appeler set_study_zone() ou definir les variables projet "
-        "study_zone/center_lat,center_lon avant analyze_facades()."
-    )
+    raise RuntimeError("Cannot determine study zone lat/lon. Call set_study_zone() first.")
 
 
 def _get_study_bbox():
@@ -1290,361 +1267,379 @@ def link_bati_troncon(bati_path=None, voirie_path=None, max_dist=50):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# FULL ORCHESTRATOR
+# ══════════════════════════════════════════════════════════════════════
+# STEP 8: GROUND SHADOW MAP
 # ══════════════════════════════════════════════════════════════════════
 
-# ══════════════════════════════════════════════════════════════════════
-# STEP 7: BUILD OBSERVATOIRE HTML
-# ══════════════════════════════════════════════════════════════════════
+def analyze_ground(config):
+    """Compute per-pixel ground shadow bitset for terrain display.
 
-def build_observatoire_html(zone_name=None, template_path=None,
-                            output_path=None, bati_path=None, voirie_path=None):
-    """Assemble les sorties NumPy + injecte dans template HTML autonome.
+    For each pixel of the MNT grid, ray-march on DSM to test solar visibility
+    per timestep. Produces a binary array for the Three.js ground shadow texture.
 
-    Refactor de `data/build_obs_v5.py` rendu generic pour la recipe V2 :
-    - bati / voirie cherches dynamiquement (pas de hash hardcode)
-    - zone_name lu de /data/solar/zone.json si absent
-    - template path par defaut : `data/obs_v6_template.html`
-    - re-encodage bitmask facade LSB->MSB (correction v7/v8)
-
-    Pre-requis : `analyze_facades()` + `compute_scores()` + `analyze_troncons()`
-    + `link_bati_troncon()` deja executes. Lit /data/solar/facades.npz,
-    bits.npy, scores.npz, troncon_bits.npy, troncon_samples.npy,
-    troncon_meta.json, ts_info.json, troncon_ts.json, bati_to_troncon.json,
-    mnt_5m.tif.
-
-    Args:
-        zone_name: nom affichage zone (ex: "Marseille 4eme"). Si None,
-            lu depuis zone.json (cle "name" ou "label") sinon "Zone d'etude".
-        template_path: chemin HTML template avec marker `D = __DATA__;`.
-            Defaut : `<repo>/data/obs_v6_template.html`.
-        output_path: chemin de sortie. Defaut :
-            `/data/solar/observatoire.html`.
-        bati_path: GPKG batiments. Recherche dynamique si None.
-        voirie_path: GPKG voirie. Recherche dynamique si None.
-
-    Returns:
-        dict {success, output_path, json_size_mb, html_size_mb, n_bati,
-              n_troncons, n_facades, elapsed_s, warnings: [...]}
+    Outputs /data/solar/ground_bits.npy + /data/solar/ground_meta.json
     """
     t0 = time.time()
-    warnings = []
-    S = SOLAR_DIR
+    res = config["resolution"]
+    dsm_path = str(SOLAR_DIR / f"dsm_hybride_{res}m.tif")
+    mnt_path = str(SOLAR_DIR / f"mnt_{res}m.tif")
 
-    # ----- Resolution chemins -----
-    if bati_path is None:
-        bati_path = _find_file("batiments",
-                                list(Path("/data/cache").glob("*batiment*.gpkg")) +
-                                list(Path("/data").glob("*batiments*.gpkg")))
-        if not bati_path:
-            return {"error": "GPKG batiments introuvable -- charger BD TOPO d'abord."}
-    if voirie_path is None:
-        voirie_path = _find_file("voirie",
-                                  list(Path("/data/cache").glob("*route*.gpkg")) +
-                                  list(Path("/data").glob("*voirie*.gpkg")))
-        if not voirie_path:
-            return {"error": "GPKG voirie introuvable -- charger BD TOPO d'abord."}
+    if not os.path.exists(dsm_path):
+        return {"error": f"Missing {dsm_path}. Run build_dsm() first."}
 
-    if template_path is None:
-        # Template co-localise dans le repo (data/obs_v6_template.html)
-        here = Path(__file__).resolve().parent.parent
-        candidates = [
-            here / "data" / "obs_v6_template.html",
-            here / "data" / "obs_v5_template.html",
-            Path("/app/data/obs_v6_template.html"),
-        ]
-        for c in candidates:
-            if c.exists():
-                template_path = str(c)
-                break
-        if template_path is None:
-            return {"error": "Template HTML introuvable (cherche obs_v6_template.html / obs_v5_template.html)."}
+    ds = gdal.Open(dsm_path)
+    gt = ds.GetGeoTransform()
+    DSM = ds.ReadAsArray().astype(np.float32)
+    H, W = DSM.shape
+    PIX = float(gt[1])
+    X0, Y0 = gt[0], gt[3]
+    ds = None
 
-    if output_path is None:
-        output_path = str(S / "observatoire.html")
+    ds2 = gdal.Open(mnt_path)
+    MNT = ds2.ReadAsArray().astype(np.float32)
+    ds2 = None
 
-    # ----- Zone name -----
-    if zone_name is None:
-        zone_file = S / "zone.json"
-        if zone_file.exists():
-            zd = json.load(open(zone_file))
-            zone_name = zd.get("name") or zd.get("label") or "Zone d'etude"
-        else:
-            zone_name = "Zone d'etude"
+    # Subsample for performance: every Nth pixel
+    STEP = max(1, int(4 * res / 5))  # ~4 at 5m, ~2 at 10m, ~1 at 2m
+    gH = H // STEP
+    gW = W // STEP
+    EYE = MNT[::STEP, ::STEP] + 1.0  # 1m above ground
 
-    # ----- Chargement sorties pipeline -----
-    try:
-        from qgis.core import QgsVectorLayer
-    except ImportError:
-        return {"error": "qgis.core indisponible -- executer dans le conteneur QGIS."}
-
-    required = ["facades.npz", "bits.npy", "scores.npz", "troncon_bits.npy",
-                "troncon_samples.npy", "troncon_meta.json", "ts_info.json",
-                "troncon_ts.json", "bati_to_troncon.json"]
-    missing = [n for n in required if not (S / n).exists()]
-    if missing:
-        return {"error": f"Sorties pipeline absentes : {missing}. "
-                          "Lancer analyze_facades + compute_scores + "
-                          "analyze_troncons + link_bati_troncon d'abord."}
-
-    fac = np.load(str(S / "facades.npz"))
-    fb = np.load(str(S / "bits.npy"))
-    sc = np.load(str(S / "scores.npz"))
-    tb = np.load(str(S / "troncon_bits.npy"))
-    ts_arr = np.load(str(S / "troncon_samples.npy"))
-    tm = json.load(open(str(S / "troncon_meta.json")))
-    b2t = json.load(open(str(S / "bati_to_troncon.json")))
-    ts_info = json.load(open(str(S / "ts_info.json")))
-    tts_info = json.load(open(str(S / "troncon_ts.json")))
-
+    LAT, LON = _get_study_latlon()
+    months = config["months"]
+    ts_info = json.load(open(str(SOLAR_DIR / "ts_info.json")))
     N_TS = len(ts_info)
-    SBID = fac["bid"]
-    SETAGE = fac["etage"]
-    SNORM = fac["norm"]
-    SHY = sc["sh_year"]
-    SS = sc["sc_sun"]
-    SH2 = sc["sc_hot"]
-    SC_ = sc["sc_com"]
+
+    max_steps = int(config["max_shadow_dist"] / PIX)
+    N_BYTES = (N_TS + 7) // 8
+    GB = np.zeros((gH, gW, N_BYTES), dtype=np.uint8)
+
+    last_log = time.time()
+    for ti in range(N_TS):
+        mo, h, m, az, el = ts_info[ti]
+        if el <= 0:
+            continue
+        az_r, el_r = math.radians(az), math.radians(el)
+        dxh, dyh, te = math.sin(az_r), math.cos(az_r), math.tan(el_r)
+        shadow = np.zeros((gH, gW), dtype=bool)
+        for s in range(1, max_steps + 1):
+            d = s * PIX
+            rz = EYE + te * d
+            # Shift in DSM pixel space (full res)
+            sc = int(round(s * dxh * STEP))
+            sr = int(round(s * -dyh * STEP))
+            dsm_sub = DSM[::STEP, ::STEP]
+            out = np.full((gH, gW), -1e9, dtype=np.float32)
+            r0s, r1s = max(0, sr), min(gH, gH + sr)
+            c0s, c1s = max(0, sc), min(gW, gW + sc)
+            if r1s > r0s and c1s > c0s:
+                out[r0s - sr:r1s - sr, c0s - sc:c1s - sc] = dsm_sub[r0s:r1s, c0s:c1s]
+            shadow |= out > (rz + 0.5)
+        bi = ti // 8
+        bp = 7 - (ti % 8)
+        sun = ~shadow
+        GB[:, :, bi][sun] |= (1 << bp)
+
+        if time.time() - last_log > 5:
+            last_log = time.time()
+            pct = sun.sum() / sun.size * 100
+            print(f"[solar]   ground ts {ti+1}/{N_TS} ({mo}/{h}h{m:02d} el={el:.0f}) — {pct:.0f}% sun", flush=True)
+
+    np.save(str(SOLAR_DIR / "ground_bits.npy"), GB)
+    gmeta = {"W": gW, "H": gH, "step": STEP, "nbytes": N_BYTES,
+             "x0": X0, "y0": Y0, "pix": PIX * STEP}
+    with open(str(SOLAR_DIR / "ground_meta.json"), "w") as f:
+        json.dump(gmeta, f)
+
+    elapsed = time.time() - t0
+    print(f"[solar] Ground shadows: {gW}x{gH} grid × {N_TS} ts in {elapsed:.1f}s", flush=True)
+    return {"success": True, "grid": f"{gW}x{gH}", "n_ts": N_TS, "elapsed_s": round(elapsed, 1)}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# STEP 9: BUILD OBSERVATOIRE HTML
+# ══════════════════════════════════════════════════════════════════════
+
+def build_observatoire_html(zone_name=None, out_path=None):
+    """Assemble all pipeline outputs into a standalone 3D HTML observatoire.
+
+    Uses the template at /app/templates/observatoire_solaire.html
+    and injects computed data inline (JSON).
+
+    Outputs: /data/solar/observatoire_solaire.html (~30-60 MB)
+    """
+    import base64
+    from collections import defaultdict
+
+    t0 = time.time()
+    if out_path is None:
+        out_path = str(SOLAR_DIR / "observatoire_solaire.html")
+    if zone_name is None:
+        zf = SOLAR_DIR / "zone.json"
+        zone_name = json.load(open(zf))["name"] if zf.exists() else "Zone"
+
+    # Load all pipeline outputs
+    fac = np.load(str(SOLAR_DIR / "facades.npz"))
+    fb = np.load(str(SOLAR_DIR / "bits.npy"))
+    sc = np.load(str(SOLAR_DIR / "scores.npz"))
+    ts_info = json.load(open(str(SOLAR_DIR / "ts_info.json")))
+    N_TS = len(ts_info)
+
+    SBID = fac['bid']; SETAGE = fac['etage']
+    SX, SY, SZ, SNORM = fac['cx'], fac['cy'], fac['z'], fac['norm']
+    SHY = sc['sh_year']; SS = sc['sc_sun']; SH2 = sc['sc_hot']; SC_C = sc['sc_com']
     N_FAC = len(SBID)
 
-    # ----- Re-encodage bitmask facade LSB -> MSB (compat avec troncon_bits)
+    # Re-encode facade bits LSB→MSB (consistent with troncons)
     fb_new = np.zeros_like(fb)
     for ti in range(N_TS):
-        bit = (fb[:, ti // 8] >> (ti % 8)) & 1
+        bi_old = ti // 8; bp_old = ti % 8
+        bit = (fb[:, bi_old] >> bp_old) & 1
         bp_new = 7 - (ti % 8)
-        fb_new[:, ti // 8] |= (bit << bp_new)
+        fb_new[:, bi_old] |= (bit << bp_new)
     fb = fb_new
 
-    # ----- Groupage samples par batiment -----
-    from collections import defaultdict
     bid_samples = defaultdict(list)
     for i in range(N_FAC):
         bid_samples[int(SBID[i])].append(i)
     unique_bids = sorted(bid_samples.keys())
 
-    # ----- Layer batiments QGIS -----
-    bl = QgsVectorLayer(str(bati_path), 'b', 'ogr')
-    if not bl.isValid() or bl.featureCount() == 0:
-        sub = bl.dataProvider().subLayers()
-        if sub:
-            ln = sub[0].split('!!::!!')[1]
-            bl = QgsVectorLayer(f'{bati_path}|layername={ln}', 'b', 'ogr')
+    # Load bati geometry
+    bati_layer_path = _find_file("batiments",
+        list(Path("/data/cache").glob("*batiment*.gpkg")) +
+        list(Path("/data").glob("*batiments*.gpkg")))
 
-    # ----- MNT pour terrain grid + centre L93 -----
-    mnt_path = str(S / "mnt_5m.tif")
-    if not os.path.exists(mnt_path):
-        return {"error": f"{mnt_path} absent -- relancer build_dsm() d'abord."}
-    ds_mnt = gdal.Open(mnt_path)
+    try:
+        from qgis.core import QgsVectorLayer
+        bl = QgsVectorLayer(bati_layer_path, 'b', 'ogr')
+        if not bl.isValid() or bl.featureCount() == 0:
+            sub = bl.dataProvider().subLayers()
+            if sub:
+                bl = QgsVectorLayer(f'{bati_layer_path}|layername={sub[0].split("!!::!!")[1]}', 'b', 'ogr')
+    except ImportError:
+        from osgeo import ogr as _ogr
+        bl = None
+
+    # Load MNT for terrain grid
+    res_files = sorted(SOLAR_DIR.glob("mnt_*m.tif"))
+    if not res_files:
+        return {"error": "No MNT found in /data/solar/"}
+    ds_mnt = gdal.Open(str(res_files[0]))
     gt = ds_mnt.GetGeoTransform()
     W, H = ds_mnt.RasterXSize, ds_mnt.RasterYSize
     MNT = ds_mnt.GetRasterBand(1).ReadAsArray().astype(np.float32)
     ds_mnt = None
+
     cx_l93 = gt[0] + W * gt[1] / 2
     cy_l93 = gt[3] + H * gt[5] / 2
 
-    # ----- Liste batiments avec facades par etage -----
+    # Load bati↔troncon links
+    b2t_path = SOLAR_DIR / "bati_to_troncon.json"
+    b2t = json.load(open(b2t_path)) if b2t_path.exists() else {}
+
+    print(f"[build] Building bati list ({len(unique_bids)} batis)...", flush=True)
     bati_list = []
     for bi_idx, bid in enumerate(unique_bids):
-        feat = bl.getFeature(bid)
-        if not feat.isValid():
-            continue
-        g = feat.geometry()
-        if g.isMultipart():
-            ps = g.asMultiPolygon()
-            if not ps:
+        if bl is not None:
+            feat = bl.getFeature(bid)
+            if not feat.isValid():
                 continue
-            ring = ps[0][0]
+            g = feat.geometry()
+            if g.isMultipart():
+                ps = g.asMultiPolygon()
+                if not ps: continue
+                ring = ps[0][0]
+            else:
+                ps = g.asPolygon()
+                if not ps: continue
+                ring = ps[0]
+            if len(ring) < 4: continue
+            ring_l = [[round(p.x()-cx_l93, 1), round(p.y()-cy_l93, 1)] for p in ring]
+            h_val = feat['hauteur'] or 10
+            z0_val = feat['altitude_minimale_sol'] or 0
+            n_et = feat['nombre_d_etages'] or max(1, int(round(float(h_val)/3)))
+            n_log = feat['nombre_de_logements'] or 0
+            usage = str(feat['usage_1'] or '')[:15]
         else:
-            ps = g.asPolygon()
-            if not ps:
-                continue
-            ring = ps[0]
-        if len(ring) < 4:
             continue
-        ring_l = [[round(p.x() - cx_l93, 1), round(p.y() - cy_l93, 1)] for p in ring]
 
-        h = feat['hauteur'] or 10
-        z0 = feat['altitude_minimale_sol'] or 0
-        n_et = feat['nombre_d_etages'] or max(1, int(round(float(h) / 3)))
-
-        # Groupage samples par (norm, etage)
         samples = bid_samples[bid]
         facs = defaultdict(dict)
         for sid in samples:
             nr = round(float(SNORM[sid]), 1)
             et = int(SETAGE[sid])
             facs[nr][et] = sid
+
         fac_list = []
         for norm, etages in facs.items():
             ets = sorted(etages.items())
-            et_data = [{
-                'e': et, 'sid': int(sid),
-                'sh': int(SHY[sid]),
-                'ss': float(round(SS[sid], 1)),
-                'sh2': float(round(SH2[sid], 1)),
-                'sc': float(round(SC_[sid], 1)),
-            } for et, sid in ets]
+            et_data = [{'e': et, 'sid': sid, 'sh': int(SHY[sid]),
+                        'ss': float(round(SS[sid], 1)), 'sh2': float(round(SH2[sid], 1)),
+                        'sc': float(round(SC_C[sid], 1))} for et, sid in ets]
             fac_list.append({'n': norm, 'e': et_data})
 
         link = b2t.get(str(bid))
         all_sids = samples
         bati_list.append({
-            'i': bi_idx, 'bid': int(bid), 'r': ring_l,
-            'h': round(float(h), 1), 'z0': round(float(z0), 1),
-            'ne': int(n_et),
-            'nl': int(feat['nombre_de_logements'] or 0),
-            'u': str(feat['usage_1'] or '')[:15],
-            'f': fac_list,
+            'i': bi_idx, 'bid': bid, 'r': ring_l,
+            'h': round(float(h_val), 1), 'z0': round(float(z0_val), 1),
+            'ne': int(n_et), 'nl': int(n_log), 'u': usage, 'f': fac_list,
             'tn': link['nom'] if link else None,
             'tf': link['fid'] if link else None,
-            'sh': int(SHY[all_sids].mean()),
-            'ss': float(round(SS[all_sids].mean(), 1)),
-            'sh2': float(round(SH2[all_sids].mean(), 1)),
-            'sc': float(round(SC_[all_sids].mean(), 1)),
+            'sh': int(SHY[all_sids].mean()), 'ss': float(round(SS[all_sids].mean(), 1)),
+            'sh2': float(round(SH2[all_sids].mean(), 1)), 'sc': float(round(SC_C[all_sids].mean(), 1)),
         })
 
-    # ----- Liste troncons + pourcentages temporels -----
-    tfids = ts_arr['fid']
-    fi_t = defaultdict(list)
-    for i, fd in enumerate(tfids):
-        fi_t[int(fd)].append(i)
-    sorted_tfids = sorted(fi_t.keys())
-    n_tron = len(sorted_tfids)
-
-    all_sun_t = np.zeros((len(ts_arr), N_TS), dtype=np.uint8)
-    for i in range(N_TS):
-        all_sun_t[:, i] = (tb[:, i // 8] >> (7 - (i % 8))) & 1
-    tron_ts_pct = np.zeros((n_tron, N_TS), dtype=np.uint8)
-    for ti_idx, fd in enumerate(sorted_tfids):
-        idxs = fi_t[fd]
-        tron_ts_pct[ti_idx] = (all_sun_t[idxs].mean(axis=0) * 100).astype(np.uint8)
-
-    vl = QgsVectorLayer(str(voirie_path), 'v', 'ogr')
-    if not vl.isValid() or vl.featureCount() == 0:
-        sub = vl.dataProvider().subLayers()
-        if sub:
-            ln = sub[0].split('!!::!!')[1]
-            vl = QgsVectorLayer(f'{voirie_path}|layername={ln}', 'v', 'ogr')
-
+    # Troncon list
+    print("[build] Building troncon list...", flush=True)
     tron_list = []
-    for ti_idx, fd in enumerate(sorted_tfids):
-        m = tm.get(str(fd), {})
-        feat = vl.getFeature(fd)
-        if not feat.isValid():
-            continue
-        g = feat.geometry()
-        if g.isMultipart():
-            lines = g.asMultiPolyline()
-            if not lines:
-                continue
-            line = max(lines, key=len)
-        else:
-            line = g.asPolyline()
-        pts = []
-        for p in line:
-            c = int((p.x() - gt[0]) / gt[1])
-            r = int((gt[3] - p.y()) / (-gt[5]))
-            z = float(MNT[r, c]) if 0 <= c < W and 0 <= r < H else 50.0
-            pts.append([round(p.x() - cx_l93, 1), round(p.y() - cy_l93, 1), round(z, 1)])
-        tron_list.append({
-            'i': ti_idx, 'f': int(fd),
-            'n': m.get('nom', ''),
-            'L': round(float(m.get('L') or 0), 0),
-            'g': pts,
-        })
+    tb_path = SOLAR_DIR / "troncon_bits.npy"
+    ts_arr_path = SOLAR_DIR / "troncon_samples.npy"
+    tm_path = SOLAR_DIR / "troncon_meta.json"
+    tts_path = SOLAR_DIR / "troncon_ts.json"
+    has_troncons = all(p.exists() for p in [tb_path, ts_arr_path, tm_path, tts_path])
 
-    # ----- Terrain grid sous-echantillonne 20m -----
-    STEP = 4
-    terr = MNT[::STEP, ::STEP]
-    tmeta = {
-        'x0': float(gt[0] - cx_l93),
-        'y0': float(gt[3] - cy_l93),
-        's': float(gt[1]) * STEP,
-        'r': int(terr.shape[0]),
-        'c': int(terr.shape[1]),
-        'zmin': float(MNT.min()),
-        'zmax': float(MNT.max()),
-    }
+    if has_troncons:
+        tb = np.load(str(tb_path))
+        ts_arr = np.load(str(ts_arr_path))
+        tm = json.load(open(str(tm_path)))
+        tts_info = json.load(open(str(tts_path)))
+        tfids = ts_arr['fid']
+        fi_t = defaultdict(list)
+        for i, f in enumerate(tfids):
+            fi_t[int(f)].append(i)
+        sorted_tfids = sorted(fi_t.keys())
+        n_tron = len(sorted_tfids)
 
-    # ----- Bitmasks base64 -----
-    import base64
+        all_sun_t = np.zeros((len(ts_arr), N_TS), dtype=np.uint8)
+        for i in range(N_TS):
+            all_sun_t[:, i] = (tb[:, i//8] >> (7 - (i%8))) & 1
+        tron_ts_pct = np.zeros((n_tron, N_TS), dtype=np.uint8)
+        for ti_idx, fid in enumerate(sorted_tfids):
+            idxs = fi_t[fid]
+            tron_ts_pct[ti_idx] = (all_sun_t[idxs].mean(axis=0) * 100).astype(np.uint8)
+
+        voi_path = _find_file("voirie", list(Path("/data/cache").glob("*route*.gpkg")) +
+                              list(Path("/data").glob("*voirie*.gpkg")))
+        if voi_path:
+            try:
+                vl = QgsVectorLayer(voi_path, 'v', 'ogr')
+                if not vl.isValid():
+                    sub = vl.dataProvider().subLayers()
+                    if sub:
+                        vl = QgsVectorLayer(f'{voi_path}|layername={sub[0].split("!!::!!")[1]}', 'v', 'ogr')
+                for ti_idx, fid in enumerate(sorted_tfids):
+                    m = tm.get(str(fid), {})
+                    feat = vl.getFeature(fid)
+                    if not feat.isValid(): continue
+                    g = feat.geometry()
+                    if g.isMultipart():
+                        lines = g.asMultiPolyline()
+                        if not lines: continue
+                        line = max(lines, key=len)
+                    else:
+                        line = g.asPolyline()
+                    pts = []
+                    for p in line:
+                        c = int((p.x() - gt[0]) / gt[1])
+                        r = int((gt[3] - p.y()) / (-gt[5]))
+                        z = float(MNT[r, c]) if 0 <= c < W and 0 <= r < H else 50.0
+                        pts.append([round(p.x()-cx_l93, 1), round(p.y()-cy_l93, 1), round(z, 1)])
+                    tron_list.append({'i': ti_idx, 'f': fid, 'n': m.get('nom', ''),
+                                      'L': round(float(m.get('L') or 0), 0), 'g': pts})
+            except Exception as e:
+                print(f"[build] WARNING troncon geometry: {e}", flush=True)
+    else:
+        tron_ts_pct = np.zeros((0, N_TS), dtype=np.uint8)
+        tts_info = ts_info
+
+    # Terrain grid (subsampled)
+    TSTEP = max(1, 4)
+    terr = MNT[::TSTEP, ::TSTEP]
+    tmeta = {'x0': gt[0] - cx_l93, 'y0': gt[3] - cy_l93, 's': float(gt[1]) * TSTEP,
+             'r': int(terr.shape[0]), 'c': int(terr.shape[1]),
+             'zmin': float(MNT.min()), 'zmax': float(MNT.max())}
+
+    # Ground shadow bits
+    gb_path = SOLAR_DIR / "ground_bits.npy"
+    gm_path = SOLAR_DIR / "ground_meta.json"
+    if gb_path.exists() and gm_path.exists():
+        GB = np.load(str(gb_path))
+        gm = json.load(open(str(gm_path)))
+        gb_b64 = base64.b64encode(GB.tobytes()).decode('ascii')
+    else:
+        gb_b64 = ""
+        gm = {"W": 0, "H": 0, "nbytes": 0}
+
+    # Encode binary data
     fb_b64 = base64.b64encode(fb.tobytes()).decode('ascii')
     tron_ts_b64 = base64.b64encode(tron_ts_pct.tobytes()).decode('ascii')
 
-    # ----- Assemblage JSON -----
-    out = {
-        'm': {
-            'z': zone_name,
-            'cx': float(cx_l93), 'cy': float(cy_l93),
-            'nb': len(bati_list), 'nt': len(tron_list),
-            'nf': int(N_FAC),
-            'ntf': N_TS, 'ntt': N_TS,
-        },
+    # Assemble JSON
+    out_data = {
+        'm': {'z': zone_name, 'cx': cx_l93, 'cy': cy_l93,
+              'nb': len(bati_list), 'nt': len(tron_list), 'nf': N_FAC,
+              'ntf': N_TS, 'ntt': N_TS},
         'T': [[round(float(z), 1) for z in row] for row in terr],
         'tm': tmeta,
         'tsf': [[t[0], t[1], t[2], round(t[3], 1), round(t[4], 1)] for t in ts_info],
         'tst': [[t[0], t[1], t[2], round(t[3], 1), round(t[4], 1)] for t in tts_info],
         'B': bati_list, 'R': tron_list,
-        'fb': fb_b64, 'fbs': [int(N_FAC), int(fb.shape[1])],
-        'tb': tron_ts_b64, 'tbs': [int(n_tron), int(N_TS)],
+        'fb': fb_b64, 'fbs': [N_FAC, fb.shape[1]],
+        'tb': tron_ts_b64, 'tbs': [len(tron_list), N_TS],
+        'gb': gb_b64, 'gm': gm,
     }
 
-    # ----- Ecriture JSON + injection template -----
-    json_path = str(S / "observatoire.json")
-    with open(json_path, "w") as f:
-        json.dump(out, f, separators=(",", ":"))
+    data_json = json.dumps(out_data, separators=(',', ':'))
 
-    tmpl = open(template_path, encoding="utf-8").read()
-    if "D = __DATA__;" not in tmpl:
-        warnings.append("Marker `D = __DATA__;` introuvable dans template -- "
-                        "HTML produit sans injection (verifier template).")
-        html = tmpl
-    else:
-        html = tmpl.replace("D = __DATA__;", f"D = {json.dumps(out, separators=(',', ':'))};")
+    # Load template and inject data
+    template_paths = [
+        Path("/app/templates/observatoire_solaire.html"),
+        Path(__file__).parent.parent / "templates" / "observatoire_solaire.html",
+    ]
+    template = None
+    for tp in template_paths:
+        if tp.exists():
+            template = tp.read_text(encoding="utf-8")
+            break
+    if template is None:
+        return {"error": "Template observatoire_solaire.html not found"}
 
-    with open(output_path, "w", encoding="utf-8") as f:
+    html = template.replace("__DATA__", data_json)
+    with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
 
-    json_mb = os.path.getsize(json_path) / 1024 / 1024
-    html_mb = os.path.getsize(output_path) / 1024 / 1024
-    total_etages = sum(len(f["e"]) for b in bati_list for f in b["f"])
+    size_mb = os.path.getsize(out_path) / 1024 / 1024
     elapsed = time.time() - t0
-
+    print(f"[build] Observatoire HTML: {size_mb:.1f} MB, {len(bati_list)} batis, "
+          f"{len(tron_list)} troncons, {N_FAC} facades ({elapsed:.1f}s)", flush=True)
     return {
         "success": True,
-        "output_path": output_path,
-        "json_size_mb": round(json_mb, 2),
-        "html_size_mb": round(html_mb, 2),
+        "path": out_path,
+        "size_mb": round(size_mb, 1),
         "n_bati": len(bati_list),
         "n_troncons": len(tron_list),
-        "n_facades": int(N_FAC),
-        "n_etages": int(total_etages),
-        "zone_name": zone_name,
-        "template_used": template_path,
-        "warnings": warnings,
+        "n_facades": N_FAC,
         "elapsed_s": round(elapsed, 1),
     }
 
 
-def run_full(zone=None, profile="standard", skip_rsun=False, **overrides):
+# FULL ORCHESTRATOR
+# ══════════════════════════════════════════════════════════════════════
+
+def run_full(zone=None, profile="standard", **overrides):
     """Run complete observatoire solaire pipeline.
 
     Args:
         zone: commune name or address (triggers set_study_zone + smart_load)
         profile: 'rapide', 'standard', or 'precision'
-        skip_rsun: si True, saute run_rsun() + aggregate_annual() (mode degrade
-            "heures de soleil seules", sans valeurs kWh/m2 reelles -- a utiliser
-            uniquement si GRASS GIS est absent du conteneur). Par defaut False :
-            le pipeline complet calcule l'irradiance r.sun et l'agregation
-            annuelle, sans quoi `SIRR` reste nul dans `facades.npz` et les
-            z-scores locaux sont inutilisables.
         **overrides: override any config param
 
-    Returns dict with all output paths + warnings explicites si mode degrade.
+    Returns dict with all output paths.
     """
     t_start = time.time()
     config = get_config(profile, **overrides)
-    results = {"config": config, "skip_rsun": skip_rsun, "warnings": []}
+    results = {"config": config}
 
     # Step 0: Set study zone if provided
     if zone:
@@ -1682,29 +1677,22 @@ def run_full(zone=None, profile="standard", skip_rsun=False, **overrides):
         return dsm_result
     results["dsm"] = dsm_result
 
-    # Step 2b: r.sun -- irradiance raster mensuelle (GRASS GIS)
-    # Step 2c: aggregate_annual -- somme 12 mois -> irradiance_annuelle_kwh.tif
-    # Sans ces deux etapes, analyze_facades ne trouve pas le raster
-    # irradiance -> SIRR = zeros -> z-scores locaux faux. Le flag skip_rsun
-    # permet le mode degrade quand GRASS est absent du conteneur.
-    if skip_rsun:
-        msg = ("Mode degrade : run_rsun() + aggregate_annual() sautes "
-               "(skip_rsun=True). SIRR=0 dans facades.npz, z-scores locaux "
-               "inutilisables, seuls SC_SUN/SC_HOT/SC_COM (heures de soleil "
-               "geometriques) sont valides.")
-        print(f"[solar] WARNING: {msg}", flush=True)
-        results["warnings"].append(msg)
+    # Step 2b: r.sun (GRASS)
+    print("[solar] === Step 2b: Run r.sun ===", flush=True)
+    rsun_result = run_rsun(config)
+    if "error" in rsun_result:
+        print(f"[solar] WARNING r.sun failed (GRASS not available?): {rsun_result['error'][:200]}", flush=True)
+        results["rsun"] = rsun_result
     else:
-        print("[solar] === Step 2b: r.sun monthly irradiance ===", flush=True)
-        rsun_result = run_rsun(config)
-        if "error" in rsun_result:
-            return rsun_result
         results["rsun"] = rsun_result
 
-        print("[solar] === Step 2c: Aggregate annual ===", flush=True)
-        agg_result = aggregate_annual()
-        if "error" in agg_result:
-            return agg_result
+    # Step 2c: Aggregate annual irradiance
+    print("[solar] === Step 2c: Aggregate annual ===", flush=True)
+    agg_result = aggregate_annual()
+    if "error" in agg_result:
+        print(f"[solar] WARNING aggregate failed: {agg_result['error'][:200]}", flush=True)
+        results["aggregate"] = agg_result
+    else:
         results["aggregate"] = agg_result
 
     # Step 3: Facade raycast
@@ -1735,23 +1723,21 @@ def run_full(zone=None, profile="standard", skip_rsun=False, **overrides):
     except Exception as e:
         results["links"] = {"error": str(e)}
 
-    # Step 7: Build observatoire HTML autonome (Three.js + DSFR)
-    # Non-fatal : si le template manque ou un GPKG est absent on garde
-    # les sorties NumPy et on logue l'erreur, l'utilisateur peut relancer
-    # build_observatoire_html() seul plus tard.
-    print("[solar] === Step 7: Build observatoire HTML ===", flush=True)
+    # Step 7: Ground shadow map
+    print("[solar] === Step 7: Ground shadows ===", flush=True)
     try:
-        obs_result = build_observatoire_html(zone_name=zone)
-        results["observatoire"] = obs_result
-        if "error" in obs_result:
-            results["warnings"].append(
-                f"Step 7 build_observatoire_html : {obs_result['error']}"
-            )
+        ground_result = analyze_ground(config)
+        results["ground"] = ground_result
     except Exception as e:
-        msg = f"build_observatoire_html exception : {e}"
-        print(f"[solar] WARNING: {msg}", flush=True)
-        results["warnings"].append(msg)
-        results["observatoire"] = {"error": str(e)}
+        results["ground"] = {"error": str(e)}
+
+    # Step 8: Build HTML observatoire
+    print("[solar] === Step 8: Build observatoire HTML ===", flush=True)
+    try:
+        html_result = build_observatoire_html(zone_name=zone)
+        results["html"] = html_result
+    except Exception as e:
+        results["html"] = {"error": str(e)}
 
     total = time.time() - t_start
     results["total_elapsed_s"] = round(total, 1)

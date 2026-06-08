@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="fr" data-fr-scheme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,shrink-to-fit=no">
+<meta name="theme-color" content="#000091">
+<title>Observatoire Solaire 3D v6 — Marseille 4ème</title>
+<link rel="stylesheet" href="https://unpkg.com/@gouvfr/dsfr@1.12.1/dist/dsfr.min.css">
+<link rel="stylesheet" href="https://unpkg.com/@gouvfr/dsfr@1.12.1/dist/utility/utility.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+.obs-wrap{display:grid;grid-template-columns:1fr 380px;gap:0;border:1px solid var(--border-default-grey);border-radius:4px;overflow:hidden;background:#eef0f5;height:calc(100vh - 260px);min-height:620px}
+.obs-canvas-box{position:relative;background:#b0c4de;overflow:hidden}
+#cv{display:block;width:100%;height:100%;cursor:grab}
+#cv:active{cursor:grabbing}
+.obs-side{background:#fff;border-left:1px solid var(--border-default-grey);display:flex;flex-direction:column;overflow:hidden}
+.obs-side-head{padding:14px 16px;background:var(--background-alt-blue-france);border-bottom:1px solid var(--border-default-grey)}
+.obs-side-head h2{font-size:15px;font-weight:700;color:var(--text-title-blue-france);margin:0}
+.obs-side-head .sub{font-size:11px;color:var(--text-mention-grey);margin-top:2px}
+.obs-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;padding:10px 16px;border-bottom:1px solid var(--border-default-grey);background:var(--background-alt-grey)}
+.obs-stats .stat{text-align:center}
+.obs-stats .v{font-size:18px;font-weight:700;color:var(--text-title-blue-france);line-height:1.1}
+.obs-stats .l{font-size:9px;color:var(--text-mention-grey);text-transform:uppercase;letter-spacing:.5px}
+.obs-ctrl{padding:12px 16px;border-bottom:1px solid var(--border-default-grey)}
+.lab{font-size:10px;color:var(--text-mention-grey);text-transform:uppercase;letter-spacing:.5px;font-weight:700;margin:10px 0 4px}
+.lab:first-child{margin-top:0}
+.disp{font-size:16px;font-weight:700;color:var(--text-title-blue-france);text-align:center;margin:4px 0}
+input[type=range]{width:100%;accent-color:var(--background-action-high-blue-france)}
+.btns{display:flex;gap:4px;margin-top:4px;flex-wrap:wrap}
+.btn{flex:1;min-width:56px;padding:6px 4px;text-align:center;font-size:11px;font-weight:700;background:#fff;border:1px solid var(--border-default-grey);border-radius:4px;color:var(--text-mention-grey);cursor:pointer;transition:all .15s;user-select:none}
+.btn:hover{border-color:var(--border-action-high-blue-france);color:var(--text-action-high-blue-france)}
+.btn.active{background:var(--background-action-high-blue-france);color:#fff;border-color:var(--background-action-high-blue-france)}
+#play{padding:8px;background:#fff;border:1px solid var(--border-default-grey);border-radius:4px;color:var(--text-action-high-blue-france);cursor:pointer;font-size:12px;font-weight:700;margin-top:10px;width:100%;text-align:center}
+#play.on{background:var(--background-action-high-blue-france);color:#fff;border-color:var(--background-action-high-blue-france)}
+#sunInfo{padding:6px 10px;background:var(--background-alt-grey);border:1px solid var(--border-default-grey);border-radius:4px;text-align:center;font-size:12px;color:var(--text-title-blue-france);margin-top:8px;font-weight:500}
+#content{flex:1;overflow-y:auto}
+.section{padding:10px 16px;border-bottom:1px solid var(--border-default-grey)}
+.section h2{font-size:11px;color:var(--text-mention-grey);text-transform:uppercase;margin-bottom:6px;letter-spacing:.5px;font-weight:700}
+.item{padding:8px 10px;cursor:pointer;font-size:12px;background:var(--background-alt-grey);border:1px solid var(--border-default-grey);border-radius:4px;margin:4px 0;transition:all .15s}
+.item:hover{border-color:var(--border-action-high-blue-france);background:#fff}
+.item .nm{color:var(--text-title-grey);font-weight:500}
+.item .de{color:var(--text-mention-grey);font-size:10px;margin-top:2px}
+.item .v{float:right;font-weight:700;font-size:13px}
+#fiche{padding:12px 16px;font-size:12px;display:none}
+#fiche h2{font-size:15px;color:var(--text-title-blue-france);margin-bottom:6px;font-weight:700}
+#fiche h3{font-size:10px;color:var(--text-mention-grey);text-transform:uppercase;margin:10px 0 4px;letter-spacing:.5px}
+#fiche .row{display:flex;justify-content:space-between;padding:3px 0;font-size:11px;color:var(--text-default-grey);border-bottom:1px solid var(--border-default-grey)}
+#fiche .row b{color:var(--text-title-blue-france)}
+#fiche table{width:100%;border-collapse:collapse;font-size:10px;margin-top:6px}
+#fiche th,#fiche td{padding:3px 4px;text-align:center;border:1px solid var(--border-default-grey)}
+#fiche th{background:var(--background-alt-grey);color:var(--text-mention-grey);font-weight:700}
+.cell{font-weight:700;color:#fff}
+.tbl-btn{padding:4px 8px;font-size:10px;cursor:pointer;background:#fff;border:1px solid var(--border-default-grey);color:var(--text-mention-grey);border-radius:3px;margin-right:4px;font-weight:500}
+.tbl-btn:hover{color:var(--text-action-high-blue-france);border-color:var(--border-action-high-blue-france)}
+#legend{position:absolute;bottom:12px;left:12px;background:#fff;border:1px solid var(--border-default-grey);border-radius:4px;padding:10px 12px;font-size:11px;box-shadow:0 2px 6px rgba(0,0,0,.08)}
+#lgT{margin-bottom:4px;color:var(--text-mention-grey);font-weight:700;font-size:10px;text-transform:uppercase;letter-spacing:.5px}
+.lg-row{display:flex;align-items:center;gap:8px;margin:2px 0;color:var(--text-default-grey)}
+.lg-sw{width:26px;height:10px;border-radius:2px;flex-shrink:0}
+#sunBadge{position:absolute;top:12px;left:12px;background:#fff;border:1px solid var(--border-action-high-blue-france);border-radius:4px;padding:6px 12px;color:var(--text-title-blue-france);font-size:12px;font-weight:700;box-shadow:0 2px 6px rgba(0,0,0,.08)}
+#viewBtns{position:absolute;top:12px;right:12px;display:flex;gap:4px;background:#fff;border:1px solid var(--border-default-grey);border-radius:4px;padding:4px;box-shadow:0 2px 6px rgba(0,0,0,.08)}
+.vb{padding:4px 8px;font-size:10px;font-weight:700;background:transparent;border:none;color:var(--text-mention-grey);cursor:pointer;border-radius:3px}
+.vb.active{background:var(--background-action-high-blue-france);color:#fff}
+#loadIndic{position:fixed;inset:0;background:rgba(255,255,255,.95);display:flex;align-items:center;justify-content:center;color:var(--text-title-blue-france);font-size:15px;z-index:9999;font-weight:500}
+#loadIndic.hide{display:none}
+.chapter-title{font-size:18px;font-weight:700;color:var(--text-title-blue-france);border-bottom:3px solid var(--border-action-high-blue-france);padding-bottom:8px;margin-bottom:16px}
+.mg{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:8px;margin:12px 0}
+.mv{font-size:22px;font-weight:700;color:var(--text-title-blue-france)}
+.ml{font-size:10px;color:var(--text-mention-grey);text-transform:uppercase;letter-spacing:.5px}
+@media(max-width:991px){.obs-wrap{grid-template-columns:1fr;height:auto}.obs-canvas-box{height:55vh}.obs-side{border-left:none;border-top:1px solid var(--border-default-grey)}}
+</style>
+</head>
+<body>
+<header role="banner" class="fr-header">
+<div class="fr-header__body"><div class="fr-container"><div class="fr-header__body-row">
+  <div class="fr-header__brand fr-enlarge-link"><div class="fr-header__brand-top">
+    <div class="fr-header__logo"><p class="fr-logo">République<br>Française</p></div>
+    <div class="fr-header__operator"><p style="font-weight:700;font-size:15px;color:#000091">CEREMA</p><p style="font-size:11px;color:#666">DTerMed · DTVB/AU</p></div>
+  </div>
+  <div class="fr-header__service"><a href="#"><p class="fr-header__service-title">Observatoire solaire 3D · Marseille 4ème</p></a>
+    <p class="fr-header__service-tagline">Bâti, rues, étages, sol — RGE ALTI 1m · 12 mois · 34 demi-heures</p>
+  </div></div>
+</div></div></div>
+</header>
+<div class="fr-notice fr-notice--info"><div class="fr-container"><div class="fr-notice__body">
+  <p class="fr-notice__title">V6 · terrain MNT pur + ombres au sol dynamiques · pipeline standard</p>
+</div></div></div>
+
+<main role="main">
+<section id="s0" class="fr-py-4w">
+<div class="fr-container">
+  <div class="fr-grid-row fr-grid-row--gutters fr-grid-row--middle fr-mb-3w">
+    <div class="fr-col-12 fr-col-md-7">
+      <h1 class="fr-mb-1w">Observatoire solaire 3D</h1>
+      <p class="fr-text--lead">Exposition au soleil des façades, toitures, tronçons et <strong>sol</strong> — DSM hybride (MNT RGE ALTI + BD TOPO bâtiments), raycast dynamique par demi-heure.</p>
+    </div>
+    <div class="fr-col-12 fr-col-md-5">
+      <div class="mg">
+        <div style="text-align:center" class="fr-p-1w"><div class="mv" id="kpi_b">—</div><div class="ml">bâtis</div></div>
+        <div style="text-align:center" class="fr-p-1w"><div class="mv" id="kpi_t">—</div><div class="ml">tronçons</div></div>
+        <div style="text-align:center" class="fr-p-1w"><div class="mv" id="kpi_f">—</div><div class="ml">façades·étages</div></div>
+      </div>
+    </div>
+  </div>
+
+  <p class="chapter-title">Exploration 3D</p>
+
+  <div class="obs-wrap">
+    <div class="obs-canvas-box">
+      <canvas id="cv"></canvas>
+      <div id="sunBadge">☀️ —</div>
+      <div id="viewBtns">
+        <button class="vb active" data-v="facade" onclick="setView('facade')">🪟 Façades</button>
+        <button class="vb" data-v="bati" onclick="setView('bati')">🏢 Bâti</button>
+        <button class="vb" data-v="ground" onclick="setView('ground')">☀️ Sol</button>
+      </div>
+      <div id="legend">
+        <div id="lgT">% soleil</div>
+        <div class="lg-row"><div class="lg-sw" style="background:#0050b4"></div><span>ombre</span></div>
+        <div class="lg-row"><div class="lg-sw" style="background:#00b4b4"></div><span>20–40</span></div>
+        <div class="lg-row"><div class="lg-sw" style="background:#c8dc00"></div><span>40–60</span></div>
+        <div class="lg-row"><div class="lg-sw" style="background:#ffaa00"></div><span>60–80</span></div>
+        <div class="lg-row"><div class="lg-sw" style="background:#ff5500"></div><span>plein soleil</span></div>
+      </div>
+    </div>
+    <aside class="obs-side">
+      <div class="obs-side-head">
+        <h2>Observatoire solaire</h2>
+        <div class="sub">Marseille 4ème · pipeline standard 12 mois</div>
+      </div>
+      <div class="obs-stats">
+        <div class="stat"><div class="v" id="sB">—</div><div class="l">bâtis</div></div>
+        <div class="stat"><div class="v" id="sT">—</div><div class="l">rues</div></div>
+        <div class="stat"><div class="v" id="sE">—</div><div class="l">étages</div></div>
+      </div>
+      <div class="obs-ctrl">
+        <div class="lab">Mode</div>
+        <div class="btns">
+          <div class="btn active" data-m="live" onclick="setMode('live')">⏱ Temps réel</div>
+          <div class="btn" data-m="annual" onclick="setMode('annual')">📅 Annuel</div>
+        </div>
+        <div class="lab">Score annuel</div>
+        <div class="btns">
+          <div class="btn active" data-s="sun" onclick="setScore('sun')">☀️ Soleil</div>
+          <div class="btn" data-s="hot" onclick="setScore('hot')">🥵 Canicule</div>
+          <div class="btn" data-s="com" onclick="setScore('com')">🌡 Confort</div>
+        </div>
+        <div class="lab">Mois · <span id="moDisp">Juin</span></div>
+        <input type="range" id="month" min="1" max="12" value="6" step="1">
+        <div class="lab">Heure</div>
+        <div class="disp" id="hrDisp">12h00</div>
+        <input type="range" id="hour" min="0" max="33" value="14" step="1">
+        <div id="sunInfo">☀️ —</div>
+        <div id="play" onclick="togglePlay()">▶ Lecture journée</div>
+      </div>
+      <div id="content">
+        <div id="topPanel" class="section">
+          <h2>🏆 Top live</h2>
+          <div id="topList"></div>
+        </div>
+        <div id="fiche"></div>
+      </div>
+    </aside>
+  </div>
+
+  <div class="fr-callout fr-mt-3w">
+    <p class="fr-callout__text"><strong>V6 ajoute</strong> : ombres au sol dynamiques (calculées par raycast sur le DSM 5m, affichées en texture sur le terrain MNT pur). Bouge le slider heure, le sol change de couleur en temps réel.</p>
+  </div>
+</div>
+</section>
+</main>
+
+<footer class="fr-footer" role="contentinfo"><div class="fr-container">
+  <div class="fr-footer__body">
+    <div class="fr-footer__brand fr-enlarge-link"><p class="fr-logo">République<br>Française</p></div>
+    <div class="fr-footer__content">
+      <p class="fr-footer__content-desc">Sources : BD TOPO IGN · RGE ALTI IGN · Pipeline solar_pipeline.py (CEREMA DTerMed)</p>
+    </div>
+  </div>
+</div></footer>
+
+<div id="loadIndic">Chargement des données…</div>
+
+<script>
+const MOIS=['','Janvier','Février','Mars','Avril','Mai','Juin','Juillet','Août','Septembre','Octobre','Novembre','Décembre'];
+let D,FB,TB,GB;                      // data, facade bits, troncon bits, ground bits
+let groundAnnual=null;                // precomputed % sun per ground pixel (Uint8Array)
+let scene,camera,renderer;
+let terrMesh=null,terrTexData=null,terrTex=null;
+let roofs=[],tLines=[],facadeMesh=null,facadeInstances=[];
+let mode='live',score='sun',view='facade';
+let month=6,hour=12,halfh=0;
+let playing=false,playTimer;
+let cameraTheta=Math.PI/4,cameraPhi=Math.PI/3.5,cameraDist=2000,cameraTarget=new THREE.Vector3(0,0,0);
+const PAL=v=>v<20?0x0050b4:v<40?0x00b4b4:v<60?0xc8dc00:v<80?0xffaa00:0xff5500;
+const PALH=v=>'#'+PAL(v).toString(16).padStart(6,'0');
+const PAL_RGB=v=>{
+  const h=PAL(v);
+  return [(h>>16)&255,(h>>8)&255,h&255];
+};
+const ZS=1.2;
+
+async function loadData(){
+  D = __DATA__;
+  let bin=atob(D.fb); FB=new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) FB[i]=bin.charCodeAt(i);
+  bin=atob(D.tb); TB=new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) TB[i]=bin.charCodeAt(i);
+  bin=atob(D.gb); GB=new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) GB[i]=bin.charCodeAt(i);
+  console.log('FB',FB.length,'TB',TB.length,'GB',GB.length);
+  // Precompute annual ground sun % per pixel
+  const gm=D.gm, GW=gm.W, GH=gm.H, nbytes=gm.nbytes;
+  const N_TS_G=D.tsf.length;
+  groundAnnual=new Uint8Array(GW*GH);
+  // Count daylight timesteps (el>0) for normalization
+  let nDaylight=0;
+  for(let ti=0;ti<N_TS_G;ti++){if(D.tsf[ti][4]>0)nDaylight++;}
+  for(let px=0;px<GW*GH;px++){
+    let count=0;
+    for(let ti=0;ti<N_TS_G;ti++){
+      if(D.tsf[ti][4]<=0)continue;
+      count+=(GB[px*nbytes+(ti>>3)]>>(7-(ti&7)))&1;
+    }
+    groundAnnual[px]=nDaylight>0?Math.round(count/nDaylight*100):0;
+  }
+  console.log('groundAnnual computed, daylight ts=',nDaylight);
+  document.getElementById('loadIndic').classList.add('hide');
+}
+function getFacBit(sid,ti){
+  const bps=D.fbs[1];
+  return (FB[sid*bps+(ti>>3)]>>(7-(ti&7)))&1;
+}
+function getTronPct(ti_idx,ti){
+  return TB[ti_idx*D.tbs[1]+ti];
+}
+function getGroundBit(px,py,ti){
+  const gm=D.gm;
+  if(px<0||px>=gm.W||py<0||py>=gm.H)return 1;
+  const idx=(py*gm.W+px)*gm.nbytes+(ti>>3);
+  return (GB[idx]>>(7-(ti&7)))&1;
+}
+
+function init3D(){
+  const box=document.querySelector('.obs-canvas-box');
+  const w=box.clientWidth,h=box.clientHeight;
+  renderer=new THREE.WebGLRenderer({canvas:document.getElementById('cv'),antialias:true});
+  renderer.setSize(w,h); renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+  scene=new THREE.Scene();
+  scene.background=new THREE.Color(0xb0c4de);
+  scene.fog=new THREE.Fog(0xb0c4de,3500,7500);
+  camera=new THREE.PerspectiveCamera(50,w/h,1,15000);
+  scene.add(new THREE.AmbientLight(0xffffff,0.85));
+  const dl=new THREE.DirectionalLight(0xffffff,0.45);
+  dl.position.set(400,700,300); scene.add(dl);
+  buildTerrain();
+  buildRoofs();
+  buildFacades();
+  buildTroncons();
+  updateCamera();
+  setupMouse();
+  animate();
+}
+
+function buildTerrain(){
+  const T=D.T,tm=D.tm;
+  const rows=T.length,cols=T[0].length;
+  const W=(cols-1)*tm.s, H=(rows-1)*tm.s;
+  const geo=new THREE.PlaneGeometry(W,H,cols-1,rows-1);
+  const pos=geo.attributes.position;
+  // Build height map — PlaneGeometry orders verts row-major top-to-bottom
+  for(let r=0;r<rows;r++)for(let c=0;c<cols;c++){
+    pos.setZ(r*cols+c,(T[r][c]-tm.zmin)*ZS);
+  }
+  geo.computeVertexNormals();
+
+  // Create DataTexture for ground shadow (initial: all uniform)
+  const gm=D.gm;
+  const GW=gm.W,GH=gm.H;
+  terrTexData=new Uint8Array(GW*GH*4);
+  for(let i=0;i<GW*GH;i++){
+    // Base altitude color
+    terrTexData[i*4+0]=180;
+    terrTexData[i*4+1]=190;
+    terrTexData[i*4+2]=170;
+    terrTexData[i*4+3]=255;
+  }
+  terrTex=new THREE.DataTexture(terrTexData,GW,GH,THREE.RGBAFormat);
+  terrTex.flipY=true;  // DataTexture needs flipping to match PlaneGeometry UV
+  terrTex.needsUpdate=true;
+
+  const mat=new THREE.MeshLambertMaterial({map:terrTex,side:THREE.DoubleSide});
+  terrMesh=new THREE.Mesh(geo,mat);
+  terrMesh.rotation.x=-Math.PI/2;
+  // Position mesh so the (x0,y0) corner of MNT aligns correctly
+  terrMesh.position.set(tm.x0+W/2,0,-(tm.y0-H/2));
+  scene.add(terrMesh);
+  console.log('terrain',rows,'x',cols,'gtex',GW,'x',GH);
+}
+
+function buildRoofs(){
+  D.B.forEach((b,bi)=>{
+    if(!b.r||b.r.length<4)return;
+    const shape=new THREE.Shape();
+    shape.moveTo(b.r[0][0],b.r[0][1]);
+    for(let j=1;j<b.r.length;j++) shape.lineTo(b.r[j][0],b.r[j][1]);
+    const g=new THREE.ShapeGeometry(shape);
+    g.rotateX(-Math.PI/2);
+    g.translate(0,(b.z0+b.h-D.tm.zmin)*ZS+0.3,0);
+    const m=new THREE.Mesh(g,new THREE.MeshBasicMaterial({color:0x888888,side:THREE.DoubleSide}));
+    m.userData={bi:bi};
+    scene.add(m); roofs.push(m);
+  });
+}
+
+function buildFacades(){
+  const inst=[];
+  D.B.forEach((b,bi)=>{
+    if(!b.r||b.r.length<4)return;
+    const et_h=b.h/b.ne;
+    for(let i=0;i<b.r.length-1;i++){
+      const ax=b.r[i][0],ay=b.r[i][1];
+      const bx=b.r[i+1][0],by=b.r[i+1][1];
+      const dx=bx-ax,dy=by-ay;
+      const len=Math.hypot(dx,dy);
+      if(len<2)continue;
+      const nx=dy/len,ny=-dx/len;
+      const normAz=((Math.atan2(nx,ny)*180/Math.PI)+360)%360;
+      let bestFac=null,bestD=1e9;
+      for(const f of b.f){
+        const d=Math.min(Math.abs(f.n-normAz),360-Math.abs(f.n-normAz));
+        if(d<bestD){bestD=d;bestFac=f;}
+      }
+      if(!bestFac||bestD>20)continue;
+      const midx=(ax+bx)/2,midy=(ay+by)/2;
+      const ang=Math.atan2(dy,dx);
+      for(const et of bestFac.e){
+        const zMid=b.z0+(et.e+0.5)*et_h;
+        inst.push({
+          sid:et.sid,bi:bi,fac:bestFac.n,et:et.e,
+          mx:midx,mz:-midy,my:(zMid-D.tm.zmin)*ZS,
+          len:len,eh:et_h*ZS,ang:ang,
+          ss:et.ss,sh2:et.sh2,sc:et.sc
+        });
+      }
+    }
+  });
+  console.log('facade instances',inst.length);
+  if(inst.length===0)return;
+  const geo=new THREE.PlaneGeometry(1,1);
+  const mat=new THREE.MeshLambertMaterial({color:0xffffff,side:THREE.DoubleSide});
+  const im=new THREE.InstancedMesh(geo,mat,inst.length);
+  im.instanceColor=new THREE.InstancedBufferAttribute(new Float32Array(inst.length*3),3);
+  const dum=new THREE.Object3D();
+  inst.forEach((e,i)=>{
+    dum.position.set(e.mx,e.my,e.mz);
+    dum.rotation.set(0,e.ang,0);
+    dum.scale.set(e.len,e.eh,1);
+    dum.updateMatrix();
+    im.setMatrixAt(i,dum.matrix);
+  });
+  im.instanceMatrix.needsUpdate=true;
+  scene.add(im);
+  facadeMesh=im;
+  facadeInstances=inst;
+}
+
+function buildTroncons(){
+  D.R.forEach((t,ti)=>{
+    if(!t.g||t.g.length<2)return;
+    const pts=t.g.map(p=>new THREE.Vector3(p[0],(p[2]-D.tm.zmin)*ZS+0.5,-p[1]));
+    const geo=new THREE.BufferGeometry().setFromPoints(pts);
+    const mat=new THREE.LineBasicMaterial({color:0x888888,linewidth:3});
+    const line=new THREE.Line(geo,mat);
+    line.userData={ti:ti};
+    scene.add(line); tLines.push(line);
+  });
+}
+
+function updateCamera(){
+  camera.position.set(
+    cameraTarget.x+cameraDist*Math.sin(cameraPhi)*Math.cos(cameraTheta),
+    cameraTarget.y+cameraDist*Math.cos(cameraPhi),
+    cameraTarget.z+cameraDist*Math.sin(cameraPhi)*Math.sin(cameraTheta));
+  camera.lookAt(cameraTarget);
+}
+function animate(){requestAnimationFrame(animate);renderer.render(scene,camera);}
+
+function tsIndex(){
+  return (month-1)*34+(hour-5)*2+(halfh===30?1:0);
+}
+
+function updateGroundTexture(ti,isN){
+  if(!terrTex||!terrTexData)return;
+  const gm=D.gm;
+  const GW=gm.W,GH=gm.H;
+  const nbytes=gm.nbytes;
+
+  if(mode==='annual' && groundAnnual){
+    // ANNUAL MODE: cumulated sun % per pixel → spectral gradient
+    for(let i=0;i<GW*GH;i++){
+      const v=groundAnnual[i]; // 0-100
+      const rgb=PAL_RGB(v);
+      terrTexData[i*4+0]=rgb[0];
+      terrTexData[i*4+1]=rgb[1];
+      terrTexData[i*4+2]=rgb[2];
+    }
+  }else if(isN){
+    // LIVE NIGHT: dark
+    for(let i=0;i<GW*GH;i++){
+      terrTexData[i*4+0]=30;
+      terrTexData[i*4+1]=40;
+      terrTexData[i*4+2]=60;
+    }
+  }else{
+    // LIVE DAY: shadow overlay on natural terrain
+    // Base = natural terrain color (warm beige), shadow = dark translucent overlay
+    const bp=7-(ti&7);
+    const byOff=ti>>3;
+    const T=D.T, tm=D.tm;
+    const zr=tm.zmax-tm.zmin||1;
+    for(let i=0;i<GW*GH;i++){
+      const sun=(GB[i*nbytes+byOff]>>bp)&1;
+      // Terrain base color from altitude
+      const gr=Math.floor(i/GW), gc=i%GW;
+      const tz=(T[Math.min(gr,T.length-1)]&&T[Math.min(gr,T.length-1)][Math.min(gc,(T[0]||[]).length-1)])||tm.zmin;
+      const nz=(tz-tm.zmin)/zr;
+      if(sun){
+        // Sunlit: warm natural terrain
+        terrTexData[i*4+0]=Math.floor(190+nz*50);
+        terrTexData[i*4+1]=Math.floor(185+nz*40);
+        terrTexData[i*4+2]=Math.floor(160+nz*30);
+      }else{
+        // Shadow: darkened terrain (like a real shadow on the ground)
+        terrTexData[i*4+0]=Math.floor(70+nz*20);
+        terrTexData[i*4+1]=Math.floor(75+nz*15);
+        terrTexData[i*4+2]=Math.floor(90+nz*10);
+      }
+    }
+  }
+  terrTex.needsUpdate=true;
+}
+
+function updateColors(){
+  const ti=tsIndex();
+  const info=D.tsf[ti]||[1,12,0,180,0];
+  const el=info[4];
+  const isN=el<=0;
+  document.getElementById('sunBadge').textContent=isN?'🌙 Nuit':`☀️ ${MOIS[month]} ${hour}h${halfh<10?'0':''}${halfh} · az ${info[3].toFixed(0)}° · él ${el.toFixed(0)}°`;
+  document.getElementById('sunInfo').textContent=isN?'🌙 nuit':`☀️ ${el.toFixed(0)}° élév`;
+  document.getElementById('moDisp').textContent=MOIS[month];
+  document.getElementById('hrDisp').textContent=(hour<10?'0':'')+hour+'h'+(halfh<10?'0':'')+halfh;
+
+  // Ground texture (dynamic)
+  updateGroundTexture(ti,isN&&mode==='live');
+
+  // Roofs
+  roofs.forEach(m=>{
+    const b=D.B[m.userData.bi];
+    let v;
+    if(mode==='live'){
+      let s=0,n=0;
+      b.f.forEach(f=>f.e.forEach(e=>{s+=getFacBit(e.sid,ti);n++;}));
+      v=n>0?100*s/n:0;
+    }else{
+      v=b[score==='sun'?'ss':score==='hot'?'sh2':'sc'];
+    }
+    m.material.color.setHex(isN&&mode==='live'?0x333344:PAL(v));
+  });
+
+  // Facades
+  if(facadeMesh){
+    const tmp=new THREE.Color();
+    facadeInstances.forEach((e,i)=>{
+      let v;
+      if(mode==='live') v=getFacBit(e.sid,ti)*100;
+      else v=e[score==='sun'?'ss':score==='hot'?'sh2':'sc'];
+      tmp.setHex(isN&&mode==='live'?0x333344:PAL(v));
+      facadeMesh.instanceColor.setXYZ(i,tmp.r,tmp.g,tmp.b);
+    });
+    facadeMesh.instanceColor.needsUpdate=true;
+  }
+
+  // Troncons
+  tLines.forEach(ln=>{
+    let v;
+    if(mode==='live'){
+      v=getTronPct(ln.userData.ti,ti);
+    }else{
+      v=50;
+    }
+    ln.material.color.setHex(isN&&mode==='live'?0x333344:PAL(v));
+  });
+
+  updateTopList();
+}
+
+function updateTopList(){
+  const ti=tsIndex();
+  const lst=document.getElementById('topList');
+  let items=[];
+  if(view==='bati'){
+    items=D.B.map((b,i)=>{
+      let v;
+      if(mode==='live'){
+        let s=0,n=0;
+        b.f.forEach(f=>f.e.forEach(e=>{s+=getFacBit(e.sid,ti);n++;}));
+        v=n>0?100*s/n:0;
+      }else v=b[score==='sun'?'ss':score==='hot'?'sh2':'sc'];
+      return {v,b,i};
+    });
+  }else if(view==='facade'){
+    D.B.forEach((b,bi)=>{
+      b.f.forEach(f=>f.e.forEach(e=>{
+        let v;
+        if(mode==='live') v=getFacBit(e.sid,ti)*100;
+        else v=e[score==='sun'?'ss':score==='hot'?'sh2':'sc'];
+        items.push({v,b,bi,e,fn:f.n});
+      }));
+    });
+  }else{
+    // ground: top 12 troncons (best ground spots)
+    D.R.forEach((t,i)=>{
+      const v=mode==='live'?getTronPct(i,ti):50;
+      items.push({v,r:t,i});
+    });
+  }
+  items.sort((a,b)=>b.v-a.v);
+  let html='';
+  items.slice(0,12).forEach(it=>{
+    if(view==='ground'){
+      html+=`<div class="item">
+        <span class="v" style="color:${PALH(it.v)}">${it.v.toFixed(0)}</span>
+        <div class="nm">${it.r.n||'Tronçon'}</div>
+        <div class="de">${(it.r.L||0)}m</div></div>`;
+    }else{
+      const label=view==='facade'?
+        `${it.b.u||'Bât'} · ét.${it.e.e+1} · ${dirFromAz(it.fn)}`:
+        `${it.b.u||'Bât'} · ${it.b.nl}log · ${it.b.h}m`;
+      html+=`<div class="item" onclick="selectBati(${it.b.i})">
+        <span class="v" style="color:${PALH(it.v)}">${it.v.toFixed(0)}</span>
+        <div class="nm">${label}</div>
+        <div class="de">${it.b.tn||'—'}</div></div>`;
+    }
+  });
+  lst.innerHTML=html||'<div style="padding:12px;color:#999">aucun</div>';
+}
+
+function dirFromAz(az){const d=['N','NE','E','SE','S','SO','O','NO'];return d[Math.round(az/45)%8];}
+
+function selectBati(idx){
+  const b=D.B[idx];
+  const f=document.getElementById('fiche');
+  const ti=tsIndex();
+  const n_et=b.ne;
+  let mhtml='<table><tr><th></th>';
+  b.f.forEach((fac,fi)=>mhtml+=`<th>F${fi+1}<br>${dirFromAz(fac.n)}</th>`);
+  mhtml+='</tr>';
+  for(let e=n_et-1;e>=0;e--){
+    mhtml+=`<tr><th>É${e+1}</th>`;
+    b.f.forEach((fac,fi)=>{
+      const et=fac.e.find(x=>x.e===e);
+      if(et){
+        let v;
+        if(mode==='live') v=getFacBit(et.sid,ti)*100;
+        else v=et[score==='sun'?'ss':score==='hot'?'sh2':'sc'];
+        mhtml+=`<td class="cell" style="background:${PALH(v)}">${v.toFixed(0)}</td>`;
+      }else mhtml+='<td></td>';
+    });
+    mhtml+='</tr>';
+  }
+  mhtml+='</table>';
+  f.innerHTML=`<h2>🏢 ${b.u||'Bâtiment'} #${b.bid}</h2>
+    <div class="row"><span>Hauteur</span><b>${b.h} m</b></div>
+    <div class="row"><span>Étages</span><b>${b.ne}</b></div>
+    <div class="row"><span>Logements</span><b>${b.nl||0}</b></div>
+    <div class="row"><span>Adresse</span><b>${b.tn||'—'}</b></div>
+    <div class="row"><span>Soleil/an</span><b>${b.sh}h</b></div>
+    <div class="row"><span>Scores ☀️/🥵/🌡</span><b>${b.ss}/${b.sh2}/${b.sc}</b></div>
+    <h3>Matrice étage × façade</h3>${mhtml}
+    <button class="tbl-btn" onclick="zoomBati(${idx})">🔍 Zoom</button>
+    <button class="tbl-btn" onclick="closeFiche()">✕ Fermer</button>`;
+  f.style.display='block';
+  document.getElementById('topPanel').style.display='none';
+  cameraTarget.set(b.r[0][0],(b.z0+b.h/2-D.tm.zmin)*ZS,-b.r[0][1]);
+  cameraDist=400; updateCamera();
+}
+function zoomBati(i){const b=D.B[i];cameraTarget.set(b.r[0][0],(b.z0+b.h/2-D.tm.zmin)*ZS,-b.r[0][1]);cameraDist=300;updateCamera();}
+function closeFiche(){document.getElementById('fiche').style.display='none';document.getElementById('topPanel').style.display='block';}
+
+function setMode(m){mode=m;document.querySelectorAll('[data-m]').forEach(b=>b.classList.toggle('active',b.dataset.m===m));updateColors();}
+function setScore(s){score=s;document.querySelectorAll('[data-s]').forEach(b=>b.classList.toggle('active',b.dataset.s===s));updateColors();}
+function setView(v){view=v;document.querySelectorAll('[data-v]').forEach(b=>b.classList.toggle('active',b.dataset.v===v));updateTopList();}
+
+function togglePlay(){
+  playing=!playing;
+  const p=document.getElementById('play');
+  p.classList.toggle('on',playing);
+  p.textContent=playing?'⏸ Pause':'▶ Lecture journée';
+  if(playing){
+    playTimer=setInterval(()=>{
+      let v=+document.getElementById('hour').value+1;
+      if(v>33)v=0;
+      document.getElementById('hour').value=v;
+      hour=5+Math.floor(v/2); halfh=(v%2)*30;
+      updateColors();
+    },250);
+  }else clearInterval(playTimer);
+}
+
+function setupMouse(){
+  const cv=renderer.domElement;
+  let drag=false,lx=0,ly=0,moved=false;
+  cv.addEventListener('mousedown',e=>{drag=true;lx=e.clientX;ly=e.clientY;moved=false;});
+  cv.addEventListener('mousemove',e=>{
+    if(!drag)return;
+    if(Math.abs(e.clientX-lx)+Math.abs(e.clientY-ly)>3)moved=true;
+    cameraTheta+=(e.clientX-lx)*0.005;
+    cameraPhi=Math.max(0.05,Math.min(Math.PI/2-0.02,cameraPhi+(e.clientY-ly)*0.005));
+    lx=e.clientX;ly=e.clientY;updateCamera();
+  });
+  cv.addEventListener('mouseup',e=>{
+    drag=false;
+    if(moved)return;
+    const rect=cv.getBoundingClientRect();
+    const m=new THREE.Vector2(((e.clientX-rect.left)/rect.width)*2-1,-((e.clientY-rect.top)/rect.height)*2+1);
+    const rc=new THREE.Raycaster();
+    rc.setFromCamera(m,camera);
+    const hits=rc.intersectObjects(roofs);
+    if(hits.length>0) selectBati(hits[0].object.userData.bi);
+  });
+  cv.addEventListener('mouseleave',()=>drag=false);
+  cv.addEventListener('wheel',e=>{
+    cameraDist=Math.max(50,Math.min(5000,cameraDist+e.deltaY*1.2));
+    updateCamera();e.preventDefault();
+  });
+}
+
+async function start(){
+  await loadData();
+  document.getElementById('kpi_b').textContent=D.m.nb.toLocaleString('fr-FR');
+  document.getElementById('kpi_t').textContent=D.m.nt.toLocaleString('fr-FR');
+  document.getElementById('kpi_f').textContent=D.m.nf.toLocaleString('fr-FR');
+  document.getElementById('sB').textContent=D.m.nb.toLocaleString('fr-FR');
+  document.getElementById('sT').textContent=D.m.nt.toLocaleString('fr-FR');
+  document.getElementById('sE').textContent=D.m.nf.toLocaleString('fr-FR');
+  init3D();
+  document.getElementById('month').oninput=function(){month=+this.value;updateColors();};
+  document.getElementById('hour').oninput=function(){const v=+this.value;hour=5+Math.floor(v/2);halfh=(v%2)*30;updateColors();};
+  updateColors();
+}
+start();
+window.addEventListener('resize',()=>{
+  const box=document.querySelector('.obs-canvas-box');
+  const w=box.clientWidth,h=box.clientHeight;
+  if(renderer){renderer.setSize(w,h);camera.aspect=w/h;camera.updateProjectionMatrix();}
+});
+</script>
+</body>
+</html>

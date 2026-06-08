@@ -174,9 +174,64 @@ def qgis_command(action: str, params: dict = None, timeout: int = None) -> dict:
     except httpx.TimeoutException:
         return {"error": f"QGIS command timed out after {effective_timeout}s."}
     except httpx.ConnectError:
-        return {"error": f"Cannot connect to QGIS api_server at port {port}. QGIS may still be starting up."}
+        return {"error": f"Cannot connect to QGIS api_server at {base_url}. QGIS may still be starting up."}
     except Exception as e:
         return {"error": f"Bridge HTTP error: {str(e)}"}
+
+
+# ── Async job helpers ────────────────────────────────────────────
+# Submit a bridge action for background execution on QGIS and poll its status.
+# The api_server holds an in-memory registry; the bridge streams heartbeats so
+# we can detect a frozen Qt main thread without waiting for timeout.
+
+def qgis_submit(action: str, params: dict = None) -> dict:
+    """POST /api/submit → {job_id, submitted_at, action}."""
+    base_url = _get_user_api_base_url()
+    url = f"{base_url}/api/submit"
+    try:
+        with httpx.Client(timeout=10) as client:
+            resp = client.post(url, json={"action": action, "params": params or {}})
+            if resp.status_code >= 400:
+                return {"error": f"submit failed ({resp.status_code}): {resp.text}"}
+            return resp.json()
+    except httpx.ConnectError:
+        return {"error": f"Cannot connect to QGIS api_server at {base_url}."}
+    except Exception as e:
+        return {"error": f"Submit error: {str(e)}"}
+
+
+def qgis_poll(job_id: str) -> dict:
+    """GET /api/job/{job_id} → status, heartbeat_age_s, result, ..."""
+    base_url = _get_user_api_base_url()
+    url = f"{base_url}/api/job/{job_id}"
+    try:
+        with httpx.Client(timeout=10) as client:
+            resp = client.get(url)
+            if resp.status_code == 404:
+                return {"error": f"Unknown job_id: {job_id}"}
+            if resp.status_code >= 400:
+                return {"error": f"poll failed ({resp.status_code}): {resp.text}"}
+            return resp.json()
+    except httpx.ConnectError:
+        return {"error": f"Cannot connect to QGIS api_server at {base_url}."}
+    except Exception as e:
+        return {"error": f"Poll error: {str(e)}"}
+
+
+def qgis_cancel(job_id: str) -> dict:
+    """DELETE /api/job/{job_id} → best-effort cancel."""
+    base_url = _get_user_api_base_url()
+    url = f"{base_url}/api/job/{job_id}"
+    try:
+        with httpx.Client(timeout=10) as client:
+            resp = client.delete(url)
+            if resp.status_code == 404:
+                return {"error": f"Unknown job_id: {job_id}"}
+            if resp.status_code >= 400:
+                return {"error": f"cancel failed ({resp.status_code}): {resp.text}"}
+            return resp.json()
+    except Exception as e:
+        return {"error": f"Cancel error: {str(e)}"}
 
 
 # ── Load HTML ─────────────────────────────────────────────────────
@@ -235,8 +290,44 @@ TOOLS = [
         }
     },
     {
+        "name": "execute_async",
+        "description": "Submit a long-running bridge action (typically execute_python) for background execution and return a job_id immediately. Poll with poll_job(job_id) to track progress and retrieve the result. Use this for anything expected to take >30s: heavy native:difference, extractbylocation on 50k+ features, smart_load with large bbox, multi-step scripts. The bridge streams heartbeats so qt_lag_ms and stale heartbeats detect a frozen QGIS main thread without waiting for a timeout.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "description": "Bridge action to run (default 'execute_python')", "default": "execute_python"},
+                "code": {"type": "string", "description": "Python code when action is execute_python"},
+                "params": {"type": "object", "description": "Params for the action (for non-execute_python actions). Ignored when 'code' is provided.", "default": {}},
+                "timeout": {"type": "integer", "description": "Server-side timeout in seconds (default 600)", "default": 600}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "poll_job",
+        "description": "Check the status of a job submitted with execute_async. Returns status ('queued'|'running'|'qt_frozen'|'done'|'error'|'cancelled'|'dropped'|'bridge_unreachable'), heartbeat_age_s, qt_lag_ms, probably_frozen, stage, and — when status=='done' — the full result. If heartbeat_age_s > 10s, a status probe is run against the bridge to distinguish a frozen Qt thread from a dead bridge.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "Job ID returned by execute_async"}
+            },
+            "required": ["job_id"]
+        }
+    },
+    {
+        "name": "cancel_job",
+        "description": "Best-effort cancel of a job. Effective only if the job is still queued on the bridge; once it has been dispatched to the Qt main thread it cannot be interrupted and the response will be 'already_dispatched_cannot_cancel'.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "Job ID to cancel"}
+            },
+            "required": ["job_id"]
+        }
+    },
+    {
         "name": "get_screenshot",
-        "description": "Capture the current QGIS map canvas as a PNG image. Returns the screenshot inline.",
+        "description": "Capture the current QGIS desktop as a JPEG image (q<=75, <=1MB). Returns the screenshot inline.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -759,6 +850,7 @@ RESOURCES = [
     {"uri": "skill://smart-loading", "name": "Smart Loading Pipeline", "description": "Guided data loading: set_study_zone + smart_load (ogr2ogr + GeoPackage). CRS handling, caching, best practices.", "mimeType": "text/plain"},
     {"uri": "skill://recipes", "name": "Recipes Guide", "description": "Workflow recipes: reproducible step-by-step GIS analyses. Use list_recipes + get_recipe.", "mimeType": "text/plain"},
     {"uri": "skill://solar", "name": "Solar Pipeline", "description": "Cadastre solaire: irradiance, r.sun, ray-marching, facade analysis, z-scores. Configurable profiles (rapide/standard/precision).", "mimeType": "text/plain"},
+    {"uri": "skill://file-exchange", "name": "File Exchange", "description": "Unified bridge_put / bridge_get API for moving files between client and the QGIS container. Decision tree, anti-patterns, troubleshooting. Status: design — pending implementation.", "mimeType": "text/plain"},
     {"uri": "skill://qgis-status", "name": "QGIS Status", "description": "Current QGIS instance status.", "mimeType": "text/plain"},
 ]
 
@@ -772,6 +864,7 @@ SKILL_MAP = {
     "skill://smart-loading": "smart_loading",
     "skill://recipes": "recipes",
     "skill://solar": "solar",
+    "skill://file-exchange": "file_exchange",
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -978,6 +1071,47 @@ def _tool_execute_python(arguments: dict) -> dict:
                             {"code": arguments["code"], "timeout": user_timeout},
                             timeout=user_timeout + 30)
     return {"content": _text(response, indent=2) + _auto_screenshot()}
+
+
+def _tool_execute_async(arguments: dict) -> dict:
+    """Submit a bridge action for background execution. Returns {job_id}."""
+    action = arguments.get("action", "execute_python")
+    user_timeout = arguments.get("timeout", 600)
+
+    if arguments.get("code"):
+        params = {"code": arguments["code"], "timeout": user_timeout}
+    else:
+        params = dict(arguments.get("params") or {})
+        params.setdefault("timeout", user_timeout)
+
+    if action == "execute_python" and not params.get("code"):
+        return _error("execute_async: 'code' is required when action is 'execute_python'")
+
+    response = qgis_submit(action, params)
+    if "error" in response:
+        return {"content": _text(response)}
+    response.setdefault("hint",
+        "Poll with poll_job(job_id) every few seconds. "
+        "If status stays 'running' but heartbeat_age_s > 10, QGIS main thread is likely frozen.")
+    return {"content": _text(response, indent=2)}
+
+
+def _tool_poll_job(arguments: dict) -> dict:
+    """Check status of an async job. Returns {status, heartbeat_age_s, ..., result?}."""
+    err = _validate_required(arguments, "job_id")
+    if err:
+        return _error(err)
+    response = qgis_poll(arguments["job_id"])
+    return {"content": _text(response, indent=2)}
+
+
+def _tool_cancel_job(arguments: dict) -> dict:
+    """Best-effort cancel of an async job."""
+    err = _validate_required(arguments, "job_id")
+    if err:
+        return _error(err)
+    response = qgis_cancel(arguments["job_id"])
+    return {"content": _text(response, indent=2)}
 
 
 def _tool_get_screenshot(arguments: dict) -> dict:
@@ -1477,6 +1611,42 @@ def _tool_restart_qgis_engine(arguments: dict) -> dict:
 
 # ── Publish artifact to hub S3 (storymap, flux, recipe, dataset, pdf) ─
 
+def _tool_restart_qgis_engine(arguments: dict) -> dict:
+    """Force le respawn du processus QGIS quand le bridge est dégradé/deadlocké.
+
+    À utiliser SEULEMENT quand 2+ tools consécutifs ont échoué avec des erreurs
+    d'infra (timeouts, erreurs muettes, gateway timeout). NE PAS utiliser
+    pour récupérer d'une simple erreur de code utilisateur.
+
+    Renvoie immédiatement. QGIS respawne en ~5-15s via supervisord ; pendant
+    cette fenêtre, les appels QGIS échoueront. Attendre puis polling health.
+    """
+    import os as _os
+    import urllib.request as _ur
+    import urllib.error as _ue
+    import json as _json
+    # On cible l'api_server local (cluster-internal) car c'est lui qui sait
+    # localiser le PID qgis.bin du conteneur courant.
+    api_url = _os.environ.get("LOCAL_API_URL", "http://localhost:8080")
+    url = f"{api_url.rstrip('/')}/api/restart_qgis"
+    try:
+        req = _ur.Request(url, data=b"{}", method="POST",
+                          headers={"Content-Type": "application/json"})
+        with _ur.urlopen(req, timeout=10) as r:
+            data = _json.loads(r.read().decode("utf-8", errors="replace"))
+        return {"content": _text({
+            "success": data.get("ok", False),
+            "killed_pids": data.get("killed_pids", []),
+            "message": data.get("message")
+                       or "QGIS respawn déclenché — attends 10-15s avant de retenter.",
+        }, indent=2)}
+    except _ue.HTTPError as e:
+        body_txt = e.read().decode("utf-8", errors="replace")[:200]
+        return _error(f"Restart QGIS HTTP {e.code} : {body_txt}")
+    except Exception as e:
+        return _error(f"Restart QGIS failed ({type(e).__name__}): {e}")
+
+
 _PUBLISH_KINDS = frozenset({"storymap", "flux", "recipe", "dataset", "pdf"})
 
 
@@ -1804,6 +1974,9 @@ async def stream_run_recipe(arguments: dict, msg_id: Any, session_id: str,
 TOOL_HANDLERS = {
     "qgis_desktop_ui": _tool_qgis_desktop_ui,
     "execute_python": _tool_execute_python,
+    "execute_async": _tool_execute_async,
+    "poll_job": _tool_poll_job,
+    "cancel_job": _tool_cancel_job,
     "get_screenshot": _tool_get_screenshot,
     "get_project_info": _tool_get_project_info,
     "new_project": _tool_new_project,
@@ -1878,7 +2051,7 @@ IMPORTANT: Always call set_study_zone BEFORE smart_load for WFS sources. Downloa
 
 ## Core tools
 - **execute_python** — Run PyQGIS code. Access: iface, project, canvas, processing, QgsProject, QgsVectorLayer, etc. Store outputs in `result` dict. A `helpers` module is injected with ready-made functions (see below).
-- **get_screenshot** — Capture current QGIS desktop (1280x720 PNG). Already included automatically after modifying tools.
+- **get_screenshot** — Capture current QGIS desktop (1280x720 JPEG, <=1MB). Already included automatically after modifying tools.
 - **add_layer** — Add vector/raster/WFS/WMS layers by URI.
 - **run_processing** — Execute any of 1000+ Processing algorithms (native:buffer, gdal:warp, grass7:v.clean, etc.).
 - **zoom_to** — Zoom to extent or layer.
