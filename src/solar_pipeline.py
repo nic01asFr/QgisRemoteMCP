@@ -1303,7 +1303,9 @@ def analyze_ground(config):
     STEP = max(1, int(4 * res / 5))  # ~4 at 5m, ~2 at 10m, ~1 at 2m
     gH = H // STEP
     gW = W // STEP
-    EYE = MNT[::STEP, ::STEP] + 1.0  # 1m above ground
+    # Ensure exact shape match between DSM and MNT subsamples
+    dsm_sub = DSM[:gH*STEP:STEP, :gW*STEP:STEP]
+    EYE = MNT[:gH*STEP:STEP, :gW*STEP:STEP] + 1.0  # 1m above ground
 
     LAT, LON = _get_study_latlon()
     months = config["months"]
@@ -1328,7 +1330,6 @@ def analyze_ground(config):
             # Shift in DSM pixel space (full res)
             sc = int(round(s * dxh * STEP))
             sr = int(round(s * -dyh * STEP))
-            dsm_sub = DSM[::STEP, ::STEP]
             out = np.full((gH, gW), -1e9, dtype=np.float32)
             r0s, r1s = max(0, sr), min(gH, gH + sr)
             c0s, c1s = max(0, sc), min(gW, gW + sc)
@@ -1458,6 +1459,7 @@ def build_observatoire_html(zone_name=None, out_path=None):
             h_val = feat['hauteur'] or 10
             z0_val = feat['altitude_minimale_sol'] or 0
             n_et = feat['nombre_d_etages'] or max(1, int(round(float(h_val)/3)))
+            if n_et < 1: n_et = 1
             n_log = feat['nombre_de_logements'] or 0
             usage = str(feat['usage_1'] or '')[:15]
         else:
@@ -1474,7 +1476,8 @@ def build_observatoire_html(zone_name=None, out_path=None):
         for norm, etages in facs.items():
             ets = sorted(etages.items())
             et_data = [{'e': et, 'sid': sid, 'sh': int(SHY[sid]),
-                        'ss': float(round(SS[sid], 1)), 'sh2': float(round(SH2[sid], 1)),
+                        'ss': float(round(SS[sid], 1)),
+                        'sh2': float(round(SH2[sid], 1)),
                         'sc': float(round(SC_C[sid], 1))} for et, sid in ets]
             fac_list.append({'n': norm, 'e': et_data})
 
@@ -1483,11 +1486,14 @@ def build_observatoire_html(zone_name=None, out_path=None):
         bati_list.append({
             'i': bi_idx, 'bid': bid, 'r': ring_l,
             'h': round(float(h_val), 1), 'z0': round(float(z0_val), 1),
-            'ne': int(n_et), 'nl': int(n_log), 'u': usage, 'f': fac_list,
+            'ne': int(n_et), 'nl': int(n_log), 'u': usage,
+            'f': fac_list,
             'tn': link['nom'] if link else None,
             'tf': link['fid'] if link else None,
-            'sh': int(SHY[all_sids].mean()), 'ss': float(round(SS[all_sids].mean(), 1)),
-            'sh2': float(round(SH2[all_sids].mean(), 1)), 'sc': float(round(SC_C[all_sids].mean(), 1)),
+            'sh': int(SHY[all_sids].mean()),
+            'ss': float(round(SS[all_sids].mean(), 1)),
+            'sh2': float(round(SH2[all_sids].mean(), 1)),
+            'sc': float(round(SC_C[all_sids].mean(), 1)),
         })
 
     # Troncon list
@@ -1556,9 +1562,10 @@ def build_observatoire_html(zone_name=None, out_path=None):
     # Terrain grid (subsampled)
     TSTEP = max(1, 4)
     terr = MNT[::TSTEP, ::TSTEP]
+    zmin_real = float(MNT[MNT > 0].min()) if (MNT > 0).any() else float(MNT.min())
     tmeta = {'x0': gt[0] - cx_l93, 'y0': gt[3] - cy_l93, 's': float(gt[1]) * TSTEP,
              'r': int(terr.shape[0]), 'c': int(terr.shape[1]),
-             'zmin': float(MNT.min()), 'zmax': float(MNT.max())}
+             'zmin': zmin_real, 'zmax': float(MNT.max())}
 
     # Ground shadow bits
     gb_path = SOLAR_DIR / "ground_bits.npy"
