@@ -1234,40 +1234,127 @@ class QGISBridge:
         }
 
     # ── Recipes ───────────────────────────────────────────────────
+    # V1.5 Sprint 0 : support multi-sources (system + user).
+    # RECIPES_SYSTEM_DIR  : recipes embarquees dans l'image (JSON, backward compat).
+    # RECIPES_USER_DIR    : recipes user editables (JSON ou YAML), sur PVC.
+    #                       Override via env USER_RECIPES_DIR (injecte par hub
+    #                       chart Onyxia avec /data/studies/{sid}/recipes).
+    # Priorite : user > system. Si meme id, user gagne (override).
+    # Tag `source` dans list_recipes pour distinguer UI.
 
-    RECIPES_DIR = Path("/app/recipes")
+    RECIPES_SYSTEM_DIR = Path("/app/recipes")
+    RECIPES_USER_DIR = Path(os.environ.get(
+        "USER_RECIPES_DIR", "/data/studies/recipes"
+    ))
+    # Legacy alias pour compat code externe qui referencerait RECIPES_DIR
+    RECIPES_DIR = RECIPES_SYSTEM_DIR
+
+    @classmethod
+    def _load_recipe_file(cls, rpath: "Path") -> dict | None:
+        """Charge une recipe depuis un fichier .json ou .yaml. Retourne None si KO."""
+        try:
+            text = rpath.read_text(encoding="utf-8")
+            if rpath.suffix == ".json":
+                return json.loads(text)
+            elif rpath.suffix in (".yaml", ".yml"):
+                try:
+                    import yaml  # type: ignore
+                    return yaml.safe_load(text)
+                except ImportError:
+                    # PyYAML non dispo en env QGIS standard -> log + skip
+                    print(f"[qgis_bridge] PyYAML manquant, skip {rpath.name}",
+                          file=sys.stderr)
+                    return None
+            return None
+        except Exception:
+            return None
+
+    @classmethod
+    def _iter_recipe_files(cls, directory: "Path") -> "list[Path]":
+        """Liste les fichiers recipes (.json + .yaml) tries dans un dossier."""
+        if not directory.is_dir():
+            return []
+        files = []
+        for pattern in ("*.json", "*.yaml", "*.yml"):
+            files.extend(directory.glob(pattern))
+        return sorted(files)
 
     def _action_list_recipes(self, params: dict) -> dict:
-        """List available workflow recipes."""
+        """List available workflow recipes (user + system merged, user prioritaire)."""
         recipes = []
-        if self.RECIPES_DIR.is_dir():
-            for rpath in sorted(self.RECIPES_DIR.glob("*.json")):
-                try:
-                    data = json.loads(rpath.read_text(encoding="utf-8"))
-                    recipes.append({
-                        "id": data.get("id", rpath.stem),
-                        "name": data.get("name", rpath.stem),
-                        "description": data.get("description", ""),
-                        "tags": data.get("tags", []),
-                        "parameters": data.get("parameters", {}),
-                    })
-                except Exception:
-                    pass
+        seen_ids = set()
+        # 1. User recipes (PVC) prioritaires
+        for rpath in self._iter_recipe_files(self.RECIPES_USER_DIR):
+            data = self._load_recipe_file(rpath)
+            if not data:
+                continue
+            rid = data.get("id", rpath.stem)
+            if rid in seen_ids:
+                continue
+            seen_ids.add(rid)
+            recipes.append({
+                "id": rid,
+                "name": data.get("name", rpath.stem),
+                "description": data.get("description", ""),
+                "tags": data.get("tags", []),
+                "parameters": data.get("parameters", {}),
+                "source": "user",
+                "format": rpath.suffix.lstrip("."),
+            })
+        # 2. System recipes (image) en fallback, skip si id deja vu (user override)
+        for rpath in self._iter_recipe_files(self.RECIPES_SYSTEM_DIR):
+            data = self._load_recipe_file(rpath)
+            if not data:
+                continue
+            rid = data.get("id", rpath.stem)
+            if rid in seen_ids:
+                continue
+            seen_ids.add(rid)
+            recipes.append({
+                "id": rid,
+                "name": data.get("name", rpath.stem),
+                "description": data.get("description", ""),
+                "tags": data.get("tags", []),
+                "parameters": data.get("parameters", {}),
+                "source": "system",
+                "format": rpath.suffix.lstrip("."),
+            })
         return {"recipes": recipes}
 
+    def _find_recipe_path(self, recipe_id: str) -> "Path | None":
+        """Cherche le fichier d'une recipe (user d'abord, system fallback)."""
+        # Essai user (JSON puis YAML)
+        for ext in (".json", ".yaml", ".yml"):
+            p = self.RECIPES_USER_DIR / f"{recipe_id}{ext}"
+            if p.exists():
+                return p
+        # Essai system (JSON uniquement, backward compat)
+        p = self.RECIPES_SYSTEM_DIR / f"{recipe_id}.json"
+        if p.exists():
+            return p
+        return None
+
     def _action_get_recipe(self, params: dict) -> dict:
-        """Get a specific recipe with parameter substitution."""
+        """Get a specific recipe with parameter substitution (user prioritaire)."""
         recipe_id = params.get("id", "")
         if not recipe_id:
             return {"error": "Missing 'id' parameter"}
 
-        recipe_path = self.RECIPES_DIR / f"{recipe_id}.json"
-        if not recipe_path.exists():
-            available = [p.stem for p in self.RECIPES_DIR.glob("*.json")] if self.RECIPES_DIR.is_dir() else []
+        recipe_path = self._find_recipe_path(recipe_id)
+        if recipe_path is None:
+            # Construire la liste des disponibles (user + system)
+            all_files = (
+                self._iter_recipe_files(self.RECIPES_USER_DIR)
+                + self._iter_recipe_files(self.RECIPES_SYSTEM_DIR)
+            )
+            available = sorted({p.stem for p in all_files})
             return {"error": f"Recipe not found: {recipe_id}",
                     "available_recipes": available}
 
-        data = json.loads(recipe_path.read_text(encoding="utf-8"))
+        data = self._load_recipe_file(recipe_path)
+        if data is None:
+            return {"error": f"Recipe failed to parse: {recipe_id}",
+                    "path": str(recipe_path)}
 
         # Substitute parameters: $zone → actual value from params
         recipe_params = data.get("parameters", {})
