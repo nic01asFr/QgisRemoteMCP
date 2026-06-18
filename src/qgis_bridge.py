@@ -1271,12 +1271,19 @@ class QGISBridge:
 
     @classmethod
     def _iter_recipe_files(cls, directory: "Path") -> "list[Path]":
-        """Liste les fichiers recipes (.json + .yaml) tries dans un dossier."""
+        """Liste les fichiers recipes (.json + .yaml) tries dans un dossier.
+
+        Skip les fichiers `.archived.<ts>` (soft delete pattern du hub :
+        cf. studies.py:delete_recipe_pod_code) : sinon les recipes
+        supprimees reapparaissent dans list_recipes apres archive.
+        """
         if not directory.is_dir():
             return []
         files = []
         for pattern in ("*.json", "*.yaml", "*.yml"):
             files.extend(directory.glob(pattern))
+        # Filtre out les archived
+        files = [f for f in files if ".archived." not in f.name]
         return sorted(files)
 
     def _action_list_recipes(self, params: dict) -> dict:
