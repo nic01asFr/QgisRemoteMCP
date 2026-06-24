@@ -759,7 +759,7 @@ TOOLS = [
     # ── Grist Export ─────────────────────────────────────────────
     {
         "name": "export_grist",
-        "description": "Export as a .grist file (SQLite). Two modes: (1) From QGIS project layers (default) — creates tables, typed columns, map widget, stats, form. (2) From HTML file (html_path) — takes any HTML containing GeoJSON (export_web_map, export_flood_map, export_temporal_map, qgis2web, or any Leaflet HTML), extracts data into Grist tables, and transforms the original map into a Grist custom widget reading from those tables. Same interactive map, but data lives in Grist.",
+        "description": "Export as a .grist file (SQLite). Two modes: (1) From QGIS project layers (default) — creates tables, typed columns, map widget, stats, form. (2) From HTML file (html_path) — takes any HTML containing GeoJSON (export_web_map, export_flood_map, export_temporal_map, qgis2web, or any Leaflet HTML), extracts data into Grist tables, and transforms the original map into a Grist custom widget reading from those tables. Same interactive map, but data lives in Grist. Optional: pass output_path to customize the .grist destination (default /data/{doc_name}.grist) and/or scene_manifest_json to embed a Scene Manifest V0.2 as an extra SceneManifest table (cross-runtime style bridge for atlas widgets).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -768,7 +768,9 @@ TOOLS = [
                 "max_features_per_layer": {"type": "integer", "description": "Max features per layer (default: 50000)", "default": 50000},
                 "include_stats": {"type": "boolean", "description": "Generate stats summary table (default: true)", "default": True},
                 "detect_relationships": {"type": "boolean", "description": "Auto-detect Ref columns between tables (default: true)", "default": True},
-                "timezone": {"type": "string", "description": "Timezone for DateTime columns (default: Europe/Paris)", "default": "Europe/Paris"}
+                "timezone": {"type": "string", "description": "Timezone for DateTime columns (default: Europe/Paris)", "default": "Europe/Paris"},
+                "output_path": {"type": "string", "description": "Optional: custom absolute path for the output .grist file. Default: /data/{document_name}.grist. Parent directory is created if missing. Used by external consumers like qgis-sspcloud to write into {sid}/projects/{pid}/exports/."},
+                "scene_manifest_json": {"type": "string", "description": "Optional: JSON-serialized Scene Manifest V0.2 (cf. cerema-offre-de-service/docs/scene-manifest-spec.md) to embed as an extra SceneManifest table inside the .grist. Allows atlas/Grist widgets to read the declarative style cross-runtime. If absent, no SceneManifest table is created."}
             },
             "required": []
         }
@@ -1545,8 +1547,12 @@ def _tool_export_qfield(arguments: dict) -> dict:
 
 def _tool_export_grist(arguments: dict) -> dict:
     params = {}
+    # NEW 2026-06-24 : output_path + scene_manifest_json forwardes (optionnels).
+    # Permet aux consumers externes (qgis-sspcloud) de personnaliser le chemin
+    # de sortie et d'embarquer un Scene Manifest V0.2 dans le .grist.
     for key in ("html_path", "document_name", "max_features_per_layer", "include_stats",
-                "detect_relationships", "timezone"):
+                "detect_relationships", "timezone",
+                "output_path", "scene_manifest_json"):
         if key in arguments:
             params[key] = arguments[key]
     response = qgis_command("export_grist", params, timeout=SOCKET_TIMEOUT_LONG)

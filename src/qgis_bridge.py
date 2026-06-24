@@ -2661,8 +2661,28 @@ class QGISBridge:
         include_stats = params.get("include_stats", True)
         detect_rels = params.get("detect_relationships", True)
         tz = params.get("timezone", "Europe/Paris")
+        # NEW 2026-06-24 (consumer qgis-sspcloud / Scene Manifest V0.2 :
+        # https://github.com/nic01asFr/cerema-offre-de-service/docs/scene-manifest-spec.md) :
+        # 2 nouveaux params OPTIONNELS pour la consommation par des
+        # plateformes externes. BigQgisMCP reste autonome avec fallback
+        # comportement actuel quand ces params sont absents.
+        # - output_path : chemin custom (ex: /data/studies/{sid}/projects/{pid}/exports/x.grist)
+        # - scene_manifest_json : JSON Scene Manifest V0.2 a embarquer comme
+        #   table _custom_SceneManifest dans le .grist (permet aux widgets
+        #   atlas Grist de lire le style declarative cross-runtime).
+        output_path = (params.get("output_path") or "").strip()
+        scene_manifest_json = (params.get("scene_manifest_json") or "").strip()
 
-        grist_path = f"/data/{doc_name}.grist"
+        if output_path:
+            grist_path = output_path
+            # S'assurer que le repertoire parent existe (cas qgis-sspcloud :
+            # /data/studies/{sid}/projects/{pid}/exports/ pas force pre-cree).
+            try:
+                Path(grist_path).parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+        else:
+            grist_path = f"/data/{doc_name}.grist"
         if os.path.exists(grist_path):
             os.remove(grist_path)
 
@@ -3544,6 +3564,89 @@ class QGISBridge:
         cur.execute("INSERT INTO _grist_ACLResources VALUES (1,'','')")
         cur.execute("INSERT INTO _grist_ACLRules VALUES (1,1,63,'[1]','',0,'','',1e999,'','')")
 
+        # NEW 2026-06-24 : optional embedded Scene Manifest V0.2.
+        # Quand un consumer externe (ex: qgis-sspcloud) fournit le JSON,
+        # on l'embarque comme table _custom_SceneManifest dans le .grist.
+        # Permet aux widgets atlas/Grist de lire le style declarative
+        # cross-runtime (cohérence avec la spec V0.2 cerema-offre-de-service).
+        # Idempotent : si scene_manifest_json absent, table non creee.
+        scene_manifest_embedded = False
+        scene_manifest_meta = {}
+        if scene_manifest_json:
+            try:
+                import json as _json
+                import hashlib as _hashlib
+                from datetime import datetime as _dt
+                # Valider que le JSON parse (best-effort, pas de validation
+                # Pydantic ici pour ne pas tirer la dep cote BigQgisMCP).
+                _parsed = _json.loads(scene_manifest_json)
+                _hash = _hashlib.sha256(
+                    scene_manifest_json.encode("utf-8")
+                ).hexdigest()
+                # Creer la table physique (donnees brutes) + entries dans
+                # _grist_Tables / _grist_Tables_column pour qu'elle soit
+                # visible dans l'UI Grist (sinon table fantome SQL-only).
+                cur.execute("""
+                    CREATE TABLE SceneManifest (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        manualSort REAL DEFAULT 0,
+                        manifest_version TEXT DEFAULT '',
+                        scene_hash TEXT DEFAULT '',
+                        content TEXT DEFAULT '',
+                        n_layers INTEGER DEFAULT 0,
+                        created_at_iso TEXT DEFAULT ''
+                    )
+                """)
+                cur.execute(
+                    "INSERT INTO SceneManifest "
+                    "(manualSort, manifest_version, scene_hash, content, "
+                    "n_layers, created_at_iso) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        1.0,
+                        str(_parsed.get("manifest_version", "V0.2")),
+                        _hash,
+                        scene_manifest_json,
+                        len(_parsed.get("layers", [])),
+                        _dt.utcnow().isoformat() + "Z",
+                    ),
+                )
+                # Registry Grist : ajout dans _grist_Tables + colonnes.
+                # ID arbitraire mais unique (max_id+1 evite collisions avec
+                # tables QGIS deja creees ci-dessus).
+                cur.execute("SELECT COALESCE(MAX(id), 0) FROM _grist_Tables")
+                sm_tid = cur.fetchone()[0] + 1
+                cur.execute(
+                    "INSERT INTO _grist_Tables VALUES (?, 'SceneManifest', 0, 0, '', '', '', 0)",
+                    (sm_tid,),
+                )
+                # Colonnes (sans manualSort qui est dejaautocree par Grist).
+                _sm_columns = [
+                    ("manifest_version", "Text", 1.0),
+                    ("scene_hash",       "Text", 2.0),
+                    ("content",          "Text", 3.0),
+                    ("n_layers",         "Int",  4.0),
+                    ("created_at_iso",   "Text", 5.0),
+                ]
+                cur.execute("SELECT COALESCE(MAX(id), 0) FROM _grist_Tables_column")
+                sm_col_id = cur.fetchone()[0]
+                for col_name, col_type, col_pos in _sm_columns:
+                    sm_col_id += 1
+                    cur.execute(
+                        "INSERT INTO _grist_Tables_column VALUES "
+                        "(?,?,?,?,?,'','','','',0,0,'')",
+                        (sm_col_id, sm_tid, col_name, col_type, col_pos),
+                    )
+                scene_manifest_embedded = True
+                scene_manifest_meta = {
+                    "scene_hash": _hash,
+                    "manifest_version": str(_parsed.get("manifest_version", "V0.2")),
+                    "n_layers": len(_parsed.get("layers", [])),
+                }
+            except Exception as _sm_exc:
+                # Best-effort : on n'echoue pas le .grist global si le SM
+                # est invalide. Le consumer verra scene_manifest_embedded=False.
+                scene_manifest_meta = {"error": str(_sm_exc)}
+
         conn.commit()
         conn.close()
 
@@ -3558,10 +3661,13 @@ class QGISBridge:
             "size_bytes": size,
             "size_mb": round(size / 1024 / 1024, 1),
             "document_name": doc_name,
-            "tables": len(layer_specs),
+            "tables": len(layer_specs) + (1 if scene_manifest_embedded else 0),
             "total_records": total_records,
             "pages": pages_created,
             "layers": {s['table_name']: len(s['records']) for s in layer_specs},
+            # NEW 2026-06-24 : metadata Scene Manifest si embarque.
+            "scene_manifest_embedded": scene_manifest_embedded,
+            "scene_manifest": scene_manifest_meta,
         }
 
     # ── Grist from HTML — universal HTML→Grist converter ─────────
