@@ -30,7 +30,7 @@ Each worker exposes the same REST API on dynamic ports (9000+/9100+/9200+).
 
 ## Key files
 
-- `main_mcp.py` — MCP Server with 40 tools, 10 resources, 3 prompts
+- `main_mcp.py` — MCP Server with 52 tools, 10 resources, 3 prompts
 - `src/qgis_bridge.py` — Runs inside QGIS, UNIX socket listener, 45 actions
 - `src/qgis_helpers.py` — Python helpers injected into execute_python
 - `src/api_server.py` — FastAPI REST wrapper
@@ -40,13 +40,13 @@ Each worker exposes the same REST API on dynamic ports (9000+/9100+/9200+).
 - `skills/*.md` — MCP Resources (PyQGIS, Processing, cartography, smart loading, recipes, etc.)
 - `templates/*.qpt` — Print layout templates (A3 landscape, A4 portrait)
 - `templates/web/` — Leaflet HTML templates (standard, flood, temporal)
-- `recipes/*.json` — Workflow recipes (5 pre-built analyses)
-- `datasources.json` — 30+ pre-configured French data sources (IGN, OSM, BD TOPO, Georisques)
+- `recipes/*.json` — Workflow recipes (6 pre-built analyses)
+- `datasources.json` — 47 pre-configured French data sources (IGN, OSM, BD TOPO, Georisques)
 - `Dockerfile` — Single container build
 - `supervisord.conf` — Process orchestration
 - `entrypoint.sh` — Container startup
 
-## MCP Tools (40)
+## MCP Tools (52)
 
 ### Core
 - `execute_python` — Run PyQGIS code with `helpers` module
@@ -210,6 +210,63 @@ docker compose restart qgisremotemcp
 ```
 
 QGIS bridge changes require full restart (loaded at QGIS startup).
+
+## Publishing — read this before changing anything shipped in the image
+
+This repository has **no CI**. The published image is built and pushed by
+hand:
+
+```bash
+docker build -t ghcr.io/nic01asfr/qgisremotemcp:latest .
+docker push ghcr.io/nic01asfr/qgisremotemcp:latest
+```
+
+That image is consumed by a **separate** project, `qgis-sspcloud`, whose
+Helm chart pins `workspace.image.repository: ghcr.io/nic01asfr/qgisremotemcp`.
+It runs as the `qgis-workspace-*` pod on SSPCloud.
+
+Two consequences worth remembering:
+
+- **Editing a file here changes nothing downstream until the image is
+  rebuilt and pushed** (~30 min). This applies to `datasources.json`,
+  `recipes/`, `skills/`, `templates/` and everything under `src/` — none of
+  it is mounted in production, all of it is baked into the image.
+- Nothing warns you that the deployed image has drifted from `main`. When a
+  fix matters downstream, rebuild, or say explicitly that it is pending.
+
+Existing QGIS projects (`.qgz`) keep the layer definitions they were saved
+with. A corrected entry in `datasources.json` only reaches a study once the
+layer is loaded again.
+
+## Data source pitfall — display vs compute
+
+WMS layers are not interchangeable. Some serve *pixels* (renderable), others
+serve *values* (not renderable by QGIS).
+
+`ELEVATION.ELEVATIONGRIDCOVERAGE.HIGHRES` in `image/tiff` returns 32-bit
+float elevations. QGIS cannot decode those samples — every tile logs
+
+```
+foo: Sorry, can not handle images with 32-bit samples.
+```
+
+The layer then shows as loaded but paints nothing, reports a `0x0` extent
+(which throws off `zoomToFullExtent`), and the flood of render errors has
+been observed crashing the QGIS process in production.
+
+The format cannot simply be swapped — that layer only accepts TIFF:
+
+| request | result |
+|---|---|
+| `HIGHRES` + `image/tiff` | 200, unusable for display |
+| `HIGHRES` + `image/png` / `image/jpeg` | 400 |
+| `…GRIDCOVERAGE.SHADOW` + `image/png` | 200, renders |
+
+Hence the split in `datasources.json`: `ign_dem` (hillshade, display) and
+`ign_dem_altitudes` (raw values, `display: false`, compute only).
+
+When adding an elevation or coverage source, check what the service actually
+returns before exposing it to `smart_load`.
 
 ## External services
 
