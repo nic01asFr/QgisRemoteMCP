@@ -1,32 +1,43 @@
-# Build et publication de l'image QgisRemoteMCP.
+name: Build & Push QgisRemoteMCP Image
+
+# Build de l'image workspace QGIS Desktop (ubuntu 24.04 + QGIS LTR + noVNC +
+# MCP server + bridge PyQGIS). Image lourde (~8-10 Go). Publiee sur
+# ghcr.io/nic01asfr/qgisremotemcp:latest — consommee par le pod workspace
+# de chaque user sur SSPCloud.
 #
-# Jusqu'ici ce depot n'avait aucun CI : l'image etait construite et poussee
-# a la main. Rien ne signalait donc qu'une correction mergee sur main
-# n'atteignait pas la production. Cas vecu le 2026-08-22 : un correctif de
-# datasources.json est reste sans effet, le service continuant a tourner sur
-# l'image precedente.
+# Avant cette CI, l'image etait buildee manuellement. Desormais tout push
+# sur main qui touche le code applicatif ou le Dockerfile declenche un
+# rebuild + push automatique (comme qgis-agent / qgis-hub cote qgis-sspcloud).
+# Apres le push de l'image, chaque pod workspace doit etre restart pour pull
+# (imagePullPolicy: Always).
 #
-# L'image est consommee par le chart Helm du projet qgis-sspcloud
-# (workspace.image.repository), ou elle tourne comme pod qgis-workspace-*.
+# Recette disque eprouvee (cf. build-geoai-gpu cote Passerelle) :
+#   - jlumbroso/free-disk-space libere ~25-30 Go (runner n'a qu'une partition /)
+#   - PAS de cache-from (pull ancienne image ~10 Go doublerait l'empreinte)
+#   - set -eu sans pipefail (SIGPIPE de head -> exit 141 ferait tomber le job)
 #
-# Le build est long (Ubuntu + QGIS Desktop complet, ~30 min) : il ne se
-# declenche donc que sur les fichiers reellement embarques dans l'image,
-# pas sur une simple retouche de documentation.
-name: Build & Push QgisRemoteMCP image
+# PREREQUIS package GHCR : le package qgisremotemcp ayant ete cree
+# manuellement (docker push via PAT), il faut autoriser ce repo en ecriture
+# dans les settings du package (Manage Actions access -> Add repository
+# BigQgisMCP -> Write), sinon le push echoue en "denied: permission_denied:
+# write_package". Fait le 2026-05-26.
 
 on:
   push:
     branches: [main]
     paths:
-      - 'Dockerfile'
-      - 'entrypoint.sh'
-      - 'supervisord.conf'
       - 'main_mcp.py'
       - 'src/**'
-      - 'skills/**'
       - 'recipes/**'
+      - 'skills/**'
       - 'templates/**'
       - 'datasources.json'
+      - 'setup_qgis_connections.py'
+      - 'entrypoint.sh'
+      - 'maximize_qgis.sh'
+      - 'supervisord.conf'
+      - 'requirements.txt'
+      - 'Dockerfile'
       - '.github/workflows/build.yml'
   workflow_dispatch:
 
@@ -36,16 +47,16 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
     permissions:
       contents: read
       packages: write
+
     steps:
-      # Le runner ne demarre qu'avec ~14 Go libres, insuffisant pour une image
-      # QGIS complete. free-disk-space en recupere 25-30 en supprimant les
-      # toolchains inutilisees ici. tool-cache reste actif : le supprimer coute
-      # plus de temps qu'il n'en fait gagner sur ce build.
-      - name: Liberer de l'espace disque
+      - name: Free disk space on runner
+        # Libere ~25-30 Go en supprimant SDK pre-installes. Le runner ubuntu
+        # hosted n'a qu'une partition / (~75 Go total, ~14 Go libres init).
+        # Apres cleanup : ~43 Go libres, assez pour build image ~10 Go sans
+        # cache-from.
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: false
@@ -53,27 +64,38 @@ jobs:
           dotnet: true
           haskell: true
           large-packages: true
+          docker-images: true
           swap-storage: true
+
+      - name: Check disk state
+        # set -eu sans pipefail : eviter le SIGPIPE de head sur docker info
+        # qui propage en exit 141 et fait tomber le job entier.
+        run: |
+          set -eu
+          df -h /
+          docker info 2>&1 | grep -E "Storage Driver|Docker Root Dir|Total Memory" || true
 
       - uses: actions/checkout@v4
 
-      - name: Authentification GHCR
+      - name: Login to ghcr.io
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Pas de cache-from volontairement : buildx pullerait l'image precedente
-      # avant de construire la nouvelle, doublant l'empreinte disque pour un
-      # gain nul sur une image qui change peu souvent.
-      - name: Build et push
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        # cache-from retire volontairement : pull l'ancienne image (~10 Go)
+        # doublerait l'empreinte disque pendant le build.
         uses: docker/build-push-action@v5
         with:
           context: .
           file: Dockerfile
           push: true
-          # Le tag :main accompagne :latest. Sur certains noeuds SSPCloud, le
+          # Le tag :main accompagne :latest. Sur certains noeuds SSPCloud le
           # cache local de :latest ne se rafraichit pas malgre pullPolicy
           # Always ; :main change a chaque publication et force le re-pull.
           tags: |
@@ -81,11 +103,13 @@ jobs:
             ${{ env.IMAGE }}:main
             ${{ env.IMAGE }}:${{ github.sha }}
 
-      # Verification minimale : le catalogue de sources est le fichier le plus
-      # souvent modifie et le seul qui casse silencieusement le service quand
-      # il est invalide. On controle qu'il est present, lisible et coherent.
+      # Controle post-build ajoute le 2026-08-22 : datasources.json est le
+      # fichier le plus souvent modifie et le seul qui casse le service
+      # silencieusement quand il devient incoherent. On verifie qu'il est
+      # lisible, sans identifiant en double, et que chaque source a un type.
       - name: Controle du catalogue embarque
         run: |
+          set -eu
           docker run --rm --entrypoint python3 "${IMAGE}:${{ github.sha }}" -c "
           import json
           d = json.load(open('/app/datasources.json'))

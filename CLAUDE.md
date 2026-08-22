@@ -213,13 +213,12 @@ QGIS bridge changes require full restart (loaded at QGIS startup).
 
 ## Publishing — read this before changing anything shipped in the image
 
-This repository has **no CI**. The published image is built and pushed by
-hand:
-
-```bash
-docker build -t ghcr.io/nic01asfr/qgisremotemcp:latest .
-docker push ghcr.io/nic01asfr/qgisremotemcp:latest
-```
+`.github/workflows/build.yml` rebuilds and pushes
+`ghcr.io/nic01asfr/qgisremotemcp` on every push to `main` **that touches a
+file baked into the image** (`Dockerfile`, `src/`, `skills/`, `recipes/`,
+`templates/`, `datasources.json`, `requirements.txt`, the startup scripts).
+Documentation-only commits do not trigger it — the build takes ~30 min.
+`workflow_dispatch` is available for a manual run.
 
 That image is consumed by a **separate** project, `qgis-sspcloud`, whose
 Helm chart pins `workspace.image.repository: ghcr.io/nic01asfr/qgisremotemcp`.
@@ -227,16 +226,22 @@ It runs as the `qgis-workspace-*` pod on SSPCloud.
 
 Two consequences worth remembering:
 
-- **Editing a file here changes nothing downstream until the image is
-  rebuilt and pushed** (~30 min). This applies to `datasources.json`,
-  `recipes/`, `skills/`, `templates/` and everything under `src/` — none of
-  it is mounted in production, all of it is baked into the image.
-- Nothing warns you that the deployed image has drifted from `main`. When a
-  fix matters downstream, rebuild, or say explicitly that it is pending.
+- **A merged fix does not reach production on its own.** The image is
+  rebuilt automatically, but running pods keep the image they started with:
+  restart the workspace pod to pull (`imagePullPolicy: Always`). Nothing
+  reports that a pod is running an older image.
+- Nothing under `datasources.json`, `recipes/`, `skills/`, `templates/` or
+  `src/` is mounted at runtime — it is all baked in, so none of it can be
+  hot-fixed on a running pod.
 
 Existing QGIS projects (`.qgz`) keep the layer definitions they were saved
 with. A corrected entry in `datasources.json` only reaches a study once the
 layer is loaded again.
+
+GHCR note: the package was originally created by hand, so this repository
+must stay listed with *Write* access under the package's *Manage Actions
+access* settings — otherwise the push fails with
+`denied: permission_denied: write_package`.
 
 ## Data source pitfall — display vs compute
 
