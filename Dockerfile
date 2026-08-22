@@ -112,10 +112,24 @@ RUN mkdir -p /app /data /tmp/qgis \
     /var/log/supervisor \
     /root/.local/share/QGIS/QGIS3/profiles/default/python/plugins \
     /root/.local/share/QGIS/QGIS3/profiles/default/python/startup \
+    /root/.local/share/QGIS/QGIS3/profiles/default/QGIS \
     /root/.fluxbox
 
 # ── Fluxbox: maximize all windows by default ───────────────────
 RUN printf '[app] (name=.*)\n  [Maximized] {yes}\n[end]\n' > /root/.fluxbox/apps
+
+# ── QGIS UI language ─────────────────────────────────────────────
+# Seeded here rather than set at runtime. QGIS reads the locale once, while
+# building its interface: writing the setting afterwards leaves every widget
+# already created in English. The startup script did set it, so the value was
+# stored — but only took effect on the *next* launch, and the profile lives on
+# the container filesystem, which is wiped on every pod restart. Net result:
+# QGIS came back in English while the rest of the service is in French.
+#
+# userLocale is the key that drives the interface language; overrideFlag makes
+# QGIS ignore the container's locale (C/POSIX) and honour it.
+RUN printf '[locale]\nuserLocale=fr\noverrideFlag=true\nglobalLocale=fr\n' \
+    > /root/.local/share/QGIS/QGIS3/profiles/default/QGIS/QGIS3.ini
 
 WORKDIR /app
 
