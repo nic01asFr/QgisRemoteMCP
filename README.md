@@ -114,7 +114,7 @@ Downloads are cached in `/data/cache/` with bbox hash — same area = instant re
 
 ## Available data sources
 
-All sources are free (IGN open data since July 2021). No API key needed. 30+ pre-configured in `datasources.json`.
+All sources are free (IGN open data since July 2021). No API key needed. 47 pre-configured in `datasources.json`.
 
 ### Vector (WFS → local GPKG)
 
@@ -191,7 +191,7 @@ Auto-detected column types: `Choice` (colored dropdowns), `Date` (epoch timestam
 
 ---
 
-## MCP tools (40)
+## MCP tools (52)
 
 ### Smart loading
 | Tool | Description |
@@ -370,7 +370,7 @@ Requirements:
 MCP Client (Claude Desktop, Claude Code, any MCP client)
   │ JSON-RPC over Streamable HTTP (:8100)
   ▼
-main_mcp.py (MCP Server, 40 tools)
+main_mcp.py (MCP Server, 52 tools)
   │ HTTP → api_server.py (:8080) → UNIX socket
   ▼
 qgis_bridge.py (runs inside QGIS, Qt main thread)
@@ -470,7 +470,7 @@ Recipes are step-by-step GIS workflows in `recipes/`:
 
 ### Data sources catalog
 
-`datasources.json` contains 30+ pre-configured French data sources. Each entry:
+`datasources.json` contains 47 pre-configured French data sources. Each entry:
 
 ```json
 {
@@ -504,11 +504,11 @@ The same Docker image serves all specializations — everything is configured th
 
 ```
 QgisRemoteMCP/
-├── main_mcp.py              # MCP Server (40 tools, 10 resources, 3 prompts)
+├── main_mcp.py              # MCP Server (52 tools, 10 resources, 3 prompts)
 ├── qgis_app.html            # MCP App (interactive QGIS in conversation)
-├── datasources.json         # 30+ pre-configured French data sources
+├── datasources.json         # 47 pre-configured French data sources
 ├── src/
-│   ├── qgis_bridge.py       # Runs inside QGIS (45 actions, Qt main thread)
+│   ├── qgis_bridge.py       # Runs inside QGIS (47 actions, Qt main thread)
 │   ├── qgis_helpers.py      # Python helpers (geocode, smart loading, etc.)
 │   ├── api_server.py        # FastAPI REST API (file upload/download, commands)
 │   ├── stream_server.py     # MJPEG stream
@@ -564,7 +564,7 @@ curl -X POST http://localhost:8100/mcp \
 
 ### Stable (single-user, Docker)
 
-- Full MCP server: 40 tools, 10 resources, 3 prompts, SSE streaming
+- Full MCP server: 52 tools, 10 resources, 3 prompts, SSE streaming
 - Smart data loading pipeline: WFS → GPKG with pagination, R-tree, caching
 - All export formats: PDF, Leaflet (standard/flood/temporal), QField, Grist
 - PyQGIS scripting with `helpers` module (geocode, overpass, smart loading)

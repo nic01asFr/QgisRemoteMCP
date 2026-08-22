@@ -19,7 +19,7 @@ Container (single-user mode)
   ├── QGIS Desktop (GUI, PyQGIS bridge via startup script)
   ├── x11vnc → websockify/noVNC (:6080)
   ├── api_server.py (FastAPI REST :8080)
-  ├── main_mcp.py (MCP Server :8100, 40 tools)
+  ├── main_mcp.py (MCP Server :8100, 52 tools)
   └── stream_server.py (MJPEG :8081)
 ```
 
