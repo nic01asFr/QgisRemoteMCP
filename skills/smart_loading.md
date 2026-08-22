@@ -174,7 +174,10 @@ for f in glob.glob("/data/cache/*"):
 - `ign_cadastre` — Cadastral parcels
 
 ### Elevation (WMS, streaming)
-- `ign_dem` — High-resolution DEM (MNT)
+- `ign_dem` — Hillshade from the high-resolution DEM. Use this one to **display** relief.
+- `ign_dem_altitudes` — Raw elevation values (32-bit TIFF). **Compute only**: QGIS cannot
+  render 32-bit samples, loading it as a visible layer yields a blank canvas and can
+  crash the QGIS process. Read it through a download/WCS step instead.
 
 ### Environment (WMS, streaming)
 - `corine_land_cover` — Land cover 2018 (Corine)

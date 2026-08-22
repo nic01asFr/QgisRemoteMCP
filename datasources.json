@@ -77,12 +77,22 @@
     },
     {
       "id": "ign_dem",
-      "name": "MNT / DEM Haute Résolution",
+      "name": "Relief ombré (MNT)",
+      "category": "elevation",
+      "type": "wms",
+      "url": "https://data.geopf.fr/wms-r",
+      "params": {"layers": "ELEVATION.ELEVATIONGRIDCOVERAGE.SHADOW", "format": "image/png", "crs": "EPSG:2154"},
+      "description": "Relief ombré issu du MNT haute résolution. Couche d'affichage : utiliser ign_dem_altitudes pour les calculs sur les valeurs d'altitude."
+    },
+    {
+      "id": "ign_dem_altitudes",
+      "name": "Altitudes MNT (valeurs brutes)",
       "category": "elevation",
       "type": "wms",
       "url": "https://data.geopf.fr/wms-r",
       "params": {"layers": "ELEVATION.ELEVATIONGRIDCOVERAGE.HIGHRES", "format": "image/tiff", "crs": "EPSG:2154"},
-      "description": "Modèle Numérique de Terrain haute résolution"
+      "display": false,
+      "description": "Altitudes en mètres (TIFF 32 bits). Source de CALCUL uniquement : pente, ombrage, cadastre solaire. Ne pas charger comme couche affichée, QGIS ne sait pas rendre ce format."
     },
     {
       "id": "bdtopo_batiments",

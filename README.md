@@ -137,7 +137,8 @@ All sources are free (IGN open data since July 2021). No API key needed. 30+ pre
 | `ign_ortho_wmts` | IGN orthophotos |
 | `ign_cadastre` | Cadastral parcels |
 | `corine_land_cover` | Land cover 2018 |
-| `ign_dem` | High-resolution DEM |
+| `ign_dem` | Hillshade from high-resolution DEM (display) |
+| `ign_dem_altitudes` | Raw elevation values, 32-bit TIFF (compute only, not renderable) |
 | + 10 more | Esri, Stamen, CartoDB, infrared, SCAN 25... |
 
 ### APIs
