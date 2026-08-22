@@ -31,7 +31,7 @@ Each worker exposes the same REST API on dynamic ports (9000+/9100+/9200+).
 ## Key files
 
 - `main_mcp.py` — MCP Server with 52 tools, 10 resources, 3 prompts
-- `src/qgis_bridge.py` — Runs inside QGIS, UNIX socket listener, 45 actions
+- `src/qgis_bridge.py` — Runs inside QGIS, UNIX socket listener, 47 actions
 - `src/qgis_helpers.py` — Python helpers injected into execute_python
 - `src/api_server.py` — FastAPI REST wrapper
 - `src/stream_server.py` — MJPEG stream
