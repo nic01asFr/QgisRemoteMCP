@@ -5844,17 +5844,93 @@ def _configure_environment():
         traceback.print_exc()
 
 
+def _zoom_to_valid_layers(iface):
+    """Frame the canvas on layers that actually have an extent.
+
+    zoomToFullExtent() aggregates every layer, including those reporting an
+    empty or undefined extent — typically a WMS layer the provider could not
+    query, which reports a 0x0 size. A single such layer produces an absurd
+    extent: real data collapses to an invisible dot and the canvas looks
+    blank even though valid layers are loaded. Observed in production with an
+    elevation WMS serving 32-bit TIFF, which QGIS cannot decode.
+
+    Falls back to zoomToFullExtent when no layer qualifies.
+    """
+    extent = None
+    skipped = []
+    try:
+        for layer in QgsProject.instance().mapLayers().values():
+            try:
+                if not layer.isValid():
+                    skipped.append(layer.name())
+                    continue
+                ext = layer.extent()
+                if ext is None or ext.isEmpty() or ext.isNull():
+                    skipped.append(layer.name())
+                    continue
+                if extent is None:
+                    extent = ext
+                else:
+                    # combineExtentWith mutates in place and returns nothing.
+                    extent.combineExtentWith(ext)
+            except Exception:
+                skipped.append(getattr(layer, "name", lambda: "?")())
+    except Exception as exc:
+        print(f"[QGISBridge] Extent computation failed: {exc}")
+        extent = None
+
+    try:
+        if extent is not None and not extent.isEmpty():
+            extent.scale(1.05)  # breathing room around the data
+            iface.mapCanvas().setExtent(extent)
+        else:
+            iface.mapCanvas().zoomToFullExtent()
+    except Exception:
+        try:
+            iface.mapCanvas().zoomToFullExtent()
+        except Exception:
+            pass
+    if skipped:
+        print(f"[QGISBridge] Layers ignored when framing (no usable extent): {skipped}")
+
+
 def _open_startup_project():
     """Open a project on startup so QGIS never shows the empty welcome screen.
 
     Behavior:
-    - If QGIS_PROJECT env var is set and the file exists → open it
+    - If a study is marked active, reopen that study's project
+    - Else if QGIS_PROJECT env var is set and the file exists → open it
     - Otherwise → create a new default project (EPSG:2154, OTF enabled)
+
+    The active-study lookup was added on 2026-08-22. QGIS can restart on its
+    own inside the pod: supervisord respawns it after a crash, which was
+    observed in production (`exited: qgis (exit status 1)` followed by
+    `spawned: 'qgis'`). The pod itself never restarts, so the hub still sees
+    a healthy workspace and never replays the activation — QGIS came back on
+    an empty project while the UI kept showing the study as open.
+
+    Reading the sentinel written by the hub (`/data/.active_study`) makes the
+    recovery self-contained: whatever killed QGIS, it comes back on the right
+    project. Covers a spontaneous crash as well as POST /api/restart_qgis.
     """
     try:
         project = QgsProject.instance()
         iface = qgis.utils.iface
         project_path = os.environ.get("QGIS_PROJECT", "").strip()
+
+        # Active study takes precedence over the env var: it reflects what the
+        # user is actually working on, the env var only a boot-time default.
+        try:
+            sentinel = "/data/.active_study"
+            if os.path.isfile(sentinel):
+                with open(sentinel, encoding="utf-8") as fh:
+                    sid = fh.read().strip()
+                candidate = f"/data/studies/{sid}/project.qgz"
+                if sid and os.path.isfile(candidate):
+                    project_path = candidate
+                    print(f"[QGISBridge] Active study {sid} -> {candidate}")
+        except Exception as exc:
+            print(f"[QGISBridge] Could not read active study sentinel: {exc}")
 
         if project_path and os.path.isfile(project_path):
             # Open existing project
@@ -5862,6 +5938,7 @@ def _open_startup_project():
             if ok:
                 print(f"[QGISBridge] Opened startup project: {project_path}")
                 if iface and iface.mapCanvas():
+                    _zoom_to_valid_layers(iface)
                     iface.mapCanvas().refresh()
                 return
             else:
