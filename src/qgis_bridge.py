@@ -3577,6 +3577,7 @@ class QGISBridge:
                 import json as _json
                 import hashlib as _hashlib
                 from datetime import datetime as _dt
+                from datetime import timezone as _timezone
                 # Valider que le JSON parse (best-effort, pas de validation
                 # Pydantic ici pour ne pas tirer la dep cote BigQgisMCP).
                 _parsed = _json.loads(scene_manifest_json)
@@ -3586,28 +3587,40 @@ class QGISBridge:
                 # Creer la table physique (donnees brutes) + entries dans
                 # _grist_Tables / _grist_Tables_column pour qu'elle soit
                 # visible dans l'UI Grist (sinon table fantome SQL-only).
+                # Schema canonique de la table, tel que qgis2grist la cree et
+                # qu'Atlas la lit : manifest_json / scene_hash / source_file /
+                # created_at. Nous ecrivions `content` et `created_at_iso` :
+                # Atlas cherchait `data.manifest_json[i]`, trouvait undefined,
+                # et rendait une carte vide en signalant « manifest JSON
+                # invalide ». Un .grist produit ici n'etait donc lisible par
+                # aucun widget de l'ecosysteme.
+                # `n_layers` est en plus du canonique -- lisible dans l'UI Grist
+                # sans avoir a ouvrir le JSON.
                 cur.execute("""
                     CREATE TABLE SceneManifest (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         manualSort REAL DEFAULT 0,
-                        manifest_version TEXT DEFAULT '',
+                        manifest_json TEXT DEFAULT '',
                         scene_hash TEXT DEFAULT '',
-                        content TEXT DEFAULT '',
-                        n_layers INTEGER DEFAULT 0,
-                        created_at_iso TEXT DEFAULT ''
+                        source_file TEXT DEFAULT '',
+                        created_at INTEGER DEFAULT 0,
+                        n_layers INTEGER DEFAULT 0
                     )
                 """)
                 cur.execute(
                     "INSERT INTO SceneManifest "
-                    "(manualSort, manifest_version, scene_hash, content, "
-                    "n_layers, created_at_iso) VALUES (?, ?, ?, ?, ?, ?)",
+                    "(manualSort, manifest_json, scene_hash, source_file, "
+                    "created_at, n_layers) VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         1.0,
-                        str(_parsed.get("manifest_version", "V0.2")),
-                        _hash,
                         scene_manifest_json,
+                        _hash,
+                        doc_name,
+                        # Grist stocke les DateTime en secondes epoch, pas en
+                        # chaine ISO. Atlas s'en sert pour retenir la ligne la
+                        # plus recente.
+                        int(_dt.now(_timezone.utc).timestamp()),
                         len(_parsed.get("layers", [])),
-                        _dt.utcnow().isoformat() + "Z",
                     ),
                 )
                 # Registry Grist : ajout dans _grist_Tables + colonnes.
@@ -3621,11 +3634,11 @@ class QGISBridge:
                 )
                 # Colonnes (sans manualSort qui est dejaautocree par Grist).
                 _sm_columns = [
-                    ("manifest_version", "Text", 1.0),
-                    ("scene_hash",       "Text", 2.0),
-                    ("content",          "Text", 3.0),
-                    ("n_layers",         "Int",  4.0),
-                    ("created_at_iso",   "Text", 5.0),
+                    ("manifest_json", "Text",         1.0),
+                    ("scene_hash",    "Text",         2.0),
+                    ("source_file",   "Text",         3.0),
+                    ("created_at",    "DateTime:UTC", 4.0),
+                    ("n_layers",      "Int",          5.0),
                 ]
                 cur.execute("SELECT COALESCE(MAX(id), 0) FROM _grist_Tables_column")
                 sm_col_id = cur.fetchone()[0]
@@ -3639,7 +3652,14 @@ class QGISBridge:
                 scene_manifest_embedded = True
                 scene_manifest_meta = {
                     "scene_hash": _hash,
-                    "manifest_version": str(_parsed.get("manifest_version", "V0.2")),
+                    # `version` est le champ du contrat publie ; `manifest_version`
+                    # est l'ancienne graphie interne de qgis-sspcloud. On lit la
+                    # premiere, on retombe sur la seconde tant qu'elle circule.
+                    "version": str(
+                        _parsed.get("version")
+                        or _parsed.get("manifest_version")
+                        or "0.2.2"
+                    ),
                     "n_layers": len(_parsed.get("layers", [])),
                 }
             except Exception as _sm_exc:
