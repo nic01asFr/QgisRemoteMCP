@@ -191,7 +191,7 @@ Auto-detected column types: `Choice` (colored dropdowns), `Date` (epoch timestam
 
 ---
 
-## MCP tools (52)
+## MCP tools (46)
 
 ### Smart loading
 | Tool | Description |
@@ -370,7 +370,7 @@ Requirements:
 MCP Client (Claude Desktop, Claude Code, any MCP client)
   │ JSON-RPC over Streamable HTTP (:8100)
   ▼
-main_mcp.py (MCP Server, 52 tools)
+main_mcp.py (MCP Server, 46 tools)
   │ HTTP → api_server.py (:8080) → UNIX socket
   ▼
 qgis_bridge.py (runs inside QGIS, Qt main thread)
@@ -504,7 +504,7 @@ The same Docker image serves all specializations — everything is configured th
 
 ```
 QgisRemoteMCP/
-├── main_mcp.py              # MCP Server (52 tools, 10 resources, 3 prompts)
+├── main_mcp.py              # MCP Server (46 tools, 12 resources, 3 prompts)
 ├── qgis_app.html            # MCP App (interactive QGIS in conversation)
 ├── datasources.json         # 47 pre-configured French data sources
 ├── src/
@@ -564,7 +564,7 @@ curl -X POST http://localhost:8100/mcp \
 
 ### Stable (single-user, Docker)
 
-- Full MCP server: 52 tools, 10 resources, 3 prompts, SSE streaming
+- Full MCP server: 46 tools, 12 resources, 3 prompts, SSE streaming
 - Smart data loading pipeline: WFS → GPKG with pagination, R-tree, caching
 - All export formats: PDF, Leaflet (standard/flood/temporal), QField, Grist
 - PyQGIS scripting with `helpers` module (geocode, overpass, smart loading)

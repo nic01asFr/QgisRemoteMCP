@@ -19,7 +19,7 @@ Container (single-user mode)
   ├── QGIS Desktop (GUI, PyQGIS bridge via startup script)
   ├── x11vnc → websockify/noVNC (:6080)
   ├── api_server.py (FastAPI REST :8080)
-  ├── main_mcp.py (MCP Server :8100, 52 tools)
+  ├── main_mcp.py (MCP Server :8100, 46 tools)
   └── stream_server.py (MJPEG :8081)
 ```
 
@@ -30,7 +30,7 @@ Each worker exposes the same REST API on dynamic ports (9000+/9100+/9200+).
 
 ## Key files
 
-- `main_mcp.py` — MCP Server with 52 tools, 10 resources, 3 prompts
+- `main_mcp.py` — MCP Server with 46 tools, 12 resources, 3 prompts
 - `src/qgis_bridge.py` — Runs inside QGIS, UNIX socket listener, 47 actions
 - `src/qgis_helpers.py` — Python helpers injected into execute_python
 - `src/api_server.py` — FastAPI REST wrapper
@@ -46,7 +46,7 @@ Each worker exposes the same REST API on dynamic ports (9000+/9100+/9200+).
 - `supervisord.conf` — Process orchestration
 - `entrypoint.sh` — Container startup
 
-## MCP Tools (52)
+## MCP Tools (46)
 
 ### Core
 - `execute_python` — Run PyQGIS code with `helpers` module
