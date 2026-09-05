@@ -87,26 +87,47 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Premiere garde, avant toute construction : `datasources.json` est un
+      # fichier du depot, copie tel quel dans l'image. L'examiner ici coute
+      # une seconde et evite de construire 10 Go pour rien.
+      - name: Controle du catalogue, avant construction
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import json
+          d = json.load(open('datasources.json'))
+          src = [s for s in d['sources'] if 'id' in s]
+          ids = [s['id'] for s in src]
+          assert len(ids) == len(set(ids)), 'identifiants en double'
+          for s in src:
+              assert s.get('type'), f"type manquant : {s['id']}"
+          print(f'catalogue OK avant construction : {len(src)} sources')
+          PY
+
       - name: Build and push
         # cache-from retire volontairement : pull l'ancienne image (~10 Go)
         # doublerait l'empreinte disque pendant le build.
+        #
+        # Seul le tag immuable est publie ici. Les tags mobiles -- ceux que
+        # les pods tirent reellement -- ne sont poses qu'apres le controle,
+        # a l'etape « Publication des tags mobiles » plus bas.
+        #
+        # Avant le 2026-09-05, les trois tags etaient pousses d'un coup et le
+        # controle venait apres : une image incoherente etait deja disponible
+        # en :latest quand la CI rougissait. Le garde-fou existait, il se
+        # declenchait trop tard pour empecher quoi que ce soit.
         uses: docker/build-push-action@v5
         with:
           context: .
           file: Dockerfile
           push: true
-          # Le tag :main accompagne :latest. Sur certains noeuds SSPCloud le
-          # cache local de :latest ne se rafraichit pas malgre pullPolicy
-          # Always ; :main change a chaque publication et force le re-pull.
           tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:main
             ${{ env.IMAGE }}:${{ github.sha }}
 
-      # Controle post-build ajoute le 2026-08-22 : datasources.json est le
-      # fichier le plus souvent modifie et le seul qui casse le service
-      # silencieusement quand il devient incoherent. On verifie qu'il est
-      # lisible, sans identifiant en double, et que chaque source a un type.
+      # Seconde garde, sur l'image construite : la premiere validait le
+      # fichier du depot, celle-ci verifie qu'il est arrive intact dans
+      # l'image. Elle porte sur le tag immuable, que rien ne consomme --
+      # aucun pod ne peut donc tirer ce qui n'a pas encore ete verifie.
       - name: Controle du catalogue embarque
         run: |
           set -eu
@@ -120,3 +141,20 @@ jobs:
               assert s.get('type'), f\"type manquant : {s['id']}\"
           print(f'catalogue OK : {len(src)} sources')
           "
+
+      # Les tags que les pods tirent reellement ne bougent qu'ici, une fois
+      # les deux controles passes. `imagetools create` ne transfere aucune
+      # couche : il fait pointer les tags mobiles sur le manifeste deja
+      # publie et deja verifie.
+      #
+      # Le tag :main accompagne :latest. Sur certains noeuds SSPCloud le
+      # cache local de :latest ne se rafraichit pas malgre pullPolicy
+      # Always ; :main change a chaque publication et force le re-pull.
+      - name: Publication des tags mobiles
+        run: |
+          set -eu
+          docker buildx imagetools create \
+            --tag "${IMAGE}:latest" \
+            --tag "${IMAGE}:main" \
+            "${IMAGE}:${{ github.sha }}"
+          echo "tags mobiles poses sur ${IMAGE}:${{ github.sha }}"
