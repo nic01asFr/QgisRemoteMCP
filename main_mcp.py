@@ -2059,7 +2059,7 @@ IMPORTANT: Always call set_study_zone BEFORE smart_load for WFS sources. Downloa
 - **execute_python** — Run PyQGIS code. Access: iface, project, canvas, processing, QgsProject, QgsVectorLayer, etc. Store outputs in `result` dict. A `helpers` module is injected with ready-made functions (see below).
 - **get_screenshot** — Capture current QGIS desktop (1280x720 JPEG, <=1MB). Already included automatically after modifying tools.
 - **add_layer** — Add vector/raster/WFS/WMS layers by URI.
-- **run_processing** — Execute any of 1000+ Processing algorithms (native:buffer, gdal:warp, grass7:v.clean, etc.).
+- **run_processing** — Execute any of ~730 Processing algorithms across 5 providers: native, qgis, gdal, grass, 3d (e.g. native:buffer, gdal:warpreproject, grass:r.horizon). SAGA is NOT installed. Call list_algorithms to check an id before using it.
 - **zoom_to** — Zoom to extent or layer.
 - **mouse_click / mouse_scroll / key_press / mouse_drag** — Direct GUI interaction via xdotool (coordinates in 1920x1080 display pixels).
 - **qgis_desktop_ui** — Open interactive QGIS view in conversation.

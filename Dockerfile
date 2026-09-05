@@ -128,7 +128,17 @@ RUN printf '[app] (name=.*)\n  [Maximized] {yes}\n[end]\n' > /root/.fluxbox/apps
 #
 # userLocale is the key that drives the interface language; overrideFlag makes
 # QGIS ignore the container's locale (C/POSIX) and honour it.
-RUN printf '[locale]\nuserLocale=fr\noverrideFlag=true\nglobalLocale=fr\n' \
+#
+# La section [PythonPlugins] declare l'ensemble active plutot que de le
+# subir. `--noplugins` a ete retire de supervisord.conf le 2026-09-05 : il
+# ne protegeait de rien et privait l'utilisateur du menu Traitement. Mais
+# retirer le drapeau sans rien declarer remplacerait une liste implicite
+# par une autre. QGIS active `processing` par defaut, pas necessairement
+# `grassprovider` ; l'ecrire ici evite d'en dependre. `db_manager` et
+# `MetaSearch` sont ecartes explicitement : inutiles dans un conteneur
+# pilote par MCP, et les nommer vaut mieux que subir le defaut de la
+# version de QGIS installee.
+RUN printf '[locale]\nuserLocale=fr\noverrideFlag=true\nglobalLocale=fr\n[PythonPlugins]\nprocessing=true\ngrassprovider=true\ndb_manager=false\nMetaSearch=false\n' \
     > /root/.local/share/QGIS/QGIS3/profiles/default/QGIS/QGIS3.ini
 
 WORKDIR /app

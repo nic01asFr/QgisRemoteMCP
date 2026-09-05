@@ -208,7 +208,7 @@ Auto-detected column types: `Choice` (colored dropdowns), `Date` (epoch timestam
 | `execute_python` | Run PyQGIS code with `helpers` module, `iface`, `project`, `processing`. |
 | `get_screenshot` | Capture QGIS canvas (JPEG ≤1MB). Auto-included after modifying tools. |
 | `get_project_info` | Project state: layers, CRS, layouts, extents. |
-| `run_processing` | Execute any of 1000+ Processing algorithms. |
+| `run_processing` | Execute any of ~730 Processing algorithms (native, qgis, gdal, grass, 3d). |
 | `search_algorithms` | Find algorithms by keyword. |
 
 ### Data & layers
@@ -568,7 +568,8 @@ curl -X POST http://localhost:8100/mcp \
 - Smart data loading pipeline: WFS → GPKG with pagination, R-tree, caching
 - All export formats: PDF, Leaflet (standard/flood/temporal), QField, Grist
 - PyQGIS scripting with `helpers` module (geocode, overpass, smart loading)
-- 1000+ Processing algorithms (native, GDAL, GRASS, SAGA)
+- ~730 Processing algorithms (native, qgis, GDAL, GRASS, 3d) — SAGA n'est
+  pas installe, et QGIS a retire son provider du coeur depuis la 3.30
 - MCP App: interactive QGIS in conversation (noVNC + file management)
 - Workflow recipes: 5 pre-built analysis templates
 - Print layouts: A3/A4 with dynamic labels

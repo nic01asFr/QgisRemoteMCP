@@ -62,7 +62,7 @@ Each worker exposes the same REST API on dynamic ports (9000+/9100+/9200+).
 - `add_layer` / `remove_layer` — Manual layer management
 
 ### Analysis
-- `run_processing` — 1000+ Processing algorithms
+- `run_processing` — ~730 Processing algorithms (native, qgis, gdal, grass, 3d)
 - `search_algorithms` — Search algorithms
 - `get_features` — Query features from vector layers
 

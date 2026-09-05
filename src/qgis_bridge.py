@@ -28,6 +28,19 @@ from pathlib import Path
 # Host-side API port for download URLs — injected by ContainerManager in multi-user mode
 _API_HOST_PORT = os.environ.get("API_HOST_PORT", "8080")
 
+# ── Bibliotheques Python installees sur le volume persistant ───────
+# `pip install --target` depose ici les paquets absents de l'image (pandas,
+# rasterio, xarray...). /data est le PVC : ils survivent au redemarrage du
+# pod, contrairement a ~/.local.
+#
+# Ajoute EN FIN de sys.path, jamais au debut : pip y depose aussi les
+# dependances transitives, dont un numpy plus recent que celui de Debian.
+# QGIS et scipy sont lies au numpy systeme ; le placer devant echangerait
+# l'ABI sous leurs pieds.
+_LIBS_PERSISTANTES = os.environ.get("QGIS_EXTRA_PYTHONPATH", "/data/pylibs")
+if os.path.isdir(_LIBS_PERSISTANTES) and _LIBS_PERSISTANTES not in sys.path:
+    sys.path.append(_LIBS_PERSISTANTES)
+
 # PyQGIS imports (available because we run inside QGIS)
 from qgis.core import (
     QgsProject, QgsVectorLayer, QgsRasterLayer, QgsCoordinateReferenceSystem,
@@ -43,10 +56,111 @@ from qgis.PyQt.QtCore import QVariant, QSize, QTimer, QEventLoop
 from qgis.PyQt.QtGui import QImage, QColor
 import qgis.utils
 
-processing = None  # Lazy-loaded (not available at startup, loaded after plugins init)
+processing = None  # Lazy-loaded (voir _ensure_processing_providers ci-dessous)
+
+# --- Providers Processing : controle, et non plus mecanisme ---------
+# Historique. QGIS etait lance avec `--noplugins` (supervisord.conf), present
+# depuis le commit initial. Le drapeau empechait le chargement du plugin
+# `processing` -- celui-la meme qui enregistre les providers `qgis`, `gdal`,
+# `grass`, et qui construit le menu Traitement de l'interface.
+#
+# Constate le 2026-09-05 en production : 322 algorithmes sur 730, aucun menu
+# Traitement, aucune boite a outils pour l'utilisateur. Pendant ce temps
+# `main_mcp.py` et `skills/processing.md` annoncaient a l'agent des
+# algorithmes `gdal:` et `qgis:` introuvables a l'execution, et
+# `solar_pipeline.py` contournait en lancant le binaire `grass` en
+# sous-processus -- ce qui a emporte un EPSG:2154 code en dur.
+#
+# Le drapeau a ete retire, et l'ensemble des plugins actives est desormais
+# declare dans le QGIS3.ini seme par le Dockerfile. Le chargement normal
+# suffit. Ce qui suit n'est donc plus le mecanisme : c'est le controle.
+#
+# Car le defaut n'a jamais ete l'absence de code d'initialisation. C'est que
+# personne ne regardait le resultat : le registre est reste incomplet pendant
+# des mois sans qu'une seule ligne de journal ne le signale.
+_PROVIDERS_READY = False
+_REPARATION_TENTEE = False
+
+# `native` et `3d` viennent du coeur C++ et s'enregistrent seuls ; `qgis` et
+# `gdal` viennent du plugin processing ; `grass` du plugin grassprovider.
+_PROVIDERS_ATTENDUS = {"native", "3d", "qgis", "gdal", "grass"}
+
+
+def _providers_presents():
+    return {a.id().split(":")[0]
+            for a in QgsApplication.processingRegistry().algorithms()}
+
+
+def _reparer_providers():
+    """Filet de securite : enregistre a la main ce que le chargement normal
+    des plugins n'a pas fourni.
+
+    Ne devrait jamais servir. S'il sert, c'est que la configuration de l'image
+    a regresse -- et le journal le dira, ce qui est tout l'objet de l'exercice.
+    """
+    try:
+        from processing.core.Processing import Processing
+        Processing.initialize()
+    except Exception as e:
+        print("[QGISBridge] Processing.initialize a echoue : %s" % e, flush=True)
+        return
+    try:
+        if not os.environ.get("GISBASE"):
+            racine = "/usr/lib"
+            bases = sorted(n for n in os.listdir(racine)
+                           if n.startswith("grass")
+                           and os.path.isdir(os.path.join(racine, n)))
+            if bases:
+                os.environ["GISBASE"] = os.path.join(racine, bases[-1])
+        if os.environ.get("GISBASE"):
+            from qgis.core import QgsSettings
+            from qgis.utils import loadPlugin, startPlugin, updateAvailablePlugins
+            QgsSettings().setValue("PythonPlugins/grassprovider", True)
+            updateAvailablePlugins()
+            if loadPlugin("grassprovider"):
+                startPlugin("grassprovider")
+        else:
+            print("[QGISBridge] GRASS introuvable sous /usr/lib", flush=True)
+    except Exception as e:
+        print("[QGISBridge] Provider GRASS indisponible : %s" % e, flush=True)
+
+
+def _ensure_processing_providers():
+    """Constate l'etat du registre, le journalise, et repare s'il manque.
+
+    Idempotent. La reparation n'est tentee qu'une fois : si elle echoue, on
+    n'y revient pas a chaque appel, mais l'etat constate reste ecrit dans les
+    logs. Appelee par un QTimer au demarrage -- pour que list_algorithms dise
+    vrai des la premiere requete -- et paresseusement par _get_processing().
+    """
+    global _PROVIDERS_READY, _REPARATION_TENTEE
+    if _PROVIDERS_READY:
+        return True
+
+    manquants = _PROVIDERS_ATTENDUS - _providers_presents()
+    if manquants and not _REPARATION_TENTEE:
+        _REPARATION_TENTEE = True
+        print("[QGISBridge] Providers absents apres chargement des plugins : %s "
+              "-> reparation" % sorted(manquants), flush=True)
+        _reparer_providers()
+        manquants = _PROVIDERS_ATTENDUS - _providers_presents()
+
+    total = len(QgsApplication.processingRegistry().algorithms())
+    if manquants:
+        print("[QGISBridge] ATTENTION registre incomplet : %d algorithmes, "
+              "providers absents %s" % (total, sorted(manquants)), flush=True)
+    else:
+        print("[QGISBridge] Processing complet : %d algorithmes, providers=%s"
+              % (total, sorted(_providers_presents())), flush=True)
+
+    # Vrai dans les deux cas : on a fait ce qu'on pouvait, on ne repasse pas.
+    _PROVIDERS_READY = True
+    return not manquants
+
+
 
 def _get_processing():
-    """Lazy import of processing module (loaded after QGIS plugins init)."""
+    """Import paresseux du module processing, providers enregistres au passage."""
     global processing
     if processing is None:
         try:
@@ -54,6 +168,8 @@ def _get_processing():
             processing = _p
         except ImportError:
             pass
+    if processing is not None:
+        _ensure_processing_providers()
     return processing
 
 SOCKET_PATH = "/tmp/qgis_bridge.sock"
@@ -5987,6 +6103,10 @@ def _open_startup_project():
 
 # Apply after QGIS is fully loaded
 QTimer.singleShot(3000, _optimize_rendering)
+# Avant _configure_environment : le registre doit etre complet quand les
+# premieres requetes arrivent, sans quoi list_algorithms annonce 322
+# algorithmes sur 730 et l'agent croit que GDAL et GRASS n'existent pas.
+QTimer.singleShot(4000, _ensure_processing_providers)
 QTimer.singleShot(5000, _configure_environment)
 
 
