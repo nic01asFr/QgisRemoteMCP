@@ -37,8 +37,8 @@ Everything runs inside Docker — the AI calls MCP tools, QGIS does the work, th
 ### 1. Run
 
 ```bash
-git clone https://github.com/nic01asFr/BigQgisMCP.git
-cd BigQgisMCP
+git clone https://github.com/nic01asFr/QgisRemoteMCP.git
+cd QgisRemoteMCP
 cp .env.example .env
 docker compose up -d --build
 ```
@@ -210,11 +210,26 @@ Auto-detected column types: `Choice` (colored dropdowns), `Date` (epoch timestam
 | `get_project_info` | Project state: layers, CRS, layouts, extents. |
 | `run_processing` | Execute any of ~730 Processing algorithms (native, qgis, gdal, grass, 3d). |
 | `search_algorithms` | Find algorithms by keyword. |
+| `restart_qgis_engine` | Respawn the QGIS process when the bridge is deadlocked. Last resort — 5-15 s of unavailability. |
+
+### Async execution
+
+Anything expected to run past 30 s — a heavy `native:difference`, an
+`extractbylocation` over 50 000 features, a wide `smart_load` — should be
+submitted rather than awaited. The bridge streams heartbeats, so a frozen
+Qt main thread is told apart from a dead bridge without waiting for a
+timeout to expire.
+
+| Tool | Description |
+|------|-------------|
+| `execute_async` | Submit a bridge action for background execution, returns a `job_id` immediately. |
+| `poll_job` | Job status, `heartbeat_age_s`, `qt_lag_ms`, `probably_frozen`, and the result once done. |
+| `cancel_job` | Best-effort cancellation. |
 
 ### Data & layers
 | Tool | Description |
 |------|-------------|
-| `add_layer` | Add vector/raster/WFS/WMS by URI. |
+| `add_layer` | Add vector/raster/WFS/WMS by URI. Point clouds too — pass `provider=copc\|ept\|vpc` and the layer is built as a point cloud, with `point_count` returned. |
 | `remove_layer` | Remove a layer. |
 | `get_features` | Query features with attribute/spatial filters. |
 | `zoom_to` | Navigate to extent, layer, or point. |
@@ -244,6 +259,7 @@ Auto-detected column types: `Choice` (colored dropdowns), `Date` (epoch timestam
 | `export_qfield` | QField-ready ZIP (.qgz + GPKGs + Observations). |
 | `export_grist` | Grist document from project or HTML. |
 | `export_layer` | Layer → GPKG/GeoJSON/Shapefile/CSV. |
+| `publish_artifact` | Publish a deliverable (storymap, dataset, recipe, PDF) to S3 through the hub, returns a stable public URL. |
 
 ### Files
 | Tool | Description |
@@ -281,6 +297,8 @@ Auto-detected column types: `Choice` (colored dropdowns), `Date` (epoch timestam
 | `skill://data-sources` | French national datasets reference |
 | `skill://recipes` | Workflow recipes reference |
 | `skill://external-services` | Vision services integration |
+| `skill://solar` | Solar cadastre pipeline (DSM, r.sun, observatory) |
+| `skill://file-exchange` | bridge_put / bridge_get file transfer — design, pending implementation |
 | `skill://qgis-status` | Live QGIS instance status |
 
 ### Prompts
@@ -564,7 +582,7 @@ curl -X POST http://localhost:8100/mcp \
 
 ### Stable (single-user, Docker)
 
-- Full MCP server: 46 tools, 12 resources, 3 prompts, SSE streaming
+- Full MCP server: 46 tools, 11 resources, 3 prompts, SSE streaming
 - Smart data loading pipeline: WFS → GPKG with pagination, R-tree, caching
 - All export formats: PDF, Leaflet (standard/flood/temporal), QField, Grist
 - PyQGIS scripting with `helpers` module (geocode, overpass, smart loading)

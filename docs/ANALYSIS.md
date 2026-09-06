@@ -1,4 +1,4 @@
-# BigQgisMCP — Architecture Analysis & Evolution Plan
+# QgisRemoteMCP — Architecture Analysis & Evolution Plan
 
 ## 1. Current Architecture
 
@@ -62,7 +62,7 @@ QGIS Desktop (Xvfb :99)
 
 | URI | Description |
 |-----|-------------|
-| `ui://bigqgismcp/qgis-desktop` | MCP App HTML (interactive view) |
+| `ui://qgisremotemcp/qgis-desktop` | MCP App HTML (interactive view) |
 | `skill://pyqgis` | PyQGIS scripting reference |
 | `skill://processing` | Processing algorithms guide |
 | `skill://cartography` | Symbology, labels, layouts |

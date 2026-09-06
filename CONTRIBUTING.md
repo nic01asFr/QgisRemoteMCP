@@ -5,8 +5,8 @@ Thank you for your interest in contributing! This document explains how the proj
 ## Development setup
 
 ```bash
-git clone https://github.com/nic01asFr/BigQgisMCP.git
-cd BigQgisMCP
+git clone https://github.com/nic01asFr/QgisRemoteMCP.git
+cd QgisRemoteMCP
 cp .env.example .env
 docker compose up -d --build
 ```
@@ -141,4 +141,4 @@ Create `skills/my_skill.md` with the skill content. Register it in `main_mcp.py`
 4. Commit with descriptive messages
 5. Submit a merge request
 
-For questions, open an issue on [GitHub](https://github.com/nic01asFr/BigQgisMCP/issues) or [GitLab CEREMA](https://gitlab.cerema.fr/mcp/QgisRemoteMCP/-/issues).
+For questions, open an issue on [GitHub](https://github.com/nic01asFr/QgisRemoteMCP/issues) or [GitLab CEREMA](https://gitlab.cerema.fr/mcp/QgisRemoteMCP/-/issues).

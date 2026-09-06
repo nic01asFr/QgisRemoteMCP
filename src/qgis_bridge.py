@@ -2796,7 +2796,7 @@ class QGISBridge:
         # NEW 2026-06-24 (consumer qgis-sspcloud / Scene Manifest V0.2 :
         # https://github.com/nic01asFr/cerema-offre-de-service/docs/scene-manifest-spec.md) :
         # 2 nouveaux params OPTIONNELS pour la consommation par des
-        # plateformes externes. BigQgisMCP reste autonome avec fallback
+        # plateformes externes. QgisRemoteMCP reste autonome avec fallback
         # comportement actuel quand ces params sont absents.
         # - output_path : chemin custom (ex: /data/studies/{sid}/projects/{pid}/exports/x.grist)
         # - scene_manifest_json : JSON Scene Manifest V0.2 a embarquer comme
@@ -3711,7 +3711,7 @@ class QGISBridge:
                 from datetime import datetime as _dt
                 from datetime import timezone as _timezone
                 # Valider que le JSON parse (best-effort, pas de validation
-                # Pydantic ici pour ne pas tirer la dep cote BigQgisMCP).
+                # Pydantic ici pour ne pas tirer la dep cote QgisRemoteMCP).
                 _parsed = _json.loads(scene_manifest_json)
                 _hash = _hashlib.sha256(
                     scene_manifest_json.encode("utf-8")

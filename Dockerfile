@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════════════════
-# BigQgisMCP — QGIS Desktop as an MCP Server
+# QgisRemoteMCP — QGIS Desktop as an MCP Server
 # ═══════════════════════════════════════════════════════════════════
 #
 # Build: rebuild trigger 2026-05-30 (inclut fix Marseille search_commune
@@ -18,8 +18,8 @@
 #   8080 — REST API (health, external access)
 #   8081 — MJPEG stream
 #
-# Build:  docker build -t bigqgismcp .
-# Run:    docker run -p 6080:6080 -p 8100:8100 bigqgismcp
+# Build:  docker build -t qgisremotemcp .
+# Run:    docker run -p 6080:6080 -p 8100:8100 qgisremotemcp
 
 FROM ubuntu:24.04
 
