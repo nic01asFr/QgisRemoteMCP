@@ -194,6 +194,17 @@ def build_dsm(config):
     H, W = mnt.shape
     ds = None
 
+    # Fix nodata/zero border pixels — WMS-R returns 0 for areas outside coverage.
+    # These create artificial shadow walls. Replace with minimum valid altitude.
+    valid = mnt[mnt > 1.0]
+    if len(valid) > 0:
+        fill_val = float(np.percentile(valid, 5))
+        n_fixed = int((mnt < 1.0).sum())
+        mnt[mnt < 1.0] = fill_val
+        if n_fixed > 0:
+            print(f"[solar] Fixed {n_fixed} border pixels (0→{fill_val:.1f}m)", flush=True)
+            _write_raster(mnt_res, mnt, gt, 2154)
+
     # Rasterize buildings onto MNT using proper gdal.RasterizeLayer
     # Build memory layer with roof_z attribute and MultiPolygon geometry
     mem_drv = ogr.GetDriverByName('Memory')
@@ -1421,8 +1432,8 @@ def build_observatoire_html(zone_name=None, out_path=None):
         from osgeo import ogr as _ogr
         bl = None
 
-    # Load MNT for terrain grid
-    res_files = sorted(SOLAR_DIR.glob("mnt_*m.tif"))
+    # Load MNT for terrain grid — pick the highest resolution (largest file)
+    res_files = sorted(SOLAR_DIR.glob("mnt_*m.tif"), key=lambda f: f.stat().st_size, reverse=True)
     if not res_files:
         return {"error": "No MNT found in /data/solar/"}
     ds_mnt = gdal.Open(str(res_files[0]))
@@ -1560,7 +1571,9 @@ def build_observatoire_html(zone_name=None, out_path=None):
         tts_info = ts_info
 
     # Terrain grid (subsampled)
-    TSTEP = max(1, 4)
+    # Target ~10m terrain display grid (matches v15 reference)
+    mnt_res = abs(gt[1])
+    TSTEP = max(1, round(10.0 / mnt_res))
     terr = MNT[::TSTEP, ::TSTEP]
     zmin_real = float(MNT[MNT > 0].min()) if (MNT > 0).any() else float(MNT.min())
     tmeta = {'x0': gt[0] - cx_l93, 'y0': gt[3] - cy_l93, 's': float(gt[1]) * TSTEP,
