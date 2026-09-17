@@ -32,7 +32,7 @@ from qgis.core import (
     QgsRectangle, QgsPointXY, QgsFeature, QgsGeometry,
     QgsField, QgsFields, QgsExpressionContextUtils,
 )
-from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt.QtCore import QVariant, Qt
 import qgis.utils
 
 # ── Configuration ─────────────────────────────────────────────
@@ -55,6 +55,43 @@ def _canvas():
     return iface.mapCanvas() if iface else None
 
 
+def _alleger_le_contour_si_couche_dense(layer, seuil=5000):
+    """Retire le contour des polygones quand ils sont trop nombreux.
+
+    Le style par defaut de QGIS trace un contour autour de chaque polygone. A
+    l'echelle d'une ville, ce contour devient plus epais que le polygone
+    lui-meme : 52 000 batiments charges sur Marseille s'affichaient en un pave
+    noir uniforme (mesure du 2026-09-17), illisible pour l'utilisateur comme
+    pour l'agent qui en prend une capture.
+
+    On n'intervient que sur le style PAR DEFAUT (symbole unique) d'une couche
+    de polygones dense : un style pose par l'utilisateur ou par l'agent
+    (categorise, gradue) n'est jamais touche.
+    """
+    try:
+        if not isinstance(layer, QgsVectorLayer) or not layer.isValid():
+            return False
+        from qgis.core import QgsWkbTypes, QgsSingleSymbolRenderer
+        if QgsWkbTypes.geometryType(layer.wkbType()) != QgsWkbTypes.PolygonGeometry:
+            return False
+        if layer.featureCount() < seuil:
+            return False
+        renderer = layer.renderer()
+        if not isinstance(renderer, QgsSingleSymbolRenderer):
+            return False
+        symbole = renderer.symbol()
+        if symbole is None or symbole.symbolLayerCount() == 0:
+            return False
+        couche_symbole = symbole.symbolLayer(0)
+        if hasattr(couche_symbole, "setStrokeStyle"):
+            couche_symbole.setStrokeStyle(Qt.NoPen)
+            layer.triggerRepaint()
+            return True
+    except Exception:
+        pass  # le rendu n'est jamais une raison de faire echouer un chargement
+    return False
+
+
 def _finalize_layer(layer):
     """Add layer to project with auto CRS adapt, zoom on first layer.
     Replicates QGISBridge._finalize_add_layer pattern."""
@@ -67,6 +104,8 @@ def _finalize_layer(layer):
         project.setCrs(layer_crs)
 
     project.addMapLayer(layer)
+
+    _alleger_le_contour_si_couche_dense(layer)
 
     # Cadrage : la carte doit suivre les donnees qu'on vient de charger.
     #

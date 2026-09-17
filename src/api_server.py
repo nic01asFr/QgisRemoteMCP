@@ -11,6 +11,7 @@ Provides:
 Runs on port 8080.
 """
 
+import asyncio
 import json
 import re
 import socket
@@ -391,34 +392,54 @@ async def get_job(job_id: str):
             raise HTTPException(404, f"Unknown job_id: {job_id}")
         row = _row_with_derived(row)
 
-    # Cross-check via status-mode probe when heartbeat is stale
+    # Cross-check via status-mode probe when heartbeat is stale.
+    #
+    # Cette sonde fait de la socket BLOQUANTE. Executee telle quelle dans un
+    # endpoint `async`, elle bloquait la boucle d'evenements entiere : quand le
+    # thread Qt gelait -- justement le cas que la sonde doit diagnostiquer --
+    # le serveur ne repondait plus, et l'appel poll_job expirait cote client.
+    # Mesure du 2026-09-17 : script de 20 s, poll_job en erreur « timed out ».
+    # Le suivi tombait donc exactement quand il servait.
+    #
+    # On l'execute desormais hors de la boucle, avec un delai maximal ferme :
+    # l'endpoint repond toujours, au pire sans le resultat de la sonde.
     if row["status"] in ("running", "queued") and (row["heartbeat_age_s"] or 0) > 10:
-        probe = None
         try:
-            probe_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            probe_sock.settimeout(2)
-            probe_sock.connect(SOCKET_PATH)
-            probe_sock.sendall(json.dumps({
-                "action": "_job_status",
-                "params": {"job_id": job_id},
-            }).encode())
-            probe_sock.shutdown(socket.SHUT_WR)
-            data = b""
-            while True:
-                chunk = probe_sock.recv(65536)
-                if not chunk:
-                    break
-                data += chunk
-            probe_sock.close()
-            if data:
-                probe = json.loads(data.decode())
-        except Exception as e:
-            probe = {"error": f"status probe failed: {e}"}
+            probe = await asyncio.wait_for(asyncio.to_thread(_sonder_le_pont, job_id), timeout=4)
+        except Exception as e:  # delai depasse compris
+            probe = {"error": f"sonde du pont sans reponse ({type(e).__name__})"}
         row["bridge_probe"] = probe
-        if probe and "error" in probe and "connection" in probe.get("error", "").lower():
+        if probe and "error" in probe and "connection" in str(probe.get("error", "")).lower():
             row["status"] = "bridge_unreachable"
 
     return row
+
+
+def _sonder_le_pont(job_id: str):
+    """Demande au pont l'etat d'un job, en socket bloquante.
+
+    A n'appeler QUE hors de la boucle d'evenements (cf. get_job) : c'est
+    precisement quand le thread Qt gele que cette sonde met du temps.
+    """
+    try:
+        probe_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe_sock.settimeout(2)
+        probe_sock.connect(SOCKET_PATH)
+        probe_sock.sendall(json.dumps({
+            "action": "_job_status",
+            "params": {"job_id": job_id},
+        }).encode())
+        probe_sock.shutdown(socket.SHUT_WR)
+        data = b""
+        while True:
+            chunk = probe_sock.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        probe_sock.close()
+        return json.loads(data.decode()) if data else None
+    except Exception as e:
+        return {"error": f"status probe failed: {e}"}
 
 
 @app.delete("/api/job/{job_id}")

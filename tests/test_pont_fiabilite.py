@@ -117,3 +117,38 @@ def test_un_chargement_hors_zone_est_signale():
     bloc = _PONT.split("def _action_smart_load")[1].split("\n    def ")[0]
     assert "avertissement" in bloc
     assert "HORS de la zone" in bloc
+
+
+# ── 6. Le suivi d'un traitement long ne tombe pas ────────────────────────
+
+_API = (_RACINE / "src" / "api_server.py").read_text(encoding="utf-8")
+
+
+def test_la_sonde_ne_bloque_plus_la_boucle_d_evenements():
+    """Elle faisait de la socket bloquante dans un endpoint async : le serveur
+    ne repondait plus quand Qt gelait, et poll_job expirait."""
+    bloc = _API.split("async def get_job")[1].split("\ndef ")[0]
+    assert "asyncio.to_thread(_sonder_le_pont" in bloc
+    assert "asyncio.wait_for" in bloc
+    # La socket bloquante a quitte l'endpoint.
+    assert "probe_sock.connect" not in bloc
+
+
+def test_la_sonde_est_bornee_dans_le_temps():
+    bloc = _API.split("async def get_job")[1].split("\ndef ")[0]
+    assert "timeout=4" in bloc
+
+
+# ── 7. Une couche dense reste lisible ────────────────────────────────────
+
+def test_le_contour_est_retire_sur_les_polygones_denses():
+    bloc = _AIDES.split("def _alleger_le_contour_si_couche_dense")[1].split("\ndef ")[0]
+    assert "Qt.NoPen" in bloc
+    # Un style pose par quelqu'un n'est jamais ecrase.
+    assert "QgsSingleSymbolRenderer" in bloc
+    assert "PolygonGeometry" in bloc
+
+
+def test_l_allegement_est_appele_au_chargement():
+    bloc = _AIDES.split("def _finalize_layer")[1].split("\ndef ")[0]
+    assert "_alleger_le_contour_si_couche_dense(layer)" in bloc
