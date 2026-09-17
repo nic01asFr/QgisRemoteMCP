@@ -5200,6 +5200,107 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
                 self._catalog_cache = {"sources": [], "categories": []}
         return self._catalog_cache
 
+    # ── Bases de donnees enregistrees dans QGIS ───────────────────
+
+    def _action_list_database_connections(self, params: dict) -> dict:
+        """Les connexions de base de donnees enregistrees DANS QGIS.
+
+        L'utilisateur declare sa base une fois, dans QGIS, comme il en a
+        l'habitude. Sans cette action, l'agent ne pouvait pas savoir qu'elle
+        existe : le fournisseur PostGIS etait bien la et le serveur joignable,
+        mais rien ne reliait les deux (constate le 2026-09-17).
+
+        Ne renvoie JAMAIS de mot de passe : seulement de quoi designer une
+        connexion et comprendre ce qu'elle contient.
+        """
+        from qgis.core import QgsProviderRegistry
+        registre = QgsProviderRegistry.instance()
+        avec_tables = bool(params.get("include_tables", False))
+        schema_demande = params.get("schema", "")
+
+        connexions = []
+        for fournisseur in ("postgres", "spatialite", "mssql", "oracle", "hana"):
+            try:
+                meta = registre.providerMetadata(fournisseur)
+                if meta is None:
+                    continue
+                noms = list(meta.connections(False).keys())
+            except Exception:
+                continue
+            for nom in noms:
+                entree = {"nom": nom, "fournisseur": fournisseur}
+                try:
+                    conn = meta.createConnection(nom, {})
+                    if avec_tables:
+                        schemas = []
+                        try:
+                            schemas = list(conn.schemas())
+                        except Exception:
+                            schemas = []
+                        entree["schemas"] = schemas
+                        cibles = [schema_demande] if schema_demande else schemas or [""]
+                        tables = []
+                        for sch in cibles[:5]:
+                            try:
+                                for t in conn.tables(sch):
+                                    tables.append({
+                                        "schema": sch,
+                                        "table": t.tableName(),
+                                        "geometrie": bool(t.geometryColumn()),
+                                    })
+                            except Exception:
+                                continue
+                        entree["tables"] = tables[:200]
+                except Exception as exc:
+                    entree["avertissement"] = (
+                        f"connexion declaree mais injoignable ({type(exc).__name__}) : "
+                        "verifier l'hote, les droits ou le mot de passe enregistre")
+                connexions.append(entree)
+
+        return {
+            "connexions": connexions,
+            "count": len(connexions),
+            "aide": ("Aucune connexion ? Declare-la dans QGIS (Couche > Ajouter une "
+                     "couche PostGIS > Nouveau), elle apparaitra ici. Puis charge une "
+                     "table avec add_database_layer(connexion, schema, table)."),
+        }
+
+    def _action_add_database_layer(self, params: dict) -> dict:
+        """Charge une table d'une connexion enregistree dans QGIS.
+
+        On s'appuie sur la connexion telle que l'utilisateur l'a declaree :
+        aucun identifiant n'est demande ni stocke ici.
+        """
+        from qgis.core import QgsProviderRegistry
+        nom = params.get("connexion") or params.get("connection") or ""
+        table = params.get("table", "")
+        if not nom or not table:
+            return {"error": "connexion et table sont requis. "
+                             "Utilise list_database_connections pour les connaitre."}
+        fournisseur = params.get("fournisseur") or params.get("provider") or "postgres"
+        schema = params.get("schema", "public")
+
+        registre = QgsProviderRegistry.instance()
+        meta = registre.providerMetadata(fournisseur)
+        if meta is None:
+            return {"error": f"Fournisseur inconnu : {fournisseur}"}
+        try:
+            conn = meta.createConnection(nom, {})
+        except Exception as exc:
+            return {"error": f"Connexion « {nom} » introuvable ou injoignable : {exc}"}
+
+        try:
+            uri = conn.tableUri(schema, table)
+        except Exception as exc:
+            return {"error": f"Table {schema}.{table} introuvable dans « {nom} » : {exc}"}
+
+        nom_affiche = params.get("name") or table
+        layer = QgsVectorLayer(uri, nom_affiche, fournisseur)
+        if not layer.isValid():
+            return {"error": f"Couche invalide pour {schema}.{table} (via « {nom} »)",
+                    "uri_sans_identifiants": uri.split("password=")[0]}
+        return self._finalize_add_layer(layer)
+
     def _action_list_datasources(self, params: dict) -> dict:
         """List available data sources from catalog, optionally filtered."""
         catalog = self._load_datasources_catalog()

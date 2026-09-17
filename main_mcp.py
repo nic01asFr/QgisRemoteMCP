@@ -377,6 +377,33 @@ TOOLS = [
         }
     },
     {
+        "name": "list_database_connections",
+        "description": "Liste les connexions de base de donnees ENREGISTREES DANS QGIS (PostGIS, SpatiaLite...). L'utilisateur declare sa base une fois dans QGIS (Couche > Ajouter une couche PostGIS > Nouveau) ; cet outil la lui rend visible et utilisable. Ne renvoie aucun mot de passe. Mettre include_tables=true pour lister aussi les tables.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "include_tables": {"type": "boolean", "description": "Lister aussi schemas et tables (plus lent : ouvre la connexion)", "default": False},
+                "schema": {"type": "string", "description": "Limiter la liste des tables a ce schema", "default": ""}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "add_database_layer",
+        "description": "Charge une table d'une connexion de base enregistree dans QGIS. Utiliser list_database_connections d'abord pour connaitre les noms. Aucun identifiant n'est demande : on reutilise la connexion telle que l'utilisateur l'a declaree.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "connexion": {"type": "string", "description": "Nom de la connexion tel qu'enregistre dans QGIS"},
+                "table": {"type": "string", "description": "Nom de la table"},
+                "schema": {"type": "string", "description": "Schema (PostGIS)", "default": "public"},
+                "fournisseur": {"type": "string", "description": "postgres, spatialite, mssql, oracle, hana", "default": "postgres"},
+                "name": {"type": "string", "description": "Nom d'affichage de la couche", "default": ""}
+            },
+            "required": ["connexion", "table"]
+        }
+    },
+    {
         "name": "add_layer",
         "description": "Add a layer to the QGIS project. Supports vector (GeoJSON, SHP, GPKG), raster (GeoTIFF, COG), WFS, WMS.",
         "inputSchema": {
@@ -1388,6 +1415,28 @@ def _tool_delete_file(arguments: dict) -> dict:
     return {"content": _text(response)}
 
 
+def _tool_list_database_connections(arguments: dict) -> dict:
+    response = qgis_command("list_database_connections", {
+        "include_tables": arguments.get("include_tables", False),
+        "schema": arguments.get("schema", ""),
+    })
+    return {"content": _text(response, indent=2)}
+
+
+def _tool_add_database_layer(arguments: dict) -> dict:
+    err = _validate_required(arguments, "connexion") or _validate_required(arguments, "table")
+    if err:
+        return _error(err)
+    response = qgis_command("add_database_layer", {
+        "connexion": arguments["connexion"],
+        "table": arguments["table"],
+        "schema": arguments.get("schema", "public"),
+        "fournisseur": arguments.get("fournisseur", "postgres"),
+        "name": arguments.get("name", ""),
+    })
+    return {"content": _text(response, indent=2)}
+
+
 def _tool_list_datasources(arguments: dict) -> dict:
     response = qgis_command("list_datasources", {
         "category": arguments.get("category", ""),
@@ -2006,6 +2055,8 @@ TOOL_HANDLERS = {
     "download_project": _tool_download_project,
     "delete_file": _tool_delete_file,
     "list_datasources": _tool_list_datasources,
+    "list_database_connections": _tool_list_database_connections,
+    "add_database_layer": _tool_add_database_layer,
     "add_from_catalog": _tool_add_from_catalog,
     "set_study_zone": _tool_set_study_zone,
     "get_study_zone": _tool_get_study_zone,

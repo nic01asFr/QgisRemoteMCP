@@ -152,3 +152,29 @@ def test_le_contour_est_retire_sur_les_polygones_denses():
 def test_l_allegement_est_appele_au_chargement():
     bloc = _AIDES.split("def _finalize_layer")[1].split("\ndef ")[0]
     assert "_alleger_le_contour_si_couche_dense(layer)" in bloc
+
+
+# ── 8. Les bases de donnees declarees dans QGIS sont visibles ────────────
+
+def test_le_pont_sait_lister_les_connexions_enregistrees():
+    """Le fournisseur PostGIS etait present et le serveur joignable, mais rien
+    ne reliait les deux : l'agent ne pouvait pas savoir qu'une base existe."""
+    bloc = _PONT.split("def _action_list_database_connections")[1].split("\n    def ")[0]
+    assert "providerMetadata" in bloc
+    assert "meta.connections(False)" in bloc
+    # Aucun mot de passe ne doit sortir d'ici.
+    assert "password" not in bloc
+
+
+def test_charger_une_table_ne_demande_aucun_identifiant():
+    bloc = _PONT.split("def _action_add_database_layer")[1].split("\n    def ")[0]
+    assert "conn.tableUri(schema, table)" in bloc
+    assert "createConnection" in bloc
+    # En cas d'echec, l'URI renvoyee est tronquee avant tout secret.
+    assert 'uri.split("password=")[0]' in bloc
+
+
+def test_les_outils_bd_sont_exposes():
+    for outil in ("list_database_connections", "add_database_layer"):
+        assert f'"name": "{outil}"' in _MCP, outil
+        assert f'"{outil}": _tool_' in _MCP, outil
