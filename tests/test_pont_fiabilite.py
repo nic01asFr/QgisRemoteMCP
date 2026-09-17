@@ -200,13 +200,15 @@ def _lister_les_fichiers():
         n.name: ast.get_source_segment(_PONT, n)
         for n in ast.walk(arbre)
         if isinstance(n, ast.FunctionDef)
-        and n.name in ("_action_list_files", "_etude_active")
+        and n.name in ("_action_list_files", "_etude_active", "lire_etude_active")
     }
-    assert set(sources) == {"_action_list_files", "_etude_active"}, sources
+    attendu = {"_action_list_files", "_etude_active", "lire_etude_active"}
+    assert set(sources) == attendu, sources
 
     espace = {"Path": _Path, "os": __import__("os")}
-    for src in sources.values():
-        exec(textwrap.dedent(src), espace)
+    # `lire_etude_active` d'abord : la methode de la classe lui delegue.
+    for nom in ("lire_etude_active", "_etude_active", "_action_list_files"):
+        exec(textwrap.dedent(sources[nom]), espace)
 
     class _Pont:
         _action_list_files = espace["_action_list_files"]
@@ -309,3 +311,11 @@ def test_une_couche_wfs_ingerable_est_signalee():
     assert "_SEUIL_WFS_INGERABLE" in bloc
     assert "smart_load" in bloc, "l'avertissement doit dire quoi faire a la place"
     assert "_SEUIL_WFS_INGERABLE = 100_000" in _AIDES
+
+
+def test_la_sentinelle_d_etude_n_est_lue_qu_a_un_seul_endroit():
+    """Le demarrage et le listing lisaient chacun leur copie."""
+    assert _PONT.count('"/data/.active_study"') == 1
+    assert "def lire_etude_active()" in _PONT
+    demarrage = _PONT.split("Active study takes precedence")[1][:600]
+    assert "lire_etude_active()" in demarrage

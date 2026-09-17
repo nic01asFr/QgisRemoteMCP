@@ -2431,14 +2431,8 @@ class QGISBridge:
         return basename
 
     def _etude_active(self) -> str:
-        """Identifiant de l'etude ouverte, lu dans la sentinelle du hub."""
-        try:
-            sentinelle = Path("/data/.active_study")
-            if sentinelle.is_file():
-                return sentinelle.read_text(encoding="utf-8").strip()
-        except Exception:
-            pass
-        return ""
+        """Identifiant de l'etude ouverte (cf. `lire_etude_active`)."""
+        return lire_etude_active()
 
     def _action_list_files(self, params: dict) -> dict:
         """Liste des fichiers sous /data.
@@ -6223,6 +6217,20 @@ def _configure_environment():
         traceback.print_exc()
 
 
+def lire_etude_active() -> str:
+    """Identifiant de l'etude ouverte, lu dans la sentinelle ecrite par le hub.
+
+    Chaine vide si aucune etude n'est active ou si la sentinelle est illisible.
+    """
+    try:
+        sentinelle = Path("/data/.active_study")
+        if sentinelle.is_file():
+            return sentinelle.read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
+    return ""
+
+
 def _zoom_to_valid_layers(iface):
     """Frame the canvas on layers that actually have an extent.
 
@@ -6300,14 +6308,11 @@ def _open_startup_project():
         # Active study takes precedence over the env var: it reflects what the
         # user is actually working on, the env var only a boot-time default.
         try:
-            sentinel = "/data/.active_study"
-            if os.path.isfile(sentinel):
-                with open(sentinel, encoding="utf-8") as fh:
-                    sid = fh.read().strip()
-                candidate = f"/data/studies/{sid}/project.qgz"
-                if sid and os.path.isfile(candidate):
-                    project_path = candidate
-                    print(f"[QGISBridge] Active study {sid} -> {candidate}")
+            sid = lire_etude_active()
+            candidate = f"/data/studies/{sid}/project.qgz"
+            if sid and os.path.isfile(candidate):
+                project_path = candidate
+                print(f"[QGISBridge] Active study {sid} -> {candidate}")
         except Exception as exc:
             print(f"[QGISBridge] Could not read active study sentinel: {exc}")
 
