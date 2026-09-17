@@ -570,11 +570,18 @@ TOOLS = [
     },
     {
         "name": "list_files",
-        "description": "List files in the QGIS container's /data/ directory.",
+        "description": (
+            "List files under /data/. With no `directory`, lists /data AND the "
+            "active study's data folder (/data/studies/{id}/data) -- what the "
+            "user calls 'my files'. Crash dumps (core.*) are left out unless "
+            "the pattern asks for them."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "pattern": {"type": "string", "description": "Glob pattern (default '*')", "default": "*"}
+                "pattern": {"type": "string", "description": "Glob pattern (default '*')", "default": "*"},
+                "directory": {"type": "string", "description": "Folder to list, must be under /data (e.g. /data/studies/<id>/data)"},
+                "recursive": {"type": "boolean", "description": "Descend into subfolders (default false)", "default": False}
             },
             "required": []
         }
@@ -1386,7 +1393,16 @@ def _tool_download_file(arguments: dict) -> dict:
 
 
 def _tool_list_files(arguments: dict) -> dict:
-    response = qgis_command("list_files", {"pattern": arguments.get("pattern", "*")})
+    # `directory` etait declare nulle part et jete ici : le dossier d'une
+    # etude (/data/studies/{id}/data) restait donc inatteignable, et a la
+    # question « quels fichiers dans mon etude ? » l'assistant repondait par
+    # le contenu de /data. Mesure du 2026-09-17.
+    charge = {"pattern": arguments.get("pattern", "*")}
+    if arguments.get("directory"):
+        charge["directory"] = arguments["directory"]
+    if arguments.get("recursive"):
+        charge["recursive"] = True
+    response = qgis_command("list_files", charge)
     return {"content": _text(response, indent=2)}
 
 

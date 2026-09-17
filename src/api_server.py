@@ -606,10 +606,21 @@ def _validate_filename(name: str) -> str:
 
 @app.get("/api/files")
 async def list_files(directory: str = "/data", pattern: str = "*"):
-    """List files in /data/."""
-    allowed = ["/data"]
-    if directory not in allowed:
-        raise HTTPException(400, f"Directory must be /data")
+    """List files under /data/, subfolders included.
+
+    Only /data itself was allowed, so a study's own folder
+    (/data/studies/{id}/data) could not be listed from here either. The bound
+    stays /data -- it is now checked on the resolved path, which also rejects
+    the `..` escapes the equality test happened to catch.
+    """
+    racine = Path("/data").resolve()
+    try:
+        cible = Path(directory).resolve()
+    except Exception as exc:
+        raise HTTPException(400, f"Unreadable path: {exc}")
+    if cible != racine and racine not in cible.parents:
+        raise HTTPException(400, "Directory must be under /data")
+    directory = str(cible)
     if not os.path.isdir(directory):
         return {"files": [], "count": 0}
     results = []

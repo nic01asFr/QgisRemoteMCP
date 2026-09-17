@@ -2430,26 +2430,94 @@ class QGISBridge:
             raise ValueError(f"Invalid characters in filename: {basename}")
         return basename
 
+    def _etude_active(self) -> str:
+        """Identifiant de l'etude ouverte, lu dans la sentinelle du hub."""
+        try:
+            sentinelle = Path("/data/.active_study")
+            if sentinelle.is_file():
+                return sentinelle.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+        return ""
+
     def _action_list_files(self, params: dict) -> dict:
-        """List files in /data/ directory."""
-        directories = ["/data"]
+        """Liste des fichiers sous /data.
+
+        Deux defauts mesures le 2026-09-17 en se servant de l'assistant :
+
+        1. Le dossier de l'etude etait INATTEIGNABLE. Les donnees d'une etude
+           vivent dans /data/studies/{id}/data/, mais cette action ne regardait
+           que /data, sans recursion et sans accepter de dossier. A la question
+           « quels fichiers sont disponibles dans mon etude ? », l'assistant
+           repondait par le contenu de /data -- donc a cote.
+        2. Les vidages de plantage (core.*) noyaient la liste : six fichiers
+           pour 3,8 Go, sans aucune valeur pour l'utilisateur.
+
+        `directory` est desormais honore, borne a /data. Sans lui, on regarde
+        /data ET le dossier de donnees de l'etude active, qui est ce que
+        l'utilisateur appelle « mes fichiers ».
+        """
+        # Racine resolue : /data peut etre un lien symbolique, auquel cas la
+        # comparaison avec un chemin resolu echouerait et refuserait tout.
+        racine = Path("/data").resolve()
         pattern = params.get("pattern", "*")
-        results = []
-        for d in directories:
-            if not os.path.isdir(d):
+        recursif = bool(params.get("recursive", False))
+        demande = str(params.get("directory", "") or "").strip()
+        etude = self._etude_active()
+
+        if demande:
+            try:
+                cible = Path(demande).resolve()
+            except Exception as exc:
+                return {"error": f"Chemin illisible : {exc}"}
+            # Bornage : on ne sort pas de /data.
+            if cible != racine and racine not in cible.parents:
+                return {"error": f"Hors de /data : {cible}"}
+            if not cible.is_dir():
+                return {"error": f"Dossier introuvable : {cible}"}
+            dossiers = [cible]
+        else:
+            dossiers = [racine]
+            donnees_etude = racine / "studies" / etude / "data" if etude else None
+            if donnees_etude and donnees_etude.is_dir():
+                dossiers.append(donnees_etude)
+
+        # Les vidages de plantage ne sont ecartes que si l'appelant ne les
+        # cherche pas explicitement.
+        ecarter_plantages = not pattern.startswith("core")
+
+        resultats = []
+        ignores = 0
+        for d in dossiers:
+            if not d.is_dir():
                 continue
-            for fpath in sorted(Path(d).glob(pattern)):
-                if fpath.is_file():
-                    stat = fpath.stat()
-                    results.append({
-                        "path": str(fpath),
-                        "name": fpath.name,
-                        "size": stat.st_size,
-                        "modified": int(stat.st_mtime),
-                        "suffix": fpath.suffix,
-                        "directory": str(fpath.parent),
-                    })
-        return {"files": results, "count": len(results)}
+            chemins = d.rglob(pattern) if recursif else d.glob(pattern)
+            for fpath in sorted(chemins):
+                if not fpath.is_file():
+                    continue
+                if ecarter_plantages and fpath.name.startswith("core."):
+                    ignores += 1
+                    continue
+                stat = fpath.stat()
+                resultats.append({
+                    "path": str(fpath),
+                    "name": fpath.name,
+                    "size": stat.st_size,
+                    "modified": int(stat.st_mtime),
+                    "suffix": fpath.suffix,
+                    "directory": str(fpath.parent),
+                })
+
+        reponse = {
+            "files": resultats,
+            "count": len(resultats),
+            "directories": [str(d) for d in dossiers],
+        }
+        if etude:
+            reponse["etude_active"] = etude
+        if ignores:
+            reponse["vidages_de_plantage_ecartes"] = ignores
+        return reponse
 
     def _action_write_file(self, params: dict) -> dict:
         """Write base64-encoded content to /data/. Used by upload_file tool."""
