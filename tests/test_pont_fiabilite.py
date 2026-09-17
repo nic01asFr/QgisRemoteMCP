@@ -264,3 +264,48 @@ def test_l_endpoint_rest_accepte_les_sous_dossiers():
     bloc = api.split("async def list_files")[1].split("\n@app.")[0]
     assert "racine not in cible.parents" in bloc
     assert 'allowed = ["/data"]' not in bloc
+
+
+# ── 10. Les operations longues aboutissent enfin ─────────────────────────
+#
+# Mesure du 2026-09-17 : « charge les batiments de la BD TOPO sur ma zone »
+# echouait systematiquement. smart_load s'accorde 300 s (SOCKET_TIMEOUT_LONG),
+# mais ce delai ne quittait jamais le client : l'api_server appliquait son
+# propre plafond de 30 s et renvoyait 504. L'agent se rabattait alors sur
+# add_from_catalog, qui ajoutait une couche WFS servie en direct -- 51 450 444
+# entites annoncees -- et QGIS se figeait au rendu, jusqu'a ce que l'agent
+# redemarre le moteur.
+
+def test_le_delai_voyage_avec_la_commande():
+    bloc = _MCP.split("def qgis_command")[1].split("\ndef ")[0]
+    assert '"timeout": effective_timeout' in bloc
+
+
+def test_l_api_honore_le_delai_demande():
+    api = (_RACINE / "src" / "api_server.py").read_text(encoding="utf-8")
+    bloc = api.split("async def command")[1].split("\n# ")[0]
+    assert 'body.get("timeout")' in bloc
+    assert "send_command(action, params, timeout=delai)" in bloc
+    # Sous un plafond : un appelant ne doit pas pouvoir reclamer l'infini.
+    assert "COMMAND_TIMEOUT_MAX" in bloc
+    assert "COMMAND_TIMEOUT_MAX = int(" in api
+
+
+def test_le_plafond_borne_bien_la_demande():
+    """Reproduit le calcul applique a la valeur recue."""
+    plafond = 600
+    for demande, attendu in ((300, 300), (10_000, 600), (0, 1), (-5, 1)):
+        assert max(1, min(int(demande), plafond)) == attendu, demande
+
+
+def test_le_compte_d_une_couche_wfs_est_qualifie():
+    bloc = _AIDES.split("def _finalize_layer")[1].split("\ndef ")[0]
+    assert 'layer.providerType() == "WFS"' in bloc
+    assert "feature_count_signification" in bloc
+
+
+def test_une_couche_wfs_ingerable_est_signalee():
+    bloc = _AIDES.split("def _finalize_layer")[1].split("\ndef ")[0]
+    assert "_SEUIL_WFS_INGERABLE" in bloc
+    assert "smart_load" in bloc, "l'avertissement doit dire quoi faire a la place"
+    assert "_SEUIL_WFS_INGERABLE = 100_000" in _AIDES

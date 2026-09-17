@@ -92,6 +92,10 @@ def _alleger_le_contour_si_couche_dense(layer, seuil=5000):
     return False
 
 
+# Au-dela, une couche WFS servie en direct fige QGIS au rendu.
+_SEUIL_WFS_INGERABLE = 100_000
+
+
 def _finalize_layer(layer):
     """Add layer to project with auto CRS adapt, zoom on first layer.
     Replicates QGISBridge._finalize_add_layer pattern."""
@@ -167,6 +171,27 @@ def _finalize_layer(layer):
         pass
     if isinstance(layer, QgsVectorLayer):
         result["feature_count"] = layer.featureCount()
+        # Une couche WFS reste servie par le serveur : ce que QGIS rapporte
+        # est le total annonce par le service, pas ce que la zone contient.
+        # Mesure du 2026-09-17 : « 51 450 444 entites » pour les batiments
+        # de la BD TOPO sur Marseille -- le total national, et une couche
+        # que QGIS ne peut pas afficher. Dit tel quel, c'est trompeur pour
+        # l'utilisateur comme pour le modele.
+        try:
+            if layer.providerType() == "WFS":
+                result["feature_count_signification"] = (
+                    "total annonce par le service WFS, pas le nombre dans la "
+                    "zone d'etude"
+                )
+                if layer.featureCount() > _SEUIL_WFS_INGERABLE:
+                    result["avertissement"] = (
+                        "Couche WFS trop volumineuse pour etre affichee telle "
+                        "quelle : QGIS se fige en tentant de la rendre. "
+                        "Utilise smart_load, qui telecharge la zone en "
+                        "GeoPackage local."
+                    )
+        except Exception:
+            pass
         result["geometry_type"] = (layer.geometryType().name
                                    if hasattr(layer.geometryType(), 'name')
                                    else str(layer.geometryType()))

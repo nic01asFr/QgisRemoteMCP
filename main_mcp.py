@@ -168,7 +168,19 @@ def qgis_command(action: str, params: dict = None, timeout: int = None) -> dict:
     url = f"{base_url}/api/command"
     try:
         with httpx.Client(timeout=effective_timeout) as client:
-            resp = client.post(url, json={"action": action, "params": params or {}})
+            # Le delai voyage avec la commande. Sans lui, l'api_server
+            # appliquait son propre plafond de 30 s : SOCKET_TIMEOUT_LONG ne
+            # servait donc a rien, et toute operation longue (smart_load,
+            # export_flood_map, export_qfield, export_grist...) echouait en
+            # 504 au bout de 30 s. Mesure du 2026-09-17 : charger les
+            # batiments de la BD TOPO sur Marseille echouait toujours, et
+            # l'agent se rabattait sur une couche WFS de 51 M d'entites qui
+            # figeait QGIS.
+            resp = client.post(url, json={
+                "action": action,
+                "params": params or {},
+                "timeout": effective_timeout,
+            })
             resp.raise_for_status()
             return resp.json()
     except httpx.TimeoutException:

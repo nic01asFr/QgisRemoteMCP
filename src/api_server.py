@@ -30,6 +30,9 @@ import uvicorn
 
 SOCKET_PATH = "/tmp/qgis_bridge.sock"
 SOCKET_TIMEOUT = 30  # seconds
+# Plafond du delai qu'une commande peut reclamer (smart_load et les
+# exports lourds s'accordent 300 s cote client).
+COMMAND_TIMEOUT_MAX = int(os.environ.get("COMMAND_TIMEOUT_MAX", "600"))
 
 # ── Async job registry ──────────────────────────────────────────
 # In-memory registry for async jobs submitted via POST /api/submit.
@@ -166,7 +169,17 @@ async def command(body: dict):
     params = body.get("params", {})
     if not action:
         raise HTTPException(400, "Missing 'action' field")
-    return send_command(action, params)
+    # Le delai demande par l'appelant est honore, sous un plafond. Il etait
+    # ignore : toute commande depassant SOCKET_TIMEOUT (30 s) tombait en 504,
+    # y compris celles que le client s'autorisait a attendre 300 s.
+    demande = body.get("timeout")
+    delai = None
+    if demande is not None:
+        try:
+            delai = max(1, min(int(demande), COMMAND_TIMEOUT_MAX))
+        except (TypeError, ValueError):
+            delai = None
+    return send_command(action, params, timeout=delai)
 
 
 # ── Async job endpoints ──────────────────────────────────────────
