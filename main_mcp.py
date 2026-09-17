@@ -639,7 +639,7 @@ TOOLS = [
             "properties": {
                 "id": {"type": "string", "description": "Catalog source ID (e.g. 'bdtopo_batiments', 'osm_xyz'). Use list_datasources to see available IDs."},
                 "bbox": {"type": "array", "items": {"type": "number"}, "description": "Optional [xmin,ymin,xmax,ymax] in EPSG:4326. Auto from study zone if not provided."},
-                "max_features": {"type": "integer", "description": "Max features for WFS download (default 10000)", "default": 10000},
+                "max_features": {"type": "integer", "description": "Plafond FACULTATIF du nombre d'entites. Par defaut AUCUN plafond : c'est l'emprise (bbox ou zone d'etude) qui borne le volume, et la pagination ogr2ogr rapatrie tout (52 000 entites / 39 Mo mesures). Ne poser ce parametre que pour brider volontairement un chargement."},
                 "name": {"type": "string", "description": "Override display name", "default": ""}
             },
             "required": ["id"]

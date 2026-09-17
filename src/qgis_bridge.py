@@ -278,11 +278,25 @@ class QGISBridge:
         return layer, None
 
     def _auto_save(self):
-        """Auto-save project to /data/.autosave.qgz before risky operations."""
+        """Filet de securite avant une operation risquee, SANS changer d'identite.
+
+        `QgsProject.write(chemin)` reaffecte le nom de fichier du projet. Comme
+        ce filet tourne avant chaque execute_python, il suffisait d'UN script
+        pour que le projet ne sache plus d'ou il venait : `fileName()` valait
+        `/data/.autosave.qgz`, et plus le chemin de l'etude. Le hub, qui
+        sauvegarde ensuite le projet charge dans l'etude qu'on lui nomme, ne
+        pouvait donc plus se fier au nom de fichier pour verifier a qui ce
+        projet appartient -- d'ou sa garde par variable de projet `hub_sid`.
+
+        On restaure donc le nom d'origine juste apres l'ecriture.
+        """
         try:
             project = QgsProject.instance()
             if project.layerTreeRoot().children():  # has content worth saving
+                nom_avant = project.fileName()
                 project.write("/data/.autosave.qgz")
+                if nom_avant and project.fileName() != nom_avant:
+                    project.setFileName(nom_avant)
         except Exception:
             pass  # never fail on autosave
 
@@ -537,9 +551,24 @@ class QGISBridge:
             exec(code, exec_globals)
             stdout = captured.getvalue()
 
+            # Recupere le resultat DEPUIS l'espace du script.
+            #
+            # `result = {...}` -- la facon naturelle d'ecrire, et celle que
+            # suggere la doc de l'outil -- rebind le nom dans exec_globals et
+            # laisse intact le dict cree ici. On relisait donc notre objet
+            # d'origine, reste vide : le script repondait `success: true` avec
+            # un resultat vide, sans le moindre avertissement. L'appelant se
+            # croyait servi et n'avait rien. On accepte desormais les deux
+            # ecritures : mutation (`result["k"] = v`) et affectation.
+            produit = exec_globals.get("result", result)
+            if not isinstance(produit, dict):
+                # Un script qui affecte autre chose qu'un dict (liste, valeur)
+                # avait son retour perdu de la meme facon.
+                produit = {"valeur": produit}
+
             # Serialize result (handle non-JSON-serializable objects)
             serialized = {}
-            for k, v in result.items():
+            for k, v in produit.items():
                 try:
                     json.dumps(v)
                     serialized[k] = v
@@ -5176,7 +5205,12 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
         catalog = self._load_datasources_catalog()
         category = params.get("category", "")
         search = params.get("search", "").lower()
-        sources = catalog.get("sources", [])
+        # Le catalogue porte des pseudo-entrees `_comment` qui servent a le
+        # decouper en sections lisibles. Elles n'ont pas d'`id`, donc rien ne
+        # peut les charger -- mais elles etaient renvoyees ET comptees : le
+        # catalogue annoncait 54 sources pour 49 reelles, et l'appelant
+        # recevait des objets qu'aucun outil n'accepte.
+        sources = [s for s in catalog.get("sources", []) if s.get("id")]
         if category:
             sources = [s for s in sources if s.get("category") == category]
         if search:
@@ -5334,6 +5368,30 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
             )
             result["source_id"] = source_id
             result["method"] = "download"
+
+            # Emprise reellement chargee vs zone d'etude declaree.
+            #
+            # Une emprise explicite prend le pas sur la zone, en silence : on
+            # pouvait donc travailler sur Marseille avec une zone « Saint-Martin »
+            # sans que rien ne le dise, ni a l'agent ni a l'utilisateur.
+            if bbox:
+                try:
+                    zone = qgis_helpers.get_study_zone()
+                    zb = zone.get("bbox_4326") if isinstance(zone, dict) else None
+                    if zb and len(zb) == 4:
+                        disjoint = (bbox[2] < zb[0] or bbox[0] > zb[2]
+                                    or bbox[3] < zb[1] or bbox[1] > zb[3])
+                        nom = zone.get("name") or "zone d'etude"
+                        if disjoint:
+                            result["avertissement"] = (
+                                f"L'emprise demandee est HORS de la zone d'etude "
+                                f"« {nom} » : les donnees chargees ne la concernent "
+                                f"pas. Corrige l'emprise, ou redefinis la zone.")
+                        else:
+                            result["zone_etude"] = nom
+                            result["emprise_utilisee"] = "bbox explicite (la zone d'etude n'a pas servi)"
+                except Exception:
+                    pass
             return result
 
         # Raster (WMS/WMTS/XYZ) → delegate to existing catalog handler
