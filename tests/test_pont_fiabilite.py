@@ -437,3 +437,26 @@ def test_smart_load_detourne_du_telechargement_ecrit_a_la_main():
     assert "N'ecris JAMAIS ton propre telechargement WFS" in bloc
     assert "ZERO entite" in bloc
     assert "avertissement" in bloc
+
+
+def test_le_delai_descend_jusqu_au_fil_principal_de_qgis():
+    """La chaine des delais ne valait que par son maillon le plus court.
+
+    Le client s'accorde 300 s, l'api_server les honore depuis le 2026-09-18
+    -- mais il n'envoyait au pont que `{action, params}`. Le pont retombait
+    donc sur son defaut de 30 s, soit un plafond de dispatch de 120 s, et le
+    chargement des batiments de Marseille (204 s) echouait la : « Main thread
+    execution timed out (120s) ».
+    """
+    api = (_RACINE / "src" / "api_server.py").read_text(encoding="utf-8")
+    bloc = api.split("def send_command")[1].split("\ndef ")[0]
+    assert 'charge["timeout"] = int(timeout)' in bloc
+    assert '"params": charge' in bloc
+    # Un delai deja porte par l'action n'est pas ecrase.
+    assert '"timeout" not in charge' in bloc
+
+
+def test_le_pont_lit_bien_ce_delai():
+    """Verrou sur l'autre bout : le pont doit continuer de le lire la."""
+    assert 'user_timeout = params.get("timeout", 30)' in _PONT
+    assert "dispatch_timeout = max(int(user_timeout) + 30, 120)" in _PONT

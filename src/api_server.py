@@ -73,7 +73,17 @@ def send_command(action: str, params: dict = None, timeout: int = None) -> dict:
         sock.settimeout(effective_timeout)
         sock.connect(SOCKET_PATH)
 
-        request = json.dumps({"action": action, "params": params or {}})
+        # Le delai descend jusqu'au pont, qui le lit dans `params` pour
+        # dimensionner son dispatch sur le fil principal de QGIS. Sans cela,
+        # il retombait sur son defaut de 30 s -> plafond de 120 s, et une
+        # operation longue echouait la meme apres que tout le reste de la
+        # chaine eut ete elargi. Mesure le 2026-09-18 : le chargement des
+        # batiments de Marseille (204 s) tombait sur « Main thread execution
+        # timed out (120s) ».
+        charge = dict(params or {})
+        if timeout and "timeout" not in charge:
+            charge["timeout"] = int(timeout)
+        request = json.dumps({"action": action, "params": charge})
         sock.sendall(request.encode())
         sock.shutdown(socket.SHUT_WR)
 
