@@ -351,7 +351,7 @@ TOOLS = [
     },
     {
         "name": "get_project_info",
-        "description": "Get information about the current QGIS project: title, CRS, layers, print layouts.",
+        "description": "Get information about the current QGIS project: title, CRS, layers, print layouts. Chaque couche porte son `origine` : `fichier` (elle est sur disque -- `fichier` donne le chemin, `fichier_present` dit s'il existe encore), `service distant` (rien en local, telecharge avec smart_load avant de traiter), ou `memoire` (elle n'existe SUR AUCUN DISQUE et disparait au prochain redemarrage de QGIS -- typiquement le resultat d'un traitement : si l'utilisateur veut le garder, exporte-le avec export_layer dans les donnees de l'etude). Ne confonds pas une couche avec un fichier : list_files montre les fichiers de l'etude, dont beaucoup ne sont chargés dans aucune couche, et inversement.",
         "inputSchema": {"type": "object", "properties": {}, "required": []}
     },
     {

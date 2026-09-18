@@ -375,6 +375,67 @@ class QGISBridge:
             "processing_available": _get_processing() is not None,
         }
 
+    def _origine_de_la_couche(self, layer) -> dict:
+        """D'ou vient cette couche, et ce que cela implique.
+
+        Une couche et un fichier ne sont pas la meme chose, et l'agent doit
+        les manipuler autrement. Trois natures coexistent dans un meme
+        projet -- mesure du 2026-09-18 sur l'instance de production :
+
+          * adossee a un fichier de l'etude : elle survit, elle part dans
+            l'archive, on peut l'exporter ou la reprojeter sur disque ;
+          * servie a distance (WFS, XYZ, WMS) : rien en local, chaque
+            affichage rejoue une requete, et son compte d'entites est celui
+            du service, pas de la zone ;
+          * en memoire : elle n'existe NULLE PART sur disque. Elle disparait
+            au prochain redemarrage de QGIS, sans avertissement -- et c'est
+            typiquement le resultat d'un traitement qu'on vient de calculer.
+
+        Sans cette distinction, l'agent traite un resultat volatile comme un
+        acquis, et l'utilisateur perd son travail sans comprendre pourquoi.
+        """
+        source = layer.source() or ""
+        origine = {}
+
+        if source.startswith("memory?") or source == "memory":
+            origine["origine"] = "memoire"
+            origine["perdue_au_redemarrage"] = True
+            origine["conseil"] = (
+                "Cette couche n'existe sur aucun disque. Pour la garder, "
+                "exporte-la (export_layer) dans les donnees de l'etude."
+            )
+            return origine
+
+        if "://" in source or source.startswith(("url=", "crs=")):
+            origine["origine"] = "service distant"
+            origine["conseil"] = (
+                "Servie par un service web : rien en local. Pour travailler "
+                "dessus, telecharge-la d'abord (smart_load)."
+            )
+            return origine
+
+        # Reste un chemin de fichier, eventuellement suivi de |layername=...
+        chemin = source.split("|", 1)[0]
+        origine["origine"] = "fichier"
+        origine["fichier"] = chemin
+        try:
+            existe = Path(chemin).is_file()
+        except Exception:
+            existe = False
+        origine["fichier_present"] = existe
+        if not existe:
+            # Une couche dont le fichier a disparu s'affiche encore dans la
+            # legende : rien ne dit qu'elle ne rendra plus jamais rien.
+            origine["avertissement"] = (
+                "Le fichier de cette couche est introuvable : elle ne "
+                "affichera ni ne traitera plus rien."
+            )
+        else:
+            etude = lire_etude_active()
+            if etude and f"/studies/{etude}/" in chemin:
+                origine["dans_l_etude"] = True
+        return origine
+
     def _action_get_project_info(self, params: dict) -> dict:
         project = QgsProject.instance()
         layers = []
@@ -394,6 +455,9 @@ class QGISBridge:
             except Exception:
                 pass
             info["source"] = layer.source()[:200]
+            # Une couche et un fichier ne sont pas la meme chose : on dit
+            # laquelle des trois natures on a sous la main.
+            info.update(self._origine_de_la_couche(layer))
             if isinstance(layer, QgsVectorLayer):
                 info["feature_count"] = layer.featureCount()
                 info["geometry_type"] = layer.geometryType().name if hasattr(layer.geometryType(), 'name') else str(layer.geometryType())
