@@ -319,3 +319,61 @@ def test_la_sentinelle_d_etude_n_est_lue_qu_a_un_seul_endroit():
     assert "def lire_etude_active()" in _PONT
     demarrage = _PONT.split("Active study takes precedence")[1][:600]
     assert "lire_etude_active()" in demarrage
+
+
+# ── 11. Un livrable doit s'ouvrir, et se trouver ─────────────────────────
+#
+# Signalement d'une utilisatrice, le 2026-09-18 : « je n'arrive pas a charger
+# ce PDF, le lien ne fonctionne pas » et « j'ai demande qu'il aille dans les
+# livrables, je ne le vois pas non plus ».
+#
+# Le lien rendu etait `http://localhost:8080/api/files/<nom>` : `localhost`
+# designe la machine de qui clique, donc il ne pouvait jamais s'ouvrir. Neuf
+# retours le fabriquaient. Une consigne avait ete posee en mai 2026 dans la
+# description des outils (« NE PAS donner ce download_url a l'user ») ; quatre
+# mois plus tard le meme bug se produisait chez une utilisatrice -- tant qu'un
+# outil rend une valeur piegee, elle finit par etre donnee.
+#
+# Les exports atterrissaient par ailleurs a la racine de /data, hors de toute
+# etude : mesure en production, huit orphelins dont deux du jour meme.
+
+def test_plus_aucun_lien_vers_localhost():
+    assert "localhost:{_API_HOST_PORT}/api/files" not in _PONT
+
+
+def test_le_lien_est_construit_pour_le_navigateur():
+    bloc = _PONT.split("def _lien_hub")[1].split("\n    def ")[0]
+    assert 'os.environ.get("HUB_URL"' in bloc
+    # Les deux emplacements que le hub sait servir.
+    assert "/studies/{sid}/file/{reste}" in bloc
+    assert '/files/' in bloc
+
+
+def test_sans_adresse_de_hub_on_ne_rend_aucun_lien():
+    """Mieux vaut pas de lien qu'un lien qui ne s'ouvre pas."""
+    bloc = _PONT.split("def _lien_hub")[1].split("\n    def ")[0]
+    assert "if not base or not chemin:" in bloc
+    assert 'return ""' in bloc
+
+
+def test_les_exports_sont_ranges_dans_l_etude():
+    bloc = _PONT.split("def _chemin_d_export")[1].split("\n    def ")[0]
+    assert "lire_etude_active()" in bloc
+    assert '"exports"' in bloc
+
+
+def test_la_racine_reste_le_repli_quand_il_n_y_a_pas_d_etude():
+    bloc = _PONT.split("def _chemin_d_export")[1].split("\n    def ")[0]
+    assert 'dossier = Path("/data")' in bloc
+
+
+def test_chaque_nature_d_export_a_sa_place():
+    for nature in ('"pdf"', '"figures"', '"storymaps"'):
+        assert f"_chemin_d_export(\n            f" in _PONT or nature in _PONT, nature
+
+
+def test_la_consigne_de_contournement_a_disparu():
+    """Elle decrivait un piege : le piege n'existe plus."""
+    assert "NE PAS donner ce download_url" not in _MCP
+    # Et on dit desormais quoi faire pour les livrables.
+    assert "figure AUSSI dans" in _MCP or "figurer AUSSI dans" in _MCP

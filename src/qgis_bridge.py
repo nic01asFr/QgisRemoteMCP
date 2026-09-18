@@ -1088,9 +1088,80 @@ class QGISBridge:
 
     # ── Print / Export ────────────────────────────────────────────
 
+    # ── Où ranger un export, et sous quel lien le rendre ────────────────
+    #
+    # Deux defauts mesures le 2026-09-18, a partir du signalement d'une
+    # utilisatrice : « je n'arrive pas a charger ce PDF, le lien ne
+    # fonctionne pas » et « je ne le vois pas dans les livrables ».
+    #
+    # 1. Le lien rendu etait `http://localhost:8080/api/files/<nom>`.
+    #    `localhost` designe la machine de qui clique : ce lien ne pouvait
+    #    structurellement jamais s'ouvrir. Huit outils le fabriquaient. Une
+    #    consigne avait ete ajoutee en mai 2026 dans la description des
+    #    outils (« NE PAS donner ce download_url a l'user ») -- mais tant
+    #    qu'un outil rend une valeur piegee nommee `download_url`, elle
+    #    finit par etre donnee. On supprime le piege au lieu d'en avertir.
+    #
+    # 2. Les exports atterrissaient a la racine de /data, hors de toute
+    #    etude : ni dans son archive, ni dans aucune liste. Mesure sur
+    #    l'instance de production : huit fichiers orphelins, dont deux du
+    #    jour meme.
+    #
+    # Le hub sait servir les deux emplacements, et son authentification par
+    # temoin de session fonctionne depuis le navigateur -- verifie en
+    # conditions reelles : `/files/<nom>` et
+    # `/studies/<sid>/file/<relatif>` rendent tous deux 200.
+
+    def _lien_hub(self, chemin: str) -> str:
+        """Lien ouvrable depuis un navigateur, ou chaine vide.
+
+        Rend une URL absolue quand le pont connait l'adresse du hub
+        (`HUB_URL`), sinon rien du tout : mieux vaut pas de lien qu'un lien
+        qui ne s'ouvre pas.
+        """
+        base = os.environ.get("HUB_URL", "").rstrip("/")
+        if not base or not chemin:
+            return ""
+        # Les appelants donnent tantot un chemin complet, tantot le seul nom
+        # du fichier ; un nom simple designe la racine de /data.
+        p = Path(chemin)
+        if not p.is_absolute():
+            p = Path("/data") / p
+        try:
+            relatif = p.relative_to("/data")
+        except ValueError:
+            return ""
+        morceaux = relatif.parts
+        if len(morceaux) >= 2 and morceaux[0] == "studies":
+            # /data/studies/<sid>/exports/x.pdf -> <hub>/studies/<sid>/file/exports/x.pdf
+            sid = morceaux[1]
+            reste = "/".join(morceaux[2:])
+            return f"{base}/studies/{sid}/file/{reste}" if reste else ""
+        return f"{base}/files/{'/'.join(morceaux)}"
+
+    def _chemin_d_export(self, nom: str, sous_dossier: str = "") -> str:
+        """Place un export DANS l'etude active, quand il y en a une.
+
+        Un fichier depose a la racine de /data n'appartient a rien : il ne
+        part pas dans l'archive de l'etude et n'apparait nulle part.
+        """
+        etude = lire_etude_active()
+        if etude and Path(f"/data/studies/{etude}").is_dir():
+            dossier = Path("/data/studies") / etude / "exports"
+            if sous_dossier:
+                dossier = dossier / sous_dossier
+        else:
+            dossier = Path("/data")
+        try:
+            dossier.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            dossier = Path("/data")
+        return str(dossier / nom)
+
     def _action_export_pdf(self, params: dict) -> dict:
         layout_name = params.get("layout", "")
-        output_path = params.get("output_path", f"/data/export_{int(time.time())}.pdf")
+        output_path = params.get("output_path") or self._chemin_d_export(
+            f"export_{int(time.time())}.pdf", "pdf")
 
         manager = QgsProject.instance().layoutManager()
         layout = manager.layoutByName(layout_name)
@@ -1107,7 +1178,7 @@ class QGISBridge:
 
         size = os.path.getsize(output_path)
         result_dict = {"success": True, "path": output_path, "size": size,
-                       "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{Path(output_path).name}"}
+                       "download_url": self._lien_hub(output_path)}
         if size <= MAX_INLINE_FILE:
             with open(output_path, "rb") as f:
                 result_dict["content_base64"] = base64.b64encode(f.read()).decode()
@@ -1116,7 +1187,8 @@ class QGISBridge:
 
     def _action_export_image(self, params: dict) -> dict:
         layout_name = params.get("layout", "")
-        output_path = params.get("output_path", f"/data/export_{int(time.time())}.png")
+        output_path = params.get("output_path") or self._chemin_d_export(
+            f"export_{int(time.time())}.png", "figures")
         dpi = params.get("dpi", 150)
 
         manager = QgsProject.instance().layoutManager()
@@ -1559,7 +1631,8 @@ class QGISBridge:
             title = project.title() or "Web Map"
 
         if not output_path:
-            output_path = f"/data/webmap_{int(time.time())}.html"
+            output_path = self._chemin_d_export(
+                f"webmap_{int(time.time())}.html", "storymaps")
 
         # Collect visible vector layers
         layer_data = []
@@ -1723,7 +1796,7 @@ class QGISBridge:
         return {
             "success": True,
             "path": output_path,
-            "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{fname}",
+            "download_url": self._lien_hub(fname),
             "size_bytes": size,
             "layers_exported": len(layer_data),
             "title": title,
@@ -1757,7 +1830,8 @@ class QGISBridge:
         if not title:
             title = f"Simulation inondation — {zone_name}"
         if not output_path:
-            output_path = f"/data/flood_map_{int(time.time())}.html"
+            output_path = self._chemin_d_export(
+                f"flood_map_{int(time.time())}.html", "storymaps")
 
         # ── Find layers by keywords ──
         def find_layers(*keywords):
@@ -2198,7 +2272,7 @@ class QGISBridge:
         return {
             "success": True,
             "path": output_path,
-            "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{fname}",
+            "download_url": self._lien_hub(fname),
             "size_bytes": size,
             "title": title,
             "zone": zone_name,
@@ -2249,7 +2323,8 @@ class QGISBridge:
         if not title:
             title = f"Pression foncière — {zone_name}"
         if not output_path:
-            output_path = f"/data/temporal_map_{int(time.time())}.html"
+            output_path = self._chemin_d_export(
+                f"temporal_map_{int(time.time())}.html", "storymaps")
 
         # ── Find layers ──
         def find_layers(*keywords):
@@ -2403,7 +2478,7 @@ class QGISBridge:
         return {
             "success": True,
             "path": output_path,
-            "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{fname}",
+            "download_url": self._lien_hub(fname),
             "size": size,
             "title": title,
             "zone": zone_name,
@@ -2556,7 +2631,7 @@ class QGISBridge:
         }
         if size > MAX_INLINE_FILE:
             result["too_large_for_inline"] = True
-            result["download_url"] = f"http://localhost:{_API_HOST_PORT}/api/files/{fpath.name}"
+            result["download_url"] = self._lien_hub(str(fpath))
         else:
             result["content_base64"] = base64.b64encode(fpath.read_bytes()).decode()
         return result
@@ -2613,7 +2688,7 @@ class QGISBridge:
         return {
             "success": True, "path": output_path, "name": name,
             "format": fmt, "size": size,
-            "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{name}",
+            "download_url": self._lien_hub(name),
         }
 
     def _action_download_project(self, params: dict) -> dict:
@@ -2633,7 +2708,7 @@ class QGISBridge:
         size = os.path.getsize(output_path)
         return {
             "success": True, "path": output_path, "name": name, "size": size,
-            "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{name}",
+            "download_url": self._lien_hub(name),
         }
 
     # ── QField Export ────────────────────────────────────────────
@@ -2842,7 +2917,7 @@ class QGISBridge:
         return {
             "success": True,
             "path": zip_path,
-            "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{zip_name}",
+            "download_url": self._lien_hub(zip_name),
             "size_bytes": zip_size,
             "size_mb": round(zip_size / 1024 / 1024, 1),
             "project_name": project_name,
@@ -3900,7 +3975,7 @@ class QGISBridge:
         return {
             "success": True,
             "path": grist_path,
-            "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{fname}",
+            "download_url": self._lien_hub(fname),
             "size_bytes": size,
             "size_mb": round(size / 1024 / 1024, 1),
             "document_name": doc_name,
@@ -4325,7 +4400,7 @@ class QGISBridge:
         return {
             "success": True,
             "path": grist_path,
-            "download_url": f"http://localhost:{_API_HOST_PORT}/api/files/{fname}",
+            "download_url": self._lien_hub(fname),
             "size_bytes": size,
             "size_mb": round(size / 1024 / 1024, 1),
             "document_name": doc_name,
