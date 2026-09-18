@@ -82,7 +82,19 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # Le package `qgisremotemcp` reste rattache a BigQgisMCP, le depot
+          # d'origine, desormais ARCHIVE et prive. GitHub accorde l'ecriture au
+          # depot rattache : le jeton automatique de CE depot est donc refuse,
+          # « denied: permission_denied: write_package ». Constate sur toutes
+          # les executions depuis le 2026-09-06 au moins -- le build reussit,
+          # seul le push echoue, donc l'image workspace n'est plus reconstruite
+          # et aucun correctif du pont QGIS n'atteint la production.
+          #
+          # `GHCR_PAT` (portee write:packages) contourne le rattachement. S'il
+          # n'est pas pose, on retombe sur le jeton automatique : c'est le
+          # comportement d'avant, utile si l'acces est retabli cote package
+          # plutot que par jeton.
+          password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
