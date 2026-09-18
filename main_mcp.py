@@ -679,7 +679,7 @@ TOOLS = [
     },
     {
         "name": "smart_load",
-        "description": "Load data from the catalog. WFS sources are downloaded as local GeoPackage via ogr2ogr (automatic pagination, R-tree spatial index, fast for Processing). Raster sources (WMS/WMTS/XYZ) stream as usual. Use set_study_zone first to define the area, or provide a bbox.",
+        "description": "Load data from the catalog. WFS sources are downloaded as local GeoPackage via ogr2ogr (automatic pagination, R-tree spatial index, fast for Processing). Raster sources (WMS/WMTS/XYZ) stream as usual. Use set_study_zone first to define the area, or provide a bbox. Il gere les grandes emprises : une ville entiere passe (300 551 batiments sur Marseille, mesure), le resultat est mis en cache 24 h et porte un index spatial. N'ecris JAMAIS ton propre telechargement WFS en execute_python : la combinaison `-spat` + `-t_srs` que tu ecrirais naturellement rend ZERO entite sans erreur, et cet outil contourne deja ce piege. Si le retour porte un `avertissement` disant qu'aucune entite n'a ete trouvee, ne poursuis pas l'analyse : verifie l'emprise.",
         "inputSchema": {
             "type": "object",
             "properties": {

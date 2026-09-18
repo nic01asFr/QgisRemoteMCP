@@ -426,3 +426,14 @@ def test_le_contournement_du_piege_gdal_reste_en_place():
     assert '"-spat"' in telechargement
     assert '"-t_srs"' not in telechargement
     assert "need_reproject" in bloc
+
+
+def test_smart_load_detourne_du_telechargement_ecrit_a_la_main():
+    """Observe en production : la recette echoue, et l'agent se met a ecrire
+    son propre ogr2ogr -- avec `-spat` ET `-t_srs`, donc zero entite sans
+    erreur. Huit tentatives infructueuses ont suivi. L'outil dit desormais
+    pourquoi il ne faut pas."""
+    bloc = _MCP.split('"name": "smart_load"')[1][:2000]
+    assert "N'ecris JAMAIS ton propre telechargement WFS" in bloc
+    assert "ZERO entite" in bloc
+    assert "avertissement" in bloc
