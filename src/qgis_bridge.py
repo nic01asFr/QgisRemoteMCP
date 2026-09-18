@@ -5516,9 +5516,21 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
         if category:
             sources = [s for s in sources if s.get("category") == category]
         if search:
-            sources = [s for s in sources if search in s.get("name", "").lower()
-                       or search in s.get("description", "").lower()
-                       or search in s.get("id", "").lower()]
+            # La recherche ignore les accents, des deux cotes.
+            #
+            # Sans cela elle etait asymetrique : « vegetation » ne trouvait pas
+            # « Végétation (BD TOPO) », alors que « végétation » si. Mesure du
+            # 2026-09-18 : 1 resultat contre 2 pour la meme notion, selon que
+            # l'on tape les accents ou non. Personne ne tape les accents dans
+            # une barre de recherche, et l'agent encore moins.
+            besoin = _sans_accents(search)
+            sources = [
+                s for s in sources
+                if besoin in _sans_accents(s.get("name", ""))
+                or besoin in _sans_accents(s.get("description", ""))
+                or besoin in _sans_accents(s.get("id", ""))
+                or besoin in _sans_accents(s.get("category", ""))
+            ]
         return {
             "sources": sources, "count": len(sources),
             "categories": catalog.get("categories", []),
@@ -6354,6 +6366,21 @@ def _configure_environment():
     except Exception as e:
         print(f"[QGISBridge] Environment config warning: {e}")
         traceback.print_exc()
+
+
+def _sans_accents(texte: str) -> str:
+    """Minuscules et sans accents, pour comparer ce que les gens tapent.
+
+    Deux fonctions voisines existent dans ce fichier (`_strip_accents`,
+    `_strip`), mais elles assainissent des NOMS DE TABLE et gardent donc la
+    casse : les employer ici changerait les noms generes. Celle-ci sert a
+    comparer, pas a nommer.
+    """
+    import unicodedata          # importe ici, comme ses deux voisines
+    if not texte:
+        return ""
+    decompose = unicodedata.normalize("NFD", str(texte).lower())
+    return "".join(c for c in decompose if unicodedata.category(c) != "Mn")
 
 
 def lire_etude_active() -> str:

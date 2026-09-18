@@ -460,3 +460,53 @@ def test_le_pont_lit_bien_ce_delai():
     """Verrou sur l'autre bout : le pont doit continuer de le lire la."""
     assert 'user_timeout = params.get("timeout", 30)' in _PONT
     assert "dispatch_timeout = max(int(user_timeout) + 30, 120)" in _PONT
+
+
+# ── 13. Chercher dans le catalogue sans se soucier des accents ───────────
+#
+# La recherche etait asymetrique : « vegetation » ne trouvait pas
+# « Végétation (BD TOPO) », alors que « végétation » si -- 1 resultat contre 2
+# pour la meme notion, mesure le 2026-09-18. Personne ne tape les accents dans
+# une barre de recherche, et l'agent encore moins.
+
+def _normaliseur():
+    """La fonction doit se suffire a elle-meme.
+
+    On l'execute dans un espace VIDE, sans lui fournir `unicodedata` : un
+    test complaisant qui l'injecterait ne verrait pas un import manquant --
+    exactement le defaut qui a fait repondre 401 au bouton de mise a jour
+    plus tot dans la journee.
+    """
+    import ast as _ast
+    import textwrap as _t
+    arbre = _ast.parse(_PONT)
+    bout = next(_ast.get_source_segment(_PONT, n) for n in _ast.walk(arbre)
+                if isinstance(n, _ast.FunctionDef) and n.name == "_sans_accents")
+    espace = {}
+    exec(_t.dedent(bout), espace)
+    return espace["_sans_accents"]
+
+
+def test_une_recherche_sans_accents_trouve_le_texte_accentue():
+    sans = _normaliseur()
+    assert "vegetation" in sans("Végétation (BD TOPO)")
+    assert "batiment" in sans("Bâtiments (BD TOPO)")
+    assert "region" in sans("RÉGION")
+
+
+def test_les_valeurs_foncieres_se_trouvent_par_foncier():
+    sans = _normaliseur()
+    assert "foncier" in sans("DVF (Valeurs Foncières)")
+
+
+def test_un_texte_vide_ne_fait_pas_tomber_la_recherche():
+    sans = _normaliseur()
+    assert sans("") == "" and sans(None) == ""
+
+
+def test_la_recherche_compare_les_deux_cotes_normalises():
+    bloc = _PONT.split("def _action_list_datasources")[1].split("\n    def ")[0]
+    assert "besoin = _sans_accents(search)" in bloc
+    assert '_sans_accents(s.get("name"' in bloc
+    # La categorie devient cherchable : « api », « risques »...
+    assert '_sans_accents(s.get("category"' in bloc
