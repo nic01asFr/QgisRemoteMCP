@@ -278,11 +278,25 @@ class QGISBridge:
         return layer, None
 
     def _auto_save(self):
-        """Auto-save project to /data/.autosave.qgz before risky operations."""
+        """Filet de securite avant une operation risquee, SANS changer d'identite.
+
+        `QgsProject.write(chemin)` reaffecte le nom de fichier du projet. Comme
+        ce filet tourne avant chaque execute_python, il suffisait d'UN script
+        pour que le projet ne sache plus d'ou il venait : `fileName()` valait
+        `/data/.autosave.qgz`, et plus le chemin de l'etude. Le hub, qui
+        sauvegarde ensuite le projet charge dans l'etude qu'on lui nomme, ne
+        pouvait donc plus se fier au nom de fichier pour verifier a qui ce
+        projet appartient -- d'ou sa garde par variable de projet `hub_sid`.
+
+        On restaure donc le nom d'origine juste apres l'ecriture.
+        """
         try:
             project = QgsProject.instance()
             if project.layerTreeRoot().children():  # has content worth saving
+                nom_avant = project.fileName()
                 project.write("/data/.autosave.qgz")
+                if nom_avant and project.fileName() != nom_avant:
+                    project.setFileName(nom_avant)
         except Exception:
             pass  # never fail on autosave
 
@@ -537,9 +551,24 @@ class QGISBridge:
             exec(code, exec_globals)
             stdout = captured.getvalue()
 
+            # Recupere le resultat DEPUIS l'espace du script.
+            #
+            # `result = {...}` -- la facon naturelle d'ecrire, et celle que
+            # suggere la doc de l'outil -- rebind le nom dans exec_globals et
+            # laisse intact le dict cree ici. On relisait donc notre objet
+            # d'origine, reste vide : le script repondait `success: true` avec
+            # un resultat vide, sans le moindre avertissement. L'appelant se
+            # croyait servi et n'avait rien. On accepte desormais les deux
+            # ecritures : mutation (`result["k"] = v`) et affectation.
+            produit = exec_globals.get("result", result)
+            if not isinstance(produit, dict):
+                # Un script qui affecte autre chose qu'un dict (liste, valeur)
+                # avait son retour perdu de la meme facon.
+                produit = {"valeur": produit}
+
             # Serialize result (handle non-JSON-serializable objects)
             serialized = {}
-            for k, v in result.items():
+            for k, v in produit.items():
                 try:
                     json.dumps(v)
                     serialized[k] = v
@@ -2401,26 +2430,88 @@ class QGISBridge:
             raise ValueError(f"Invalid characters in filename: {basename}")
         return basename
 
+    def _etude_active(self) -> str:
+        """Identifiant de l'etude ouverte (cf. `lire_etude_active`)."""
+        return lire_etude_active()
+
     def _action_list_files(self, params: dict) -> dict:
-        """List files in /data/ directory."""
-        directories = ["/data"]
+        """Liste des fichiers sous /data.
+
+        Deux defauts mesures le 2026-09-17 en se servant de l'assistant :
+
+        1. Le dossier de l'etude etait INATTEIGNABLE. Les donnees d'une etude
+           vivent dans /data/studies/{id}/data/, mais cette action ne regardait
+           que /data, sans recursion et sans accepter de dossier. A la question
+           « quels fichiers sont disponibles dans mon etude ? », l'assistant
+           repondait par le contenu de /data -- donc a cote.
+        2. Les vidages de plantage (core.*) noyaient la liste : six fichiers
+           pour 3,8 Go, sans aucune valeur pour l'utilisateur.
+
+        `directory` est desormais honore, borne a /data. Sans lui, on regarde
+        /data ET le dossier de donnees de l'etude active, qui est ce que
+        l'utilisateur appelle « mes fichiers ».
+        """
+        # Racine resolue : /data peut etre un lien symbolique, auquel cas la
+        # comparaison avec un chemin resolu echouerait et refuserait tout.
+        racine = Path("/data").resolve()
         pattern = params.get("pattern", "*")
-        results = []
-        for d in directories:
-            if not os.path.isdir(d):
+        recursif = bool(params.get("recursive", False))
+        demande = str(params.get("directory", "") or "").strip()
+        etude = self._etude_active()
+
+        if demande:
+            try:
+                cible = Path(demande).resolve()
+            except Exception as exc:
+                return {"error": f"Chemin illisible : {exc}"}
+            # Bornage : on ne sort pas de /data.
+            if cible != racine and racine not in cible.parents:
+                return {"error": f"Hors de /data : {cible}"}
+            if not cible.is_dir():
+                return {"error": f"Dossier introuvable : {cible}"}
+            dossiers = [cible]
+        else:
+            dossiers = [racine]
+            donnees_etude = racine / "studies" / etude / "data" if etude else None
+            if donnees_etude and donnees_etude.is_dir():
+                dossiers.append(donnees_etude)
+
+        # Les vidages de plantage ne sont ecartes que si l'appelant ne les
+        # cherche pas explicitement.
+        ecarter_plantages = not pattern.startswith("core")
+
+        resultats = []
+        ignores = 0
+        for d in dossiers:
+            if not d.is_dir():
                 continue
-            for fpath in sorted(Path(d).glob(pattern)):
-                if fpath.is_file():
-                    stat = fpath.stat()
-                    results.append({
-                        "path": str(fpath),
-                        "name": fpath.name,
-                        "size": stat.st_size,
-                        "modified": int(stat.st_mtime),
-                        "suffix": fpath.suffix,
-                        "directory": str(fpath.parent),
-                    })
-        return {"files": results, "count": len(results)}
+            chemins = d.rglob(pattern) if recursif else d.glob(pattern)
+            for fpath in sorted(chemins):
+                if not fpath.is_file():
+                    continue
+                if ecarter_plantages and fpath.name.startswith("core."):
+                    ignores += 1
+                    continue
+                stat = fpath.stat()
+                resultats.append({
+                    "path": str(fpath),
+                    "name": fpath.name,
+                    "size": stat.st_size,
+                    "modified": int(stat.st_mtime),
+                    "suffix": fpath.suffix,
+                    "directory": str(fpath.parent),
+                })
+
+        reponse = {
+            "files": resultats,
+            "count": len(resultats),
+            "directories": [str(d) for d in dossiers],
+        }
+        if etude:
+            reponse["etude_active"] = etude
+        if ignores:
+            reponse["vidages_de_plantage_ecartes"] = ignores
+        return reponse
 
     def _action_write_file(self, params: dict) -> dict:
         """Write base64-encoded content to /data/. Used by upload_file tool."""
@@ -5171,12 +5262,118 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
                 self._catalog_cache = {"sources": [], "categories": []}
         return self._catalog_cache
 
+    # ── Bases de donnees enregistrees dans QGIS ───────────────────
+
+    def _action_list_database_connections(self, params: dict) -> dict:
+        """Les connexions de base de donnees enregistrees DANS QGIS.
+
+        L'utilisateur declare sa base une fois, dans QGIS, comme il en a
+        l'habitude. Sans cette action, l'agent ne pouvait pas savoir qu'elle
+        existe : le fournisseur PostGIS etait bien la et le serveur joignable,
+        mais rien ne reliait les deux (constate le 2026-09-17).
+
+        Ne renvoie JAMAIS de mot de passe : seulement de quoi designer une
+        connexion et comprendre ce qu'elle contient.
+        """
+        from qgis.core import QgsProviderRegistry
+        registre = QgsProviderRegistry.instance()
+        avec_tables = bool(params.get("include_tables", False))
+        schema_demande = params.get("schema", "")
+
+        connexions = []
+        for fournisseur in ("postgres", "spatialite", "mssql", "oracle", "hana"):
+            try:
+                meta = registre.providerMetadata(fournisseur)
+                if meta is None:
+                    continue
+                noms = list(meta.connections(False).keys())
+            except Exception:
+                continue
+            for nom in noms:
+                entree = {"nom": nom, "fournisseur": fournisseur}
+                try:
+                    conn = meta.createConnection(nom, {})
+                    if avec_tables:
+                        schemas = []
+                        try:
+                            schemas = list(conn.schemas())
+                        except Exception:
+                            schemas = []
+                        entree["schemas"] = schemas
+                        cibles = [schema_demande] if schema_demande else schemas or [""]
+                        tables = []
+                        for sch in cibles[:5]:
+                            try:
+                                for t in conn.tables(sch):
+                                    tables.append({
+                                        "schema": sch,
+                                        "table": t.tableName(),
+                                        "geometrie": bool(t.geometryColumn()),
+                                    })
+                            except Exception:
+                                continue
+                        entree["tables"] = tables[:200]
+                except Exception as exc:
+                    entree["avertissement"] = (
+                        f"connexion declaree mais injoignable ({type(exc).__name__}) : "
+                        "verifier l'hote, les droits ou le mot de passe enregistre")
+                connexions.append(entree)
+
+        return {
+            "connexions": connexions,
+            "count": len(connexions),
+            "aide": ("Aucune connexion ? Declare-la dans QGIS (Couche > Ajouter une "
+                     "couche PostGIS > Nouveau), elle apparaitra ici. Puis charge une "
+                     "table avec add_database_layer(connexion, schema, table)."),
+        }
+
+    def _action_add_database_layer(self, params: dict) -> dict:
+        """Charge une table d'une connexion enregistree dans QGIS.
+
+        On s'appuie sur la connexion telle que l'utilisateur l'a declaree :
+        aucun identifiant n'est demande ni stocke ici.
+        """
+        from qgis.core import QgsProviderRegistry
+        nom = params.get("connexion") or params.get("connection") or ""
+        table = params.get("table", "")
+        if not nom or not table:
+            return {"error": "connexion et table sont requis. "
+                             "Utilise list_database_connections pour les connaitre."}
+        fournisseur = params.get("fournisseur") or params.get("provider") or "postgres"
+        schema = params.get("schema", "public")
+
+        registre = QgsProviderRegistry.instance()
+        meta = registre.providerMetadata(fournisseur)
+        if meta is None:
+            return {"error": f"Fournisseur inconnu : {fournisseur}"}
+        try:
+            conn = meta.createConnection(nom, {})
+        except Exception as exc:
+            return {"error": f"Connexion « {nom} » introuvable ou injoignable : {exc}"}
+
+        try:
+            uri = conn.tableUri(schema, table)
+        except Exception as exc:
+            return {"error": f"Table {schema}.{table} introuvable dans « {nom} » : {exc}"}
+
+        nom_affiche = params.get("name") or table
+        layer = QgsVectorLayer(uri, nom_affiche, fournisseur)
+        if not layer.isValid():
+            return {"error": f"Couche invalide pour {schema}.{table} (via « {nom} »)",
+                    "uri_sans_identifiants": uri.split("password=")[0]}
+        return self._finalize_add_layer(layer)
+
     def _action_list_datasources(self, params: dict) -> dict:
         """List available data sources from catalog, optionally filtered."""
         catalog = self._load_datasources_catalog()
         category = params.get("category", "")
         search = params.get("search", "").lower()
-        sources = catalog.get("sources", [])
+        # Le catalogue porte des pseudo-entrees `_comment` qui servent a le
+        # decouper en sections lisibles. Elles n'ont pas d'`id`, donc rien ne
+        # peut les charger -- mais elles etaient renvoyees ET comptees : le
+        # catalogue annoncait 54 sources pour 49 reelles, et l'appelant
+        # recevait des objets qu'aucun outil n'accepte.
+        sources = [s for s in catalog.get("sources", []) if s.get("id")]
         if category:
             sources = [s for s in sources if s.get("category") == category]
         if search:
@@ -5334,6 +5531,30 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
             )
             result["source_id"] = source_id
             result["method"] = "download"
+
+            # Emprise reellement chargee vs zone d'etude declaree.
+            #
+            # Une emprise explicite prend le pas sur la zone, en silence : on
+            # pouvait donc travailler sur Marseille avec une zone « Saint-Martin »
+            # sans que rien ne le dise, ni a l'agent ni a l'utilisateur.
+            if bbox:
+                try:
+                    zone = qgis_helpers.get_study_zone()
+                    zb = zone.get("bbox_4326") if isinstance(zone, dict) else None
+                    if zb and len(zb) == 4:
+                        disjoint = (bbox[2] < zb[0] or bbox[0] > zb[2]
+                                    or bbox[3] < zb[1] or bbox[1] > zb[3])
+                        nom = zone.get("name") or "zone d'etude"
+                        if disjoint:
+                            result["avertissement"] = (
+                                f"L'emprise demandee est HORS de la zone d'etude "
+                                f"« {nom} » : les donnees chargees ne la concernent "
+                                f"pas. Corrige l'emprise, ou redefinis la zone.")
+                        else:
+                            result["zone_etude"] = nom
+                            result["emprise_utilisee"] = "bbox explicite (la zone d'etude n'a pas servi)"
+                except Exception:
+                    pass
             return result
 
         # Raster (WMS/WMTS/XYZ) → delegate to existing catalog handler
@@ -5996,6 +6217,20 @@ def _configure_environment():
         traceback.print_exc()
 
 
+def lire_etude_active() -> str:
+    """Identifiant de l'etude ouverte, lu dans la sentinelle ecrite par le hub.
+
+    Chaine vide si aucune etude n'est active ou si la sentinelle est illisible.
+    """
+    try:
+        sentinelle = Path("/data/.active_study")
+        if sentinelle.is_file():
+            return sentinelle.read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
+    return ""
+
+
 def _zoom_to_valid_layers(iface):
     """Frame the canvas on layers that actually have an extent.
 
@@ -6073,14 +6308,11 @@ def _open_startup_project():
         # Active study takes precedence over the env var: it reflects what the
         # user is actually working on, the env var only a boot-time default.
         try:
-            sentinel = "/data/.active_study"
-            if os.path.isfile(sentinel):
-                with open(sentinel, encoding="utf-8") as fh:
-                    sid = fh.read().strip()
-                candidate = f"/data/studies/{sid}/project.qgz"
-                if sid and os.path.isfile(candidate):
-                    project_path = candidate
-                    print(f"[QGISBridge] Active study {sid} -> {candidate}")
+            sid = lire_etude_active()
+            candidate = f"/data/studies/{sid}/project.qgz"
+            if sid and os.path.isfile(candidate):
+                project_path = candidate
+                print(f"[QGISBridge] Active study {sid} -> {candidate}")
         except Exception as exc:
             print(f"[QGISBridge] Could not read active study sentinel: {exc}")
 

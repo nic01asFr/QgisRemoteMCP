@@ -32,7 +32,7 @@ from qgis.core import (
     QgsRectangle, QgsPointXY, QgsFeature, QgsGeometry,
     QgsField, QgsFields, QgsExpressionContextUtils,
 )
-from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt.QtCore import QVariant, Qt
 import qgis.utils
 
 # ── Configuration ─────────────────────────────────────────────
@@ -55,6 +55,47 @@ def _canvas():
     return iface.mapCanvas() if iface else None
 
 
+def _alleger_le_contour_si_couche_dense(layer, seuil=5000):
+    """Retire le contour des polygones quand ils sont trop nombreux.
+
+    Le style par defaut de QGIS trace un contour autour de chaque polygone. A
+    l'echelle d'une ville, ce contour devient plus epais que le polygone
+    lui-meme : 52 000 batiments charges sur Marseille s'affichaient en un pave
+    noir uniforme (mesure du 2026-09-17), illisible pour l'utilisateur comme
+    pour l'agent qui en prend une capture.
+
+    On n'intervient que sur le style PAR DEFAUT (symbole unique) d'une couche
+    de polygones dense : un style pose par l'utilisateur ou par l'agent
+    (categorise, gradue) n'est jamais touche.
+    """
+    try:
+        if not isinstance(layer, QgsVectorLayer) or not layer.isValid():
+            return False
+        from qgis.core import QgsWkbTypes, QgsSingleSymbolRenderer
+        if QgsWkbTypes.geometryType(layer.wkbType()) != QgsWkbTypes.PolygonGeometry:
+            return False
+        if layer.featureCount() < seuil:
+            return False
+        renderer = layer.renderer()
+        if not isinstance(renderer, QgsSingleSymbolRenderer):
+            return False
+        symbole = renderer.symbol()
+        if symbole is None or symbole.symbolLayerCount() == 0:
+            return False
+        couche_symbole = symbole.symbolLayer(0)
+        if hasattr(couche_symbole, "setStrokeStyle"):
+            couche_symbole.setStrokeStyle(Qt.NoPen)
+            layer.triggerRepaint()
+            return True
+    except Exception:
+        pass  # le rendu n'est jamais une raison de faire echouer un chargement
+    return False
+
+
+# Au-dela, une couche WFS servie en direct fige QGIS au rendu.
+_SEUIL_WFS_INGERABLE = 100_000
+
+
 def _finalize_layer(layer):
     """Add layer to project with auto CRS adapt, zoom on first layer.
     Replicates QGISBridge._finalize_add_layer pattern."""
@@ -68,12 +109,46 @@ def _finalize_layer(layer):
 
     project.addMapLayer(layer)
 
-    # Auto-zoom on first layer (no refresh — caller controls rendering)
+    _alleger_le_contour_si_couche_dense(layer)
+
+    # Cadrage : la carte doit suivre les donnees qu'on vient de charger.
+    #
+    # L'ancienne regle ne cadrait que sur la TOUTE PREMIERE couche. Or un fond
+    # de carte mondial est presque toujours charge en premier : le canevas
+    # restait donc sur le monde entier, et chaque chargement suivant renvoyait
+    # `zoomed: false`. Mesure : 52 000 batiments charges, la carte ne bougeait
+    # pas -- l'utilisateur voyait la planete, et l'agent une capture inutile.
+    #
+    # On cadre desormais aussi quand la vue courante ne montre pas les
+    # donnees : soit elles sont hors champ, soit elles y sont noyees (moins
+    # d'un centieme de la surface affichee). Si la vue est deja au bon endroit,
+    # on n'y touche pas -- deplacer la carte sous les yeux de quelqu'un qui
+    # travaille serait pire que de ne rien faire.
     zoomed = False
     canvas = _canvas()
-    if is_first and canvas and layer.extent() and not layer.extent().isEmpty():
-        canvas.setExtent(layer.extent())
-        zoomed = True
+    emprise = layer.extent() if layer else None
+    if canvas and emprise is not None and not emprise.isEmpty():
+        if is_first:
+            canvas.setExtent(emprise)
+            zoomed = True
+        else:
+            emprise_vue = None
+            try:
+                transformation = QgsCoordinateTransform(
+                    layer.crs(), project.crs(), project)
+                emprise_vue = transformation.transformBoundingBox(emprise)
+            except Exception:
+                emprise_vue = None
+            vue = canvas.extent()
+            if (emprise_vue is not None and not emprise_vue.isEmpty()
+                    and vue is not None and not vue.isEmpty()):
+                hors_champ = not vue.intersects(emprise_vue)
+                aire_vue = vue.width() * vue.height()
+                aire_donnees = emprise_vue.width() * emprise_vue.height()
+                noyee = aire_vue > 0 and (aire_donnees / aire_vue) < 0.01
+                if hors_champ or noyee:
+                    canvas.setExtent(emprise_vue)
+                    zoomed = True
     # NOTE: canvas.refresh() intentionally NOT called here.
     # Each layer add was triggering a full re-render including
     # WMS GetCapabilities requests, causing crashes with 5+ layers.
@@ -96,6 +171,27 @@ def _finalize_layer(layer):
         pass
     if isinstance(layer, QgsVectorLayer):
         result["feature_count"] = layer.featureCount()
+        # Une couche WFS reste servie par le serveur : ce que QGIS rapporte
+        # est le total annonce par le service, pas ce que la zone contient.
+        # Mesure du 2026-09-17 : « 51 450 444 entites » pour les batiments
+        # de la BD TOPO sur Marseille -- le total national, et une couche
+        # que QGIS ne peut pas afficher. Dit tel quel, c'est trompeur pour
+        # l'utilisateur comme pour le modele.
+        try:
+            if layer.providerType() == "WFS":
+                result["feature_count_signification"] = (
+                    "total annonce par le service WFS, pas le nombre dans la "
+                    "zone d'etude"
+                )
+                if layer.featureCount() > _SEUIL_WFS_INGERABLE:
+                    result["avertissement"] = (
+                        "Couche WFS trop volumineuse pour etre affichee telle "
+                        "quelle : QGIS se fige en tentant de la rendre. "
+                        "Utilise smart_load, qui telecharge la zone en "
+                        "GeoPackage local."
+                    )
+        except Exception:
+            pass
         result["geometry_type"] = (layer.geometryType().name
                                    if hasattr(layer.geometryType(), 'name')
                                    else str(layer.geometryType()))
@@ -837,11 +933,17 @@ def set_study_zone(target, buffer_km=2):
     project = _project()
     zone_name = ""
     bbox_4326 = None
+    # Comment la zone a ete obtenue. Sans cette trace, l'utilisateur ne peut
+    # pas savoir si « Marseille » a donne l'emprise de la commune ou un point
+    # entoure d'un tampon -- deux resultats tres differents pour la meme
+    # demande, et l'une des incomprehensions les plus frequentes.
+    methode = "inconnue"
 
     if isinstance(target, (list, tuple)) and len(target) == 4:
         # Explicit bbox
         bbox_4326 = [float(x) for x in target]
         zone_name = f"Zone [{bbox_4326[0]:.2f},{bbox_4326[1]:.2f}]"
+        methode = "emprise fournie directement"
 
     elif isinstance(target, dict):
         # Point dict
@@ -852,6 +954,7 @@ def set_study_zone(target, buffer_km=2):
         bbox_4326 = [lon - buf_deg_lon, lat - buf_deg_lat,
                      lon + buf_deg_lon, lat + buf_deg_lat]
         zone_name = f"Point ({lon:.4f}, {lat:.4f})"
+        methode = f"point fourni, elargi d'un tampon de {buffer_km} km"
 
     elif isinstance(target, str):
         # Try commune first (precise bbox), then geocode
@@ -862,6 +965,7 @@ def set_study_zone(target, buffer_km=2):
                 and all(isinstance(v, (int, float)) for v in commune_bbox)):
             bbox_4326 = [float(v) for v in commune_bbox]
             zone_name = commune.get("nom", target)
+            methode = "emprise administrative de la commune (tampon non applique)"
         elif "error" not in commune and "lon" in commune:
             # Use commune center with buffer
             lon, lat = float(commune["lon"]), float(commune["lat"])
@@ -870,6 +974,7 @@ def set_study_zone(target, buffer_km=2):
             bbox_4326 = [lon - buf_deg_lon, lat - buf_deg_lat,
                          lon + buf_deg_lon, lat + buf_deg_lat]
             zone_name = commune.get("nom", target)
+            methode = f"centre de la commune, elargi d'un tampon de {buffer_km} km"
         else:
             geo = geocode(target)
             if "error" in geo:
@@ -880,6 +985,7 @@ def set_study_zone(target, buffer_km=2):
             bbox_4326 = [lon - buf_deg_lon, lat - buf_deg_lat,
                          lon + buf_deg_lon, lat + buf_deg_lat]
             zone_name = geo.get("label", target)
+            methode = f"adresse geocodee, elargie d'un tampon de {buffer_km} km"
     else:
         return {"error": f"Invalid target type: {type(target).__name__}. "
                 "Use string, list [xmin,ymin,xmax,ymax], or dict {{lon, lat}}."}
@@ -912,11 +1018,24 @@ def set_study_zone(target, buffer_km=2):
     center_4326 = [(bbox_4326[0] + bbox_4326[2]) / 2,
                    (bbox_4326[1] + bbox_4326[3]) / 2]
 
+    # Dimensions reelles, calculees en metrique (EPSG:2154) et non en degres.
+    largeur_km = round((bbox_2154[2] - bbox_2154[0]) / 1000.0, 1)
+    hauteur_km = round((bbox_2154[3] - bbox_2154[1]) / 1000.0, 1)
+
     return {
         "name": zone_name,
         "bbox_4326": bbox_4326,
         "bbox_2154": bbox_2154,
         "center_4326": center_4326,
+        # La reponse ne disait que des bbox brutes. Une phrase dit ce qui a ete
+        # fait, avec des unites lisibles : c'est ce que l'agent peut reprendre
+        # tel quel pour l'utilisateur.
+        "methode": methode,
+        "largeur_km": largeur_km,
+        "hauteur_km": hauteur_km,
+        "resume": (f"Zone d'etude : {zone_name} — {largeur_km} x {hauteur_km} km "
+                   f"({methode}). La carte est cadree dessus, et les prochains "
+                   f"chargements s'y limiteront sauf emprise explicite."),
     }
 
 

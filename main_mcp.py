@@ -168,7 +168,19 @@ def qgis_command(action: str, params: dict = None, timeout: int = None) -> dict:
     url = f"{base_url}/api/command"
     try:
         with httpx.Client(timeout=effective_timeout) as client:
-            resp = client.post(url, json={"action": action, "params": params or {}})
+            # Le delai voyage avec la commande. Sans lui, l'api_server
+            # appliquait son propre plafond de 30 s : SOCKET_TIMEOUT_LONG ne
+            # servait donc a rien, et toute operation longue (smart_load,
+            # export_flood_map, export_qfield, export_grist...) echouait en
+            # 504 au bout de 30 s. Mesure du 2026-09-17 : charger les
+            # batiments de la BD TOPO sur Marseille echouait toujours, et
+            # l'agent se rabattait sur une couche WFS de 51 M d'entites qui
+            # figeait QGIS.
+            resp = client.post(url, json={
+                "action": action,
+                "params": params or {},
+                "timeout": effective_timeout,
+            })
             resp.raise_for_status()
             return resp.json()
     except httpx.TimeoutException:
@@ -377,6 +389,33 @@ TOOLS = [
         }
     },
     {
+        "name": "list_database_connections",
+        "description": "Liste les connexions de base de donnees ENREGISTREES DANS QGIS (PostGIS, SpatiaLite...). L'utilisateur declare sa base une fois dans QGIS (Couche > Ajouter une couche PostGIS > Nouveau) ; cet outil la lui rend visible et utilisable. Ne renvoie aucun mot de passe. Mettre include_tables=true pour lister aussi les tables.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "include_tables": {"type": "boolean", "description": "Lister aussi schemas et tables (plus lent : ouvre la connexion)", "default": False},
+                "schema": {"type": "string", "description": "Limiter la liste des tables a ce schema", "default": ""}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "add_database_layer",
+        "description": "Charge une table d'une connexion de base enregistree dans QGIS. Utiliser list_database_connections d'abord pour connaitre les noms. Aucun identifiant n'est demande : on reutilise la connexion telle que l'utilisateur l'a declaree.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "connexion": {"type": "string", "description": "Nom de la connexion tel qu'enregistre dans QGIS"},
+                "table": {"type": "string", "description": "Nom de la table"},
+                "schema": {"type": "string", "description": "Schema (PostGIS)", "default": "public"},
+                "fournisseur": {"type": "string", "description": "postgres, spatialite, mssql, oracle, hana", "default": "postgres"},
+                "name": {"type": "string", "description": "Nom d'affichage de la couche", "default": ""}
+            },
+            "required": ["connexion", "table"]
+        }
+    },
+    {
         "name": "add_layer",
         "description": "Add a layer to the QGIS project. Supports vector (GeoJSON, SHP, GPKG), raster (GeoTIFF, COG), WFS, WMS.",
         "inputSchema": {
@@ -543,11 +582,18 @@ TOOLS = [
     },
     {
         "name": "list_files",
-        "description": "List files in the QGIS container's /data/ directory.",
+        "description": (
+            "List files under /data/. With no `directory`, lists /data AND the "
+            "active study's data folder (/data/studies/{id}/data) -- what the "
+            "user calls 'my files'. Crash dumps (core.*) are left out unless "
+            "the pattern asks for them."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "pattern": {"type": "string", "description": "Glob pattern (default '*')", "default": "*"}
+                "pattern": {"type": "string", "description": "Glob pattern (default '*')", "default": "*"},
+                "directory": {"type": "string", "description": "Folder to list, must be under /data (e.g. /data/studies/<id>/data)"},
+                "recursive": {"type": "boolean", "description": "Descend into subfolders (default false)", "default": False}
             },
             "required": []
         }
@@ -639,7 +685,7 @@ TOOLS = [
             "properties": {
                 "id": {"type": "string", "description": "Catalog source ID (e.g. 'bdtopo_batiments', 'osm_xyz'). Use list_datasources to see available IDs."},
                 "bbox": {"type": "array", "items": {"type": "number"}, "description": "Optional [xmin,ymin,xmax,ymax] in EPSG:4326. Auto from study zone if not provided."},
-                "max_features": {"type": "integer", "description": "Max features for WFS download (default 10000)", "default": 10000},
+                "max_features": {"type": "integer", "description": "Plafond FACULTATIF du nombre d'entites. Par defaut AUCUN plafond : c'est l'emprise (bbox ou zone d'etude) qui borne le volume, et la pagination ogr2ogr rapatrie tout (52 000 entites / 39 Mo mesures). Ne poser ce parametre que pour brider volontairement un chargement."},
                 "name": {"type": "string", "description": "Override display name", "default": ""}
             },
             "required": ["id"]
@@ -1359,7 +1405,16 @@ def _tool_download_file(arguments: dict) -> dict:
 
 
 def _tool_list_files(arguments: dict) -> dict:
-    response = qgis_command("list_files", {"pattern": arguments.get("pattern", "*")})
+    # `directory` etait declare nulle part et jete ici : le dossier d'une
+    # etude (/data/studies/{id}/data) restait donc inatteignable, et a la
+    # question « quels fichiers dans mon etude ? » l'assistant repondait par
+    # le contenu de /data. Mesure du 2026-09-17.
+    charge = {"pattern": arguments.get("pattern", "*")}
+    if arguments.get("directory"):
+        charge["directory"] = arguments["directory"]
+    if arguments.get("recursive"):
+        charge["recursive"] = True
+    response = qgis_command("list_files", charge)
     return {"content": _text(response, indent=2)}
 
 
@@ -1386,6 +1441,28 @@ def _tool_delete_file(arguments: dict) -> dict:
         return _error(err)
     response = qgis_command("delete_file", {"path": arguments["path"]})
     return {"content": _text(response)}
+
+
+def _tool_list_database_connections(arguments: dict) -> dict:
+    response = qgis_command("list_database_connections", {
+        "include_tables": arguments.get("include_tables", False),
+        "schema": arguments.get("schema", ""),
+    })
+    return {"content": _text(response, indent=2)}
+
+
+def _tool_add_database_layer(arguments: dict) -> dict:
+    err = _validate_required(arguments, "connexion") or _validate_required(arguments, "table")
+    if err:
+        return _error(err)
+    response = qgis_command("add_database_layer", {
+        "connexion": arguments["connexion"],
+        "table": arguments["table"],
+        "schema": arguments.get("schema", "public"),
+        "fournisseur": arguments.get("fournisseur", "postgres"),
+        "name": arguments.get("name", ""),
+    })
+    return {"content": _text(response, indent=2)}
 
 
 def _tool_list_datasources(arguments: dict) -> dict:
@@ -2006,6 +2083,8 @@ TOOL_HANDLERS = {
     "download_project": _tool_download_project,
     "delete_file": _tool_delete_file,
     "list_datasources": _tool_list_datasources,
+    "list_database_connections": _tool_list_database_connections,
+    "add_database_layer": _tool_add_database_layer,
     "add_from_catalog": _tool_add_from_catalog,
     "set_study_zone": _tool_set_study_zone,
     "get_study_zone": _tool_get_study_zone,
