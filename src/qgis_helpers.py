@@ -1069,6 +1069,13 @@ def get_study_zone():
 
 # ── Smart Download ───────────────────────────────────────────
 
+# Delais du telechargement WFS, en secondes. Reglables, parce que le cout
+# depend de l'emprise : 204 s mesurees pour les 300 551 batiments de
+# Marseille, quand le plafond etait de 180 s.
+_DELAI_TELECHARGEMENT = int(os.environ.get("WFS_DELAI_TELECHARGEMENT", "600"))
+_DELAI_REPROJECTION = int(os.environ.get("WFS_DELAI_REPROJECTION", "300"))
+
+
 def download_wfs_ogr(url, typename, bbox_4326=None, output_path=None,
                      native_crs="EPSG:2154", max_features=None, name=None):
     """Download WFS features as local GeoPackage via ogr2ogr.
@@ -1150,10 +1157,21 @@ def download_wfs_ogr(url, typename, bbox_4326=None, output_path=None,
         cmd += ["-limit", str(max_features)]
 
     # 5. Execute download
+    #
+    # Le delai etait de 180 s. Mesure le 2026-09-18 sur l'emprise de
+    # Marseille : 204 s pour 300 551 batiments -- une ville entiere depassait
+    # donc le plafond, et le chargement echouait sans que la taille soit en
+    # cause. L'agent se rabattait alors sur du code ecrit a la main, qui
+    # retombait dans le piege GDAL contourne ici (`-spat` avec `-t_srs`
+    # rend zero entite), et tournait en rond.
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=180)
+        proc = subprocess.run(cmd, capture_output=True, timeout=_DELAI_TELECHARGEMENT)
     except subprocess.TimeoutExpired:
-        return {"error": "ogr2ogr download timed out after 180s. Try a smaller bbox or fewer features."}
+        return {"error": (
+            f"Le telechargement a depasse {_DELAI_TELECHARGEMENT} s. "
+            f"L'emprise demandee est probablement tres vaste : reduis-la, "
+            f"ou passe par execute_async pour ne pas bloquer."
+        )}
     except FileNotFoundError:
         return {"error": "ogr2ogr not found. GDAL may not be installed in the container."}
 
@@ -1172,9 +1190,12 @@ def download_wfs_ogr(url, typename, bbox_4326=None, output_path=None,
             "-t_srs", native_crs, "-overwrite",
         ]
         try:
-            proc2 = subprocess.run(cmd2, capture_output=True, timeout=60)
+            proc2 = subprocess.run(cmd2, capture_output=True, timeout=_DELAI_REPROJECTION)
         except subprocess.TimeoutExpired:
-            return {"error": "ogr2ogr reproject timed out after 60s."}
+            return {"error": (
+                f"La reprojection a depasse {_DELAI_REPROJECTION} s "
+                f"(le telechargement, lui, avait abouti)."
+            )}
         finally:
             # Clean up temp file
             if os.path.exists(dl_path):
@@ -1199,6 +1220,21 @@ def download_wfs_ogr(url, typename, bbox_4326=None, output_path=None,
     result = _finalize_layer(layer)
     result["path"] = output_path
     result["cached"] = False
+
+    # Un telechargement qui ne ramene rien n'est pas une reussite.
+    #
+    # ogr2ogr rend 0 (succes) meme quand le service n'a renvoye aucune
+    # entite : le fichier existe, il est valide, il est vide. Sans ce
+    # signal, l'appelant croit avoir charge la donnee, l'agent enchaine sur
+    # une analyse qui ne porte sur rien, et personne ne comprend pourquoi le
+    # resultat est absurde. Mesure le 2026-09-18 : une emprise mal formee
+    # rendait « success » avec zero batiment, en trois secondes.
+    if not result.get("feature_count"):
+        result["avertissement"] = (
+            "Aucune entite dans l'emprise demandee. Le service a repondu, "
+            "mais n'a rien renvoye : verifie l'emprise (ordre des "
+            "coordonnees, zone hors couverture) avant de poursuivre."
+        )
     result["download_size_mb"] = round(os.path.getsize(output_path) / 1048576, 2)
     return result
 

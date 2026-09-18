@@ -377,3 +377,52 @@ def test_la_consigne_de_contournement_a_disparu():
     assert "NE PAS donner ce download_url" not in _MCP
     # Et on dit desormais quoi faire pour les livrables.
     assert "figure AUSSI dans" in _MCP or "figurer AUSSI dans" in _MCP
+
+
+# ── 12. Charger une ville entiere, et savoir quand on n'a rien charge ────
+#
+# Mesures du 2026-09-18 sur l'emprise de Marseille :
+#   * 300 551 batiments, telecharges en 204 s -- quand le plafond etait de
+#     180 s. Une ville entiere echouait donc, sans que la taille soit en
+#     cause : c'etait le delai.
+#   * `-spat` combine a `-t_srs` rend ZERO entite (bug GDAL deja contourne
+#     ici en separant telechargement et reprojection). L'agent, lui, se
+#     rabattait sur du code ecrit a la main qui retombait dedans -- d'ou les
+#     boucles d'essais observees en production.
+#   * ogr2ogr rend 0 (succes) sur un resultat vide : le fichier existe, il
+#     est valide, il ne contient rien.
+
+def test_le_delai_de_telechargement_couvre_une_ville():
+    bloc = _AIDES.split("def download_wfs_ogr")[1].split("\ndef ")[0]
+    assert "timeout=_DELAI_TELECHARGEMENT" in bloc
+    assert "timeout=180" not in bloc
+    assert "_DELAI_TELECHARGEMENT = int(" in _AIDES
+
+
+def test_le_delai_de_reprojection_est_proportionne():
+    bloc = _AIDES.split("def download_wfs_ogr")[1].split("\ndef ")[0]
+    assert "timeout=_DELAI_REPROJECTION" in bloc
+    assert "timeout=60)" not in bloc
+
+
+def test_les_delais_sont_reglables():
+    """Le cout depend de l'emprise : on doit pouvoir l'ajuster sans livrer."""
+    assert 'os.environ.get("WFS_DELAI_TELECHARGEMENT"' in _AIDES
+    assert 'os.environ.get("WFS_DELAI_REPROJECTION"' in _AIDES
+
+
+def test_un_telechargement_vide_est_signale():
+    bloc = _AIDES.split("def download_wfs_ogr")[1].split("\ndef ")[0]
+    assert 'if not result.get("feature_count"):' in bloc
+    assert "avertissement" in bloc
+    assert "Aucune entite" in bloc
+
+
+def test_le_contournement_du_piege_gdal_reste_en_place():
+    """Verrou : `-spat` avec `-t_srs` rend zero entite. Mesure, deux fois."""
+    bloc = _AIDES.split("def download_wfs_ogr")[1].split("\ndef ")[0]
+    # Le telechargement ne doit PAS porter -t_srs ; la reprojection est a part.
+    telechargement = bloc.split("# 5. Execute download")[0]
+    assert '"-spat"' in telechargement
+    assert '"-t_srs"' not in telechargement
+    assert "need_reproject" in bloc
