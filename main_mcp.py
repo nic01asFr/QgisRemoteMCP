@@ -291,7 +291,7 @@ TOOLS = [
     },
     {
         "name": "execute_python",
-        "description": "Execute Python/PyQGIS code inside the running QGIS instance. The script has access to qgis.core.*, iface, processing.run(), project = QgsProject.instance(), canvas = iface.mapCanvas(). A `helpers` module is available with ready-made functions: helpers.geocode(addr), helpers.add_wfs(url, typename, bbox), helpers.add_wms(url, layers), helpers.add_wmts(url, layers), helpers.add_xyz(url, name), helpers.zoom_to(target), helpers.create_point_layer(name, points), helpers.load_catalog_source(id), helpers.bbox_from_canvas(), helpers.search_commune(name), helpers.get_elevation(lon, lat). Store return values in the `result` dict. Read skill://helpers for full reference.",
+        "description": "Execute Python/PyQGIS code inside the running QGIS instance. The script has access to qgis.core.*, iface, processing.run(), project = QgsProject.instance(), canvas = iface.mapCanvas(). A `helpers` module is available with ready-made functions: helpers.geocode(addr), helpers.add_wfs(url, typename, bbox), helpers.add_wms(url, layers), helpers.add_wmts(url, layers), helpers.add_xyz(url, name), helpers.zoom_to(target), helpers.create_point_layer(name, points), helpers.load_catalog_source(id), helpers.bbox_from_canvas(), helpers.search_commune(name), helpers.get_elevation(lon, lat). Store return values in the `result` dict. Read skill://helpers for full reference. Les couches creees par le script recoivent un bloc `verification` (compte, emprise vs zone, origine) : lis-le. Avant d'ecrire du code, verifie qu'un outil ne couvre pas le besoin (smart_load, clip_to_study_zone, run_processing).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -456,7 +456,7 @@ TOOLS = [
     },
     {
         "name": "run_processing",
-        "description": "Execute a QGIS Processing algorithm. 1000+ algorithms from native, GDAL, GRASS, SAGA.",
+        "description": "Execute a QGIS Processing algorithm (~730: native, qgis, gdal, grass, 3d; no SAGA). Chaque couche produite recoit un bloc `verification` (compte, emprise vs zone, CRS, origine, avertissement). Une sortie TEMPORARY_OUTPUT reste en memoire : export_layer pour la garder. Pour decouper a la commune, prefere clip_to_study_zone.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -662,7 +662,7 @@ TOOLS = [
     # ── Study zone & smart load ─────────────────────────────────
     {
         "name": "set_study_zone",
-        "description": "Define the geographic study area. CALL THIS FIRST before loading WFS data. Geocodes the target, stores bbox in project variables (EPSG:4326 + EPSG:2154), and zooms the canvas. Subsequent smart_load calls auto-use this zone.",
+        "description": "Define the geographic study area. CALL THIS FIRST before loading WFS data. Geocodes the target, stores bbox in project variables (EPSG:4326 + EPSG:2154), and zooms the canvas. Subsequent smart_load calls auto-use this zone. Pour une commune ou un arrondissement (« Aix-en-Provence », « Marseille 4e »), le contour administratif est aussi memorise : clip_to_study_zone s'en sert. Une adresse, un point ou une emprise ne donnent qu'un rectangle.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -691,7 +691,7 @@ TOOLS = [
     },
     {
         "name": "smart_load",
-        "description": "Load data from the catalog. WFS sources are downloaded as local GeoPackage via ogr2ogr (automatic pagination, R-tree spatial index, fast for Processing). Raster sources (WMS/WMTS/XYZ) stream as usual. Use set_study_zone first to define the area, or provide a bbox. Il gere les grandes emprises : une ville entiere passe (300 551 batiments sur Marseille, mesure), le resultat est mis en cache 24 h et porte un index spatial. N'ecris JAMAIS ton propre telechargement WFS en execute_python : la combinaison `-spat` + `-t_srs` que tu ecrirais naturellement rend ZERO entite sans erreur, et cet outil contourne deja ce piege. Si le retour porte un `avertissement` disant qu'aucune entite n'a ete trouvee, ne poursuis pas l'analyse : verifie l'emprise.",
+        "description": "Load data from the catalog. WFS sources are downloaded as local GeoPackage via ogr2ogr (automatic pagination, R-tree spatial index, fast for Processing). Raster sources (WMS/WMTS/XYZ) stream as usual. Use set_study_zone first to define the area, or provide a bbox. Il gere les grandes emprises : une ville entiere passe (300 551 batiments sur Marseille, mesure), le resultat est mis en cache 24 h et porte un index spatial. N'ecris JAMAIS ton propre telechargement WFS en execute_python : la combinaison `-spat` + `-t_srs` que tu ecrirais naturellement rend ZERO entite sans erreur, et cet outil contourne deja ce piege. Si le retour porte un `avertissement` disant qu'aucune entite n'a ete trouvee, ne poursuis pas l'analyse : verifie l'emprise. Lis le bloc `verification` (compte local, emprise vs zone) avant tout chiffre. Le chargement couvre un rectangle : pour un chiffre dans la commune, clip_to_study_zone ensuite.",
         "inputSchema": {
             "type": "object",
             "properties": {
