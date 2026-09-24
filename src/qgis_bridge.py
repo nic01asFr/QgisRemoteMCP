@@ -59,6 +59,10 @@ import qgis.utils
 
 processing = None  # Lazy-loaded (voir _ensure_processing_providers ci-dessous)
 
+# Au-dela de ce rapport entre l'emprise chargee et celle de la zone d'etude,
+# le chargement n'a pas ete borne par la zone (cf. _verification_chargement).
+_RATIO_EMPRISE_ABERRANTE = 25
+
 # --- Providers Processing : controle, et non plus mecanisme ---------
 # Historique. QGIS etait lance avec `--noplugins` (supervisord.conf), present
 # depuis le commit initial. Le drapeau empechait le chargement du plugin
@@ -5557,38 +5561,42 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
         layer = None
 
         if src_type == "wfs":
-            # Auto-derive bbox from canvas if not provided
+            # Une source WFS n'est plus servie en direct : elle est telechargee
+            # dans l'emprise, comme par smart_load.
+            #
+            # Mesure du 2026-09-24 (scenario « bati sur Aix-en-Provence ») :
+            # la couche WFS creee ici annoncait 51 450 444 entites en EPSG:4326,
+            # emprise France et outre-mer. Le provider WFS de QGIS ne connait
+            # pas de cle `bbox` dans son URI : elle etait ignoree sans erreur.
+            # La garde « couche WFS ingerable » ne s'appliquait pas non plus,
+            # elle vit dans qgis_helpers._finalize_layer que ce chemin
+            # n'empruntait pas. L'agent comptait donc la France entiere.
             if not bbox:
-                if self.iface and self.iface.mapCanvas():
-                    canvas_ext = self.iface.mapCanvas().extent()
-                    if not canvas_ext.isEmpty():
-                        transform = QgsCoordinateTransform(
-                            QgsProject.instance().crs(),
-                            QgsCoordinateReferenceSystem("EPSG:4326"),
-                            QgsProject.instance()
-                        )
-                        ext_4326 = transform.transformBoundingBox(canvas_ext)
-                        bbox = [ext_4326.xMinimum(), ext_4326.yMinimum(),
-                                ext_4326.xMaximum(), ext_4326.yMaximum()]
-                if not bbox:
-                    return {"error": "WFS sources require a bbox. Zoom to an area first, or provide bbox [xmin,ymin,xmax,ymax] in EPSG:4326. Example: bbox=[2.3, 48.8, 2.4, 48.9] for central Paris."}
-            typename = src_params.get("typename", "")
-            srsname = src_params.get("srsname", "EPSG:4326")
-            uri = (f"url='{source['url']}' typename='{typename}' "
-                   f"srsname='{srsname}' "
-                   f"bbox='{bbox[1]},{bbox[0]},{bbox[3]},{bbox[2]}' "
-                   f"pagingEnabled='true'")
-            if params.get("max_features"):
-                uri += f" maxNumFeatures='{params['max_features']}'"
-            layer = QgsVectorLayer(uri, name, "WFS")
-            if not layer.isValid():
-                return {"error": f"Invalid WFS layer: {typename}", "uri": uri}
+                zone = self._zone_etude_bbox()
+                if zone is None:
+                    bbox = self._bbox_du_canevas()
+                if not bbox and zone is None:
+                    return {"error": "WFS sources require a bbox. Call set_study_zone first, or provide bbox [xmin,ymin,xmax,ymax] in EPSG:4326. Example: bbox=[2.3, 48.8, 2.4, 48.9] for central Paris."}
+            charge = self._action_smart_load({
+                "id": source_id,
+                "name": name,
+                "bbox": bbox,
+                "max_features": params.get("max_features"),
+            })
+            if "error" in charge:
+                return charge
             if params.get("sql_filter"):
-                if not layer.setSubsetString(params["sql_filter"]):
+                couche = QgsProject.instance().mapLayer(charge.get("layer_id", ""))
+                if couche is None or not couche.setSubsetString(params["sql_filter"]):
                     return {"error": f"Invalid filter: {params['sql_filter']}",
-                            "fields": [f.name() for f in layer.fields()]}
+                            "fields": [f.name() for f in couche.fields()] if couche else []}
+                charge["feature_count"] = couche.featureCount()
+            charge["success"] = True
+            charge["type"] = src_type
+            charge["via"] = "smart_load (telechargement GeoPackage dans l'emprise)"
+            return charge
 
-        elif src_type == "wms":
+        if src_type == "wms":
             layers_param = src_params.get("layers", "")
             fmt = src_params.get("format", "image/png")
             crs = src_params.get("crs", "EPSG:3857")
@@ -5636,6 +5644,73 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
 
     # ── Study Zone & Smart Load ───────────────────────────────────
 
+    @staticmethod
+    def _zone_etude_bbox():
+        """Emprise EPSG:4326 de la zone d'etude, ou None si aucune zone."""
+        import qgis_helpers
+        try:
+            zone = qgis_helpers.get_study_zone()
+        except Exception:
+            return None
+        zb = zone.get("bbox_4326") if isinstance(zone, dict) else None
+        return zb if zb and len(zb) == 4 else None
+
+    def _bbox_du_canevas(self):
+        """Emprise EPSG:4326 affichee par le canevas, ou None."""
+        if not (self.iface and self.iface.mapCanvas()):
+            return None
+        canvas_ext = self.iface.mapCanvas().extent()
+        if canvas_ext.isEmpty():
+            return None
+        transform = QgsCoordinateTransform(
+            QgsProject.instance().crs(),
+            QgsCoordinateReferenceSystem("EPSG:4326"),
+            QgsProject.instance()
+        )
+        ext_4326 = transform.transformBoundingBox(canvas_ext)
+        return [ext_4326.xMinimum(), ext_4326.yMinimum(),
+                ext_4326.xMaximum(), ext_4326.yMaximum()]
+
+    @staticmethod
+    def _verification_chargement(result: dict, couche, zone_bbox, zone_nom) -> dict:
+        """Ce que l'agent doit savoir du chargement avant d'en tirer un chiffre.
+
+        Le compte rendu est celui du GeoPackage local, pas celui annonce par
+        le service. L'emprise est celle du rectangle demande, jamais celle du
+        contour administratif : un compte « dans la commune » exige un
+        decoupage prealable.
+        """
+        verification = {
+            "feature_count": result.get("feature_count"),
+            "zone_etude": zone_nom,
+            "filtre": "rectangle (bbox) -- pas le contour administratif",
+            "suite": ("Pour une carte, la couche convient telle quelle. Pour un "
+                      "chiffre « dans la commune », decoupe d'abord au contour "
+                      "(native:clip avec la limite communale), puis compte."),
+        }
+        if couche is None:
+            return verification
+        emprise = couche.extent()
+        if emprise.isEmpty():
+            return verification
+        transformation = QgsCoordinateTransform(
+            couche.crs(), QgsCoordinateReferenceSystem("EPSG:4326"),
+            QgsProject.instance())
+        e = transformation.transformBoundingBox(emprise)
+        verification["emprise_4326"] = [round(e.xMinimum(), 5), round(e.yMinimum(), 5),
+                                         round(e.xMaximum(), 5), round(e.yMaximum(), 5)]
+        if zone_bbox:
+            aire_zone = (zone_bbox[2] - zone_bbox[0]) * (zone_bbox[3] - zone_bbox[1])
+            aire_couche = e.width() * e.height()
+            # Seuil large : ogr2ogr garde les entites qui touchent le
+            # rectangle, l'emprise deborde donc toujours un peu.
+            if aire_zone > 0 and aire_couche / aire_zone > _RATIO_EMPRISE_ABERRANTE:
+                verification["avertissement"] = (
+                    f"L'emprise chargee est {aire_couche / aire_zone:.0f} fois plus "
+                    f"vaste que la zone d'etude : ne presente aucun chiffre avant "
+                    f"d'avoir decoupe la couche a la zone.")
+        return verification
+
     def _action_set_study_zone(self, params: dict) -> dict:
         """Define the study zone. Geocodes target, stores bbox, zooms canvas."""
         import qgis_helpers
@@ -5682,6 +5757,14 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
             )
             result["source_id"] = source_id
             result["method"] = "download"
+            if "error" not in result:
+                zone_bbox = self._zone_etude_bbox()
+                zone_nom = None
+                if zone_bbox:
+                    zone_nom = qgis_helpers.get_study_zone().get("name")
+                result["verification"] = self._verification_chargement(
+                    result, QgsProject.instance().mapLayer(result.get("layer_id", "")),
+                    zone_bbox, zone_nom)
 
             # Emprise reellement chargee vs zone d'etude declaree.
             #

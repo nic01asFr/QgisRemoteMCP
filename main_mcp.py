@@ -648,13 +648,13 @@ TOOLS = [
     },
     {
         "name": "add_from_catalog",
-        "description": "Add a data source from the catalog by ID. WFS sources require a bbox. Use list_datasources to see available IDs.",
+        "description": "Add a data source from the catalog by ID. Prefer smart_load, which this tool now follows for WFS sources: the features are downloaded as a local GeoPackage limited to the bbox (or the study zone), never served live. Raster sources (WMS/WMTS/XYZ) stream. Use list_datasources to see available IDs.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "id": {"type": "string", "description": "Source ID from catalog (e.g. 'osm_xyz', 'bdtopo_batiments')"},
                 "name": {"type": "string", "description": "Override display name", "default": ""},
-                "bbox": {"type": "array", "items": {"type": "number"}, "description": "[xmin, ymin, xmax, ymax] in EPSG:4326 — required for WFS sources"}
+                "bbox": {"type": "array", "items": {"type": "number"}, "description": "[xmin, ymin, xmax, ymax] in EPSG:4326. Optional: the study zone is used when omitted."}
             },
             "required": ["id"]
         }
@@ -1482,7 +1482,8 @@ def _tool_add_from_catalog(arguments: dict) -> dict:
         params["name"] = arguments["name"]
     if arguments.get("bbox"):
         params["bbox"] = arguments["bbox"]
-    response = qgis_command("add_from_catalog", params)
+    # Une source WFS est telechargee comme par smart_load : meme delai.
+    response = qgis_command("add_from_catalog", params, timeout=SOCKET_TIMEOUT_LONG)
     content = _text(response)
     if response.get("success"):
         content += _auto_screenshot()
@@ -1802,7 +1803,7 @@ def _tool_publish_artifact(arguments: dict) -> dict:
 
 # Actions that need longer timeouts (WFS downloads, heavy exports)
 _LONG_TIMEOUT_ACTIONS = frozenset({
-    "smart_load", "export_flood_map", "export_web_map", "export_temporal_map", "export_qfield", "export_grist", "execute_python",
+    "smart_load", "add_from_catalog", "export_flood_map", "export_web_map", "export_temporal_map", "export_qfield", "export_grist", "execute_python",
 })
 
 
@@ -2164,7 +2165,7 @@ Use these instead of writing boilerplate. Read skill://helpers for full docs and
 
 ## Data catalog (pre-configured French national sources — free, no API key)
 - **list_datasources** — Browse available sources: IGN orthophotos, Plan IGN, BD TOPO (buildings, roads, rivers, communes...), OSM, cadastre, DEM, BAN geocoding, Panoramax. Filter by category or search.
-- **add_from_catalog** — Add a source by ID (e.g. `osm_xyz`, `bdtopo_batiments`). WFS requires a `bbox` [xmin,ymin,xmax,ymax] in EPSG:4326. Raster sources (WMS/WMTS/XYZ) work without bbox.
+- **add_from_catalog** — Add a source by ID (e.g. `osm_xyz`, `bdtopo_batiments`). Same path as smart_load for WFS (local GeoPackage within the bbox or the study zone). Prefer smart_load.
 
 ## File management
 - **upload_file** — Upload a file (base64) into the QGIS container /data/. Supports shapefiles, GeoJSON, GPKG, CSV, TIFF, project files.
