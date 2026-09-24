@@ -33,7 +33,14 @@ except ImportError:
 
 # ── Output directory ─────────────────────────────────────────────────
 SOLAR_DIR = Path("/data/solar")
-SOLAR_DIR.mkdir(exist_ok=True)
+# Le dossier n'est cree que si le volume /data est la. Hors conteneur (CI,
+# poste de dev), le creer sans condition faisait echouer l'import lui-meme
+# -- FileNotFoundError sur /data -- et avec lui les 10 tests purs du module
+# (position du soleil, profils, lecture de zone.json), qui n'ecrivent rien.
+# Dans le conteneur rien ne change ; un /data present mais non inscriptible
+# leve toujours, on ne masque que l'absence du volume.
+if SOLAR_DIR.parent.is_dir():
+    SOLAR_DIR.mkdir(exist_ok=True)
 
 # ── Linke turbidity by month (Mediterranean climate) ────────────────
 LINKE_MONTHLY = {
@@ -888,7 +895,18 @@ def _sun_pos(year, month, day, hour, minute, lat, lon):
 
 
 def _get_study_latlon():
-    """Read lat/lon from zone.json or QGIS project variables. Raises if unavailable."""
+    """Lit lat/lon du centre de la zone d'etude. Leve RuntimeError sinon.
+
+    Pas de fallback silencieux : sans centre connu, les positions solaires
+    seraient calculees pour de mauvaises coordonnees et les scores resteraient
+    faussement plausibles (correctif A4, 568596f).
+
+    La reecriture « pipeline v2 » (a1a0eba, une semaine apres) avait perdu la
+    moitie de ce correctif : les cles center_lat/center_lon, la reprojection
+    du centroide de bbox_2154 et le message explicite. Personne ne l'a vu,
+    parce que les tests qui le verrouillaient ne tournaient pas -- le module
+    ne s'importait pas hors conteneur. On garde ici les deux jeux de cles.
+    """
     zone_file = SOLAR_DIR / "zone.json"
     if zone_file.exists():
         z = json.load(open(zone_file))
@@ -896,6 +914,17 @@ def _get_study_latlon():
             return z["center_4326"][1], z["center_4326"][0]
         if "lat" in z:
             return z["lat"], z["lon"]
+        if "center_lat" in z and "center_lon" in z:
+            return float(z["center_lat"]), float(z["center_lon"])
+        if "bbox_2154" in z:
+            try:
+                from pyproj import Transformer
+                b = z["bbox_2154"]
+                t = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
+                lon, lat = t.transform((b[0] + b[2]) / 2, (b[1] + b[3]) / 2)
+                return float(lat), float(lon)
+            except ImportError:
+                pass  # pyproj absent : on essaie le projet, puis on echoue
     try:
         from qgis.core import QgsProject
         prj = QgsProject.instance()
@@ -905,7 +934,11 @@ def _get_study_latlon():
             return float(lat_s), float(lon_s)
     except Exception:
         pass
-    raise RuntimeError("Cannot determine study zone lat/lon. Call set_study_zone() first.")
+    raise RuntimeError(
+        "Impossible de determiner lat/lon de la zone d'etude. "
+        "Appeler set_study_zone() ou definir les variables projet "
+        "study_zone/center_lat,center_lon avant analyze_facades()."
+    )
 
 
 def _get_study_bbox():
