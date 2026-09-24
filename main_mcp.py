@@ -1807,6 +1807,28 @@ _LONG_TIMEOUT_ACTIONS = frozenset({
 })
 
 
+def _couches_avant_recette() -> list:
+    """Identifiants des couches presentes avant l'execution d'une recette."""
+    return qgis_command("verify_layers", {"layer_ids": []}).get("layer_ids", [])
+
+
+def _verification_recette(avant: list) -> dict:
+    """Bloc `verification` des couches creees par une recette.
+
+    Calcule par le pont sur l'etat FINAL du projet, une fois toutes les
+    etapes jouees : une couche creee puis retiree par une etape suivante
+    n'y figure pas, une couche restylee y figure avec sa donnee reelle.
+    """
+    verif = qgis_command("verify_layers", {"sauf": avant, "outil": "run_recipe"},
+                         timeout=SOCKET_TIMEOUT_LONG)
+    if "error" in verif:
+        return {"verification_erreur": verif["error"]}
+    retour = {"verification": verif.get("verification", [])}
+    if verif.get("verification_omise"):
+        retour["verification_omise"] = verif["verification_omise"]
+    return retour
+
+
 def _tool_run_recipe(arguments: dict) -> dict:
     """Execute a complete recipe in one shot — all steps sequentially."""
     err = _validate_required(arguments, "id", "zone")
@@ -1819,6 +1841,7 @@ def _tool_run_recipe(arguments: dict) -> dict:
     # 1. Optionally start a new project
     if arguments.get("new_project", True):
         qgis_command("new_project", {"title": f"{recipe_id} — {zone}"})
+    avant = _couches_avant_recette()
 
     # 2. Get the resolved recipe (with $zone substituted)
     recipe_params = {"id": recipe_id, "zone": zone}
@@ -1877,7 +1900,7 @@ def _tool_run_recipe(arguments: dict) -> dict:
         else:
             # Include key metrics from response (keep it compact)
             for key in ("feature_count", "layer_id", "name", "path",
-                        "download_url", "size", "stats"):
+                        "download_url", "size", "stats", "avertissement"):
                 if key in resp:
                     step_result[key] = resp[key]
             # For execute_python, include the result dict
@@ -1906,6 +1929,9 @@ def _tool_run_recipe(arguments: dict) -> dict:
         "steps": step_results,
         "outputs": recipe_resp.get("outputs", []),
     }
+    # Les sorties declarees sont des descriptions ; la verification porte sur
+    # les couches reellement creees.
+    response.update(_verification_recette(avant))
 
     return {"content": _text(response, indent=2) + _auto_screenshot()}
 
@@ -1951,6 +1977,7 @@ async def stream_run_recipe(arguments: dict, msg_id: Any, session_id: str,
     if arguments.get("new_project", True):
         await asyncio.to_thread(qgis_command, "new_project",
                                 {"title": f"{recipe_id} — {zone}"})
+    avant = await asyncio.to_thread(_couches_avant_recette)
 
     # 2. Resolve recipe
     recipe_params = {"id": recipe_id, "zone": zone}
@@ -2012,7 +2039,7 @@ async def stream_run_recipe(arguments: dict, msg_id: Any, session_id: str,
             step_result["error"] = resp.get("error", "Unknown error")
         else:
             for key in ("feature_count", "layer_id", "name", "path",
-                        "download_url", "size", "stats"):
+                        "download_url", "size", "stats", "avertissement"):
                 if key in resp:
                     step_result[key] = resp[key]
             if action == "execute_python" and "result" in resp:
@@ -2039,6 +2066,7 @@ async def stream_run_recipe(arguments: dict, msg_id: Any, session_id: str,
         "steps": results,
         "outputs": recipe_resp.get("outputs", []),
     }
+    response_data.update(await asyncio.to_thread(_verification_recette, avant))
 
     yield progress(total, total, f"Terminé — {succeeded}/{total} étapes réussies")
 

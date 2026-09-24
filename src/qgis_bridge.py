@@ -63,6 +63,20 @@ processing = None  # Lazy-loaded (voir _ensure_processing_providers ci-dessous)
 # le chargement n'a pas ete borne par la zone (cf. _verification_chargement).
 _RATIO_EMPRISE_ABERRANTE = 25
 
+# Controle des geometries dans le bloc `verification` : plafonne, parce qu'il
+# parcourt la couche entite par entite. Mesure indicative du 2026-09-24
+# (GEOS via shapely, hors QGIS) : 8 us par polygone de 5 a 20 sommets. La
+# lecture du GeoPackage et la conversion en GEOS s'y ajoutent dans QGIS :
+# au plafond, une couche reste de l'ordre de la seconde. Au-dela, le controle
+# est annonce « non calcule » plutot que de figer QGIS sur 300 000 batiments.
+_PLAFOND_VALIDATION_GEOMETRIES = 20_000
+# Meme borne pour l'ensemble des couches d'un seul appel (execute_python
+# peut en creer une dizaine).
+_BUDGET_VALIDATION_APPEL = 50_000
+# Nombre de blocs `verification` rendus par appel, comme la liste des couches
+# de la L2 de l'agent.
+_PLAFOND_VERIFICATIONS = 15
+
 # --- Providers Processing : controle, et non plus mecanisme ---------
 # Historique. QGIS etait lance avec `--noplugins` (supervisord.conf), present
 # depuis le commit initial. Le drapeau empechait le chargement du plugin
@@ -214,6 +228,9 @@ class QGISBridge:
     def __init__(self):
         self._lock = threading.Lock()
         self._started = time.time()
+        # Derniere verification de donnee (cf. _retenir_verification) : le
+        # contexte rendu a l'agent en tient compte pour dire quoi faire.
+        self._derniere_verification = None
 
     @property
     def iface(self):
@@ -556,6 +573,10 @@ class QGISBridge:
         # Auto-save before executing arbitrary code
         self._auto_save()
 
+        # Couches presentes avant le script : celles qu'il cree recevront un
+        # bloc `verification` (cf. _joindre_verification_des_nouvelles).
+        ids_avant = set(QgsProject.instance().mapLayers().keys())
+
         # Execution context
         iface = qgis.utils.iface
         result = {}
@@ -615,6 +636,7 @@ class QGISBridge:
 
         timer = threading.Timer(timeout, _timeout_killer)
         timer.start()
+        reponse = None
         try:
             exec(code, exec_globals)
             stdout = captured.getvalue()
@@ -643,19 +665,19 @@ class QGISBridge:
                 except (TypeError, ValueError):
                     serialized[k] = str(v)
 
-            return {
+            reponse = {
                 "success": True,
                 "result": serialized,
                 "stdout": stdout,
             }
         except TimeoutError:
-            return {
+            reponse = {
                 "success": False,
                 "error": f"Script exceeded {timeout}s timeout",
                 "stdout": captured.getvalue(),
             }
         except Exception as e:
-            return {
+            reponse = {
                 "success": False,
                 "error": str(e),
                 "traceback": traceback.format_exc(),
@@ -664,6 +686,13 @@ class QGISBridge:
         finally:
             timer.cancel()
             sys.stdout = old_stdout
+
+        # Apres l'arret du minuteur : le controle ne doit pas etre interrompu
+        # par le delai du script. Un script en echec laisse souvent des
+        # couches derriere lui (incident S1 : bati_temp, communes_temp,
+        # invalides, zero entite) -- elles sont verifiees aussi.
+        self._joindre_verification_des_nouvelles(reponse, ids_avant, "execute_python")
+        return reponse
 
     # ── Project management ────────────────────────────────────────
 
@@ -943,7 +972,28 @@ class QGISBridge:
                 except (TypeError, ValueError):
                     serialized[k] = str(v)
 
-        return {"result": serialized, "output_layers": output_layers}
+        reponse = {"result": serialized, "output_layers": output_layers}
+
+        # Les sorties recoivent le meme bloc `verification` qu'un chargement :
+        # un traitement qui rend zero entite, une emprise hors zone ou une
+        # couche en memoire se voit ici, pas dans le chiffre annonce ensuite.
+        # Une sortie ecrite dans un fichier n'est pas ajoutee au projet par
+        # processing.run : on la relit sans l'ajouter, pour la verifier.
+        try:
+            produites = [v for v in result.values()
+                         if isinstance(v, (QgsVectorLayer, QgsRasterLayer))]
+            for v in result.values():
+                couche = self._couche_depuis_fichier_de_sortie(v)
+                if couche is not None:
+                    produites.append(couche)
+            if produites:
+                blocs, omises = self._verifier_couches(produites, "run_processing")
+                reponse["verification"] = blocs
+                if omises:
+                    reponse["verification_omise"] = omises
+        except Exception as e:
+            reponse["verification_erreur"] = str(e)
+        return reponse
 
     def _action_list_algorithms(self, params: dict) -> dict:
         if not _get_processing():
@@ -5671,14 +5721,243 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
         return [ext_4326.xMinimum(), ext_4326.yMinimum(),
                 ext_4326.xMaximum(), ext_4326.yMaximum()]
 
+    # ── Verification des couches produites ──────────────────────────
+    #
+    # Contrat (strategie qualite §2.1) : tout outil qui cree une couche rend
+    # un bloc `verification` calcule par l'outil, jamais par le LLM. Un bloc
+    # par couche :
+    #
+    #   layer_id, name, feature_count (vecteur), crs, origine
+    #   (fichier | memoire | service distant), emprise_4326, zone_etude,
+    #   rapport_emprise_zone, geometries_invalides (entier, ou « non calcule :
+    #   <raison> » au-dela du plafond), echecs (codes), avertissement (texte).
+    #
+    # Codes d'echec : emprise_aberrante, zero_entite, geometries_invalides,
+    # crs_inconnu (donnee douteuse : corriger avant tout chiffre) et memoire
+    # (couche a sauvegarder, la donnee n'est pas en cause).
+
+    _ECHECS_DE_DONNEE = ("emprise_aberrante", "zero_entite",
+                         "geometries_invalides", "crs_inconnu")
+
+    def _zone_etude(self):
+        """(emprise EPSG:4326, nom) de la zone d'etude, ou (None, None)."""
+        import qgis_helpers
+        zone_bbox = self._zone_etude_bbox()
+        if not zone_bbox:
+            return None, None
+        try:
+            return zone_bbox, qgis_helpers.get_study_zone().get("name")
+        except Exception:
+            return zone_bbox, None
+
     @staticmethod
-    def _verification_chargement(result: dict, couche, zone_bbox, zone_nom) -> dict:
+    def _emprise_et_rapport(couche, zone_bbox):
+        """(emprise EPSG:4326 arrondie, rapport d'aire couche / zone).
+
+        L'un ou l'autre vaut None quand il ne peut etre calcule (couche vide,
+        CRS inconnu, pas de zone).
+        """
+        try:
+            emprise = couche.extent()
+            if emprise is None or emprise.isEmpty():
+                return None, None
+            transformation = QgsCoordinateTransform(
+                couche.crs(), QgsCoordinateReferenceSystem("EPSG:4326"),
+                QgsProject.instance())
+            e = transformation.transformBoundingBox(emprise)
+        except Exception:
+            return None, None
+        emprise_4326 = [round(e.xMinimum(), 5), round(e.yMinimum(), 5),
+                        round(e.xMaximum(), 5), round(e.yMaximum(), 5)]
+        rapport = None
+        if zone_bbox:
+            aire_zone = (zone_bbox[2] - zone_bbox[0]) * (zone_bbox[3] - zone_bbox[1])
+            if aire_zone > 0:
+                rapport = (e.width() * e.height()) / aire_zone
+        return emprise_4326, rapport
+
+    @staticmethod
+    def _geometries_invalides(couche, origine, budget=None):
+        """Nombre de geometries invalides, ou « non calcule : <raison> »."""
+        if origine == "service distant":
+            # Parcourir une couche distante la telechargerait entierement.
+            return "non calcule : couche servie a distance"
+        n = couche.featureCount()
+        if n < 0:
+            return "non calcule : nombre d'entites inconnu"
+        if n > _PLAFOND_VALIDATION_GEOMETRIES:
+            return f"non calcule : plus de {_PLAFOND_VALIDATION_GEOMETRIES} entites"
+        if budget is not None:
+            if budget["reste"] < n:
+                return "non calcule : plafond de controle de cet appel atteint"
+            budget["reste"] -= n
+        requete = QgsFeatureRequest()
+        requete.setNoAttributes()
+        invalides = 0
+        for entite in couche.getFeatures(requete):
+            geometrie = entite.geometry()
+            if geometrie is None or geometrie.isNull():
+                continue
+            if not geometrie.isGeosValid():
+                invalides += 1
+        return invalides
+
+    def _verification_couche(self, couche, zone_bbox, zone_nom,
+                             libelle="de la couche", budget=None) -> dict:
+        """Bloc `verification` d'une couche (contrat ci-dessus)."""
+        bloc = {"layer_id": couche.id(), "name": couche.name()}
+        echecs, messages = [], []
+        vecteur = isinstance(couche, QgsVectorLayer)
+        n = couche.featureCount() if vecteur else None
+        if vecteur:
+            bloc["feature_count"] = n
+
+        crs = couche.crs()
+        bloc["crs"] = crs.authid() if crs.isValid() else None
+        if not crs.isValid():
+            echecs.append("crs_inconnu")
+            messages.append("CRS inconnu : emprise et surfaces ne sont pas "
+                            "fiables tant qu'il n'est pas defini.")
+
+        origine = self._origine_de_la_couche(couche).get("origine")
+        bloc["origine"] = origine
+
+        emprise, rapport = self._emprise_et_rapport(couche, zone_bbox)
+        if emprise:
+            bloc["emprise_4326"] = emprise
+        bloc["zone_etude"] = zone_nom
+        if rapport is not None:
+            bloc["rapport_emprise_zone"] = round(rapport, 1)
+            # Seuil large : ogr2ogr garde les entites qui touchent le
+            # rectangle, et un tampon deborde un peu la zone.
+            if rapport > _RATIO_EMPRISE_ABERRANTE:
+                echecs.append("emprise_aberrante")
+                messages.append(
+                    f"L'emprise {libelle} est {rapport:.0f} fois plus "
+                    f"vaste que la zone d'etude : ne presente aucun chiffre avant "
+                    f"d'avoir decoupe la couche a la zone.")
+
+        if vecteur and n == 0:
+            echecs.append("zero_entite")
+            messages.append("Aucune entite : resultat vide. Verifie les "
+                            "parametres avant d'en tirer une conclusion.")
+
+        if vecteur:
+            invalides = self._geometries_invalides(couche, origine, budget)
+            bloc["geometries_invalides"] = invalides
+            if isinstance(invalides, int) and invalides > 0:
+                echecs.append("geometries_invalides")
+                messages.append(
+                    f"{invalides} geometrie(s) invalide(s) : repare avec "
+                    f"native:fixgeometries avant un decoupage ou une surface.")
+
+        if origine == "memoire":
+            echecs.append("memoire")
+            messages.append("Couche en memoire, non sauvegardee : "
+                            "export_layer pour la garder.")
+
+        if echecs:
+            bloc["echecs"] = echecs
+            bloc["avertissement"] = " ".join(messages)
+        return bloc
+
+    def _verifier_couches(self, couches, outil):
+        """Blocs `verification` d'une liste de couches, plafonnes.
+
+        Rend (blocs, nombre de couches non verifiees au-dela du plafond).
+        """
+        zone_bbox, zone_nom = self._zone_etude()
+        budget = {"reste": _BUDGET_VALIDATION_APPEL}
+        blocs = [self._verification_couche(c, zone_bbox, zone_nom, budget=budget)
+                 for c in couches[:_PLAFOND_VERIFICATIONS]]
+        self._retenir_verification(outil, blocs)
+        return blocs, max(0, len(couches) - _PLAFOND_VERIFICATIONS)
+
+    def _retenir_verification(self, outil, blocs):
+        """Memorise les alertes de donnee de la derniere verification.
+
+        Le contexte rendu a l'agent (_build_context) s'en sert : tant qu'une
+        alerte porte sur une couche encore presente, la suite est de corriger,
+        pas d'analyser. Une couche seulement en memoire n'est pas une alerte
+        de donnee.
+        """
+        alertes = []
+        for b in blocs:
+            codes = [c for c in b.get("echecs", []) if c in self._ECHECS_DE_DONNEE]
+            if codes:
+                alertes.append({"layer_id": b.get("layer_id"),
+                                "name": b.get("name"),
+                                "echecs": codes,
+                                "avertissement": b.get("avertissement", "")})
+        self._derniere_verification = {"outil": outil, "alertes": alertes}
+
+    def _joindre_verification_des_nouvelles(self, reponse, ids_avant, outil):
+        """Ajoute a `reponse` la verification des couches apparues depuis
+        `ids_avant`. Ne fait jamais echouer l'appel."""
+        try:
+            nouvelles = [c for lid, c in QgsProject.instance().mapLayers().items()
+                         if lid not in ids_avant]
+            if not nouvelles:
+                return
+            blocs, omises = self._verifier_couches(nouvelles, outil)
+            reponse["verification"] = blocs
+            if omises:
+                reponse["verification_omise"] = omises
+        except Exception as e:
+            reponse["verification_erreur"] = str(e)
+
+    _EXTENSIONS_VECTEUR = (".gpkg", ".shp", ".geojson", ".json", ".gml",
+                           ".kml", ".csv", ".fgb", ".sqlite")
+    _EXTENSIONS_RASTER = (".tif", ".tiff", ".vrt", ".asc", ".nc", ".img")
+
+    def _couche_depuis_fichier_de_sortie(self, valeur):
+        """Couche lue (non ajoutee au projet) depuis un chemin de sortie de
+        Processing, ou None si la valeur n'est pas un fichier de couche."""
+        if not isinstance(valeur, str) or not valeur:
+            return None
+        chemin = valeur.split("|", 1)[0]
+        suffixe = Path(chemin).suffix.lower()
+        if suffixe not in self._EXTENSIONS_VECTEUR + self._EXTENSIONS_RASTER:
+            return None
+        if not Path(chemin).is_file():
+            return None
+        if suffixe in self._EXTENSIONS_VECTEUR:
+            couche = QgsVectorLayer(valeur, Path(chemin).stem, "ogr")
+        else:
+            couche = QgsRasterLayer(chemin, Path(chemin).stem)
+        return couche if couche.isValid() else None
+
+    def _action_verify_layers(self, params: dict) -> dict:
+        """Verification de couches deja dans le projet (lecture seule).
+
+        Sert a run_recipe : `layer_ids` = [] rend seulement la liste des
+        couches presentes ; `sauf` = cette liste verifie celles apparues
+        depuis.
+        """
+        toutes = QgsProject.instance().mapLayers()
+        if "layer_ids" in params:
+            ids = [i for i in (params.get("layer_ids") or []) if i in toutes]
+        else:
+            sauf = set(params.get("sauf") or [])
+            ids = [i for i in toutes if i not in sauf]
+        reponse = {"layer_ids": list(toutes.keys())}
+        if ids:
+            blocs, omises = self._verifier_couches(
+                [toutes[i] for i in ids], params.get("outil") or "verify_layers")
+            reponse["verification"] = blocs
+            if omises:
+                reponse["verification_omise"] = omises
+        return reponse
+
+    def _verification_chargement(self, result: dict, couche, zone_bbox, zone_nom) -> dict:
         """Ce que l'agent doit savoir du chargement avant d'en tirer un chiffre.
 
         Le compte rendu est celui du GeoPackage local, pas celui annonce par
         le service. L'emprise est celle du rectangle demande, jamais celle du
         contour administratif : un compte « dans la commune » exige un
         decoupage prealable.
+
+        Meme contrat que _verification_couche, plus `filtre` et `suite`.
         """
         verification = {
             "feature_count": result.get("feature_count"),
@@ -5690,25 +5969,10 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
         }
         if couche is None:
             return verification
-        emprise = couche.extent()
-        if emprise.isEmpty():
-            return verification
-        transformation = QgsCoordinateTransform(
-            couche.crs(), QgsCoordinateReferenceSystem("EPSG:4326"),
-            QgsProject.instance())
-        e = transformation.transformBoundingBox(emprise)
-        verification["emprise_4326"] = [round(e.xMinimum(), 5), round(e.yMinimum(), 5),
-                                         round(e.xMaximum(), 5), round(e.yMaximum(), 5)]
-        if zone_bbox:
-            aire_zone = (zone_bbox[2] - zone_bbox[0]) * (zone_bbox[3] - zone_bbox[1])
-            aire_couche = e.width() * e.height()
-            # Seuil large : ogr2ogr garde les entites qui touchent le
-            # rectangle, l'emprise deborde donc toujours un peu.
-            if aire_zone > 0 and aire_couche / aire_zone > _RATIO_EMPRISE_ABERRANTE:
-                verification["avertissement"] = (
-                    f"L'emprise chargee est {aire_couche / aire_zone:.0f} fois plus "
-                    f"vaste que la zone d'etude : ne presente aucun chiffre avant "
-                    f"d'avoir decoupe la couche a la zone.")
+        commun = self._verification_couche(couche, zone_bbox, zone_nom,
+                                           libelle="chargee")
+        for cle, valeur in commun.items():
+            verification.setdefault(cle, valeur)
         return verification
 
     def _action_set_study_zone(self, params: dict) -> dict:
@@ -5765,6 +6029,7 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
                 result["verification"] = self._verification_chargement(
                     result, QgsProject.instance().mapLayer(result.get("layer_id", "")),
                     zone_bbox, zone_nom)
+                self._retenir_verification("smart_load", [result["verification"]])
 
             # Emprise reellement chargee vs zone d'etude declaree.
             #
