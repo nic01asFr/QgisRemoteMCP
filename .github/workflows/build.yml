@@ -38,6 +38,8 @@ on:
       - 'supervisord.conf'
       - 'requirements.txt'
       - 'Dockerfile'
+      - 'tests/**'
+      - 'pytest.ini'
       - '.github/workflows/build.yml'
   workflow_dispatch:
 
@@ -45,7 +47,35 @@ env:
   IMAGE: ghcr.io/nic01asfr/qgisremotemcp
 
 jobs:
+  # La suite pytest ne tournait nulle part (strategie qualite, §6). Mesure du
+  # 2026-09-24, a sa premiere execution hors conteneur : 10 echecs dans
+  # test_solar_pipeline.py -- le module ne s'importait pas sans /data, et
+  # derriere ce masque deux vrais defauts : le correctif A4 perdu dans la
+  # reecriture v2, et des tests de position solaire faux depuis leur
+  # ecriture. Un test qu'aucune machine n'execute ne protege de rien.
+  #
+  # Ce job passe avant la construction : 10 Go d'image ne partent pas si la
+  # suite echoue. Pas de QGIS ici : les tests marques `container` (PyQGIS,
+  # GRASS) sont exclus et restent a lancer dans l'image. pyproj n'est pas
+  # dans requirements.txt (l'image l'a par QGIS) ; sans lui, le test de
+  # reprojection de zone.json s'ignorerait en silence.
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Dependances
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pyproj
+      - name: Suite hors conteneur
+        run: python -m pytest tests/ -q -m "not container"
+
   build:
+    needs: tests
     runs-on: ubuntu-latest
     permissions:
       contents: read
