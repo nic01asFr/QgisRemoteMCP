@@ -433,7 +433,7 @@ def _try_resolve_major_city(name: str) -> str | None:
     return None
 
 
-def _commune_by_insee(insee: str) -> dict:
+def _commune_by_insee(insee: str, avec_contour: bool = False) -> dict:
     """Lookup direct d'une commune par code INSEE (5 chiffres), via
     `geo.api.gouv.fr/communes/{insee}`. Cet endpoint résout aussi les
     arrondissements municipaux que `?nom=` n'indexe pas."""
@@ -446,11 +446,16 @@ def _commune_by_insee(insee: str) -> dict:
         return data
     if not isinstance(data, dict) or "code" not in data:
         return {"error": f"Commune INSEE {insee} introuvable"}
-    return _commune_to_result(data)
+    return _commune_to_result(data, avec_contour=avec_contour)
 
 
-def _commune_to_result(c: dict) -> dict:
-    """Transforme une réponse /communes en dict normalisé avec lon/lat/bbox."""
+def _commune_to_result(c: dict, avec_contour: bool = False) -> dict:
+    """Transforme une réponse /communes en dict normalisé avec lon/lat/bbox.
+
+    Le contour GeoJSON n'est rendu que sur demande (`avec_contour`) : il pese
+    jusqu'a 150 Ko (Marseille, 7 390 sommets, mesure du 2026-09-24) et n'a
+    rien a faire dans le retour d'un execute_python ordinaire.
+    """
     result = {
         "nom": c.get("nom", ""),
         "code": c.get("code", ""),
@@ -484,10 +489,50 @@ def _commune_to_result(c: dict) -> dict:
         lons = [p[0] for p in all_points]
         lats = [p[1] for p in all_points]
         result["bbox"] = [min(lons), min(lats), max(lons), max(lats)]
+    if avec_contour and geo_type in ("Polygon", "MultiPolygon"):
+        result["contour"] = contour
     return result
 
 
-def search_commune(name):
+def _contour_geojson_vers_wkt(contour) -> str:
+    """Polygone ou multipolygone GeoJSON -> WKT, chaine vide sinon.
+
+    Ecrit a la main plutot que par QgsJsonUtils : la fonction reste pure, donc
+    testable sans QGIS.
+    """
+    if not isinstance(contour, dict):
+        return ""
+    genre = contour.get("type")
+    coords = contour.get("coordinates") or []
+
+    def _anneau(anneau):
+        points = [p for p in anneau
+                  if isinstance(p, (list, tuple)) and len(p) >= 2]
+        # Un anneau ferme compte au moins 4 points (le premier repete).
+        if len(points) < 4:
+            return ""
+        return "(" + ", ".join(f"{float(p[0])!r} {float(p[1])!r}" for p in points) + ")"
+
+    def _polygone(anneaux):
+        morceaux = [_anneau(a) for a in anneaux if isinstance(a, list)]
+        # Sans anneau exterieur valable, les trous n'ont plus de sens.
+        if not morceaux or not morceaux[0]:
+            return ""
+        return "(" + ", ".join(m for m in morceaux if m) + ")"
+
+    try:
+        if genre == "Polygon":
+            corps = _polygone(coords)
+            return f"POLYGON {corps}" if corps else ""
+        if genre == "MultiPolygon":
+            corps = [c for c in (_polygone(p) for p in coords if isinstance(p, list)) if c]
+            return f"MULTIPOLYGON ({', '.join(corps)})" if corps else ""
+    except (TypeError, ValueError):
+        return ""
+    return ""
+
+
+def search_commune(name, avec_contour=False):
     """Search for a French commune using the Geo API.
 
     Stratégie en 3 niveaux pour gérer correctement les arrondissements
@@ -502,7 +547,7 @@ def search_commune(name):
 
     Returns:
         {"nom", "code", "codesPostaux", "population", "lon", "lat", "bbox"}
-        or {"error": "..."}.
+        (+ "contour" GeoJSON si avec_contour) or {"error": "..."}.
 
     Example:
         commune = helpers.search_commune("Nimes")
@@ -513,7 +558,7 @@ def search_commune(name):
     # 1) Détection arrondissement municipal → lookup direct par INSEE
     insee = _try_resolve_arrondissement(name)
     if insee:
-        r = _commune_by_insee(insee)
+        r = _commune_by_insee(insee, avec_contour=avec_contour)
         if "error" not in r:
             return r
         # Si lookup INSEE échoue, on tente quand même le fallback nom
@@ -521,7 +566,7 @@ def search_commune(name):
     # 2) Détection ville majeure seule (Paris/Marseille/Lyon sans numéro)
     insee = _try_resolve_major_city(name)
     if insee:
-        r = _commune_by_insee(insee)
+        r = _commune_by_insee(insee, avec_contour=avec_contour)
         if "error" not in r:
             return r
 
@@ -533,7 +578,7 @@ def search_commune(name):
         return data
     if not data or not isinstance(data, list) or len(data) == 0:
         return {"error": f"Commune not found: {name}"}
-    return _commune_to_result(data[0])
+    return _commune_to_result(data[0], avec_contour=avec_contour)
 
 
 def get_elevation(lon, lat):
@@ -938,6 +983,13 @@ def set_study_zone(target, buffer_km=2):
     # entoure d'un tampon -- deux resultats tres differents pour la meme
     # demande, et l'une des incomprehensions les plus frequentes.
     methode = "inconnue"
+    # Contour administratif (WKT, EPSG:4326) quand la cible est une commune ou
+    # un arrondissement. Sans lui, « dans la commune » ne peut vouloir dire
+    # que « dans le rectangle » : c'est le defaut T2 (bbox != contour) du plan
+    # « comportements spatiaux » -- le rectangle d'Aix deborde sur les
+    # communes voisines.
+    contour_wkt = ""
+    contour_source = ""
 
     if isinstance(target, (list, tuple)) and len(target) == 4:
         # Explicit bbox
@@ -958,7 +1010,7 @@ def set_study_zone(target, buffer_km=2):
 
     elif isinstance(target, str):
         # Try commune first (precise bbox), then geocode
-        commune = search_commune(target)
+        commune = search_commune(target, avec_contour=True)
         commune_bbox = commune.get("bbox") if "error" not in commune else None
         # Validate bbox is a flat list of 4 numbers
         if (commune_bbox and isinstance(commune_bbox, list) and len(commune_bbox) == 4
@@ -966,6 +1018,10 @@ def set_study_zone(target, buffer_km=2):
             bbox_4326 = [float(v) for v in commune_bbox]
             zone_name = commune.get("nom", target)
             methode = "emprise administrative de la commune (tampon non applique)"
+            contour_wkt = _contour_geojson_vers_wkt(commune.get("contour"))
+            if contour_wkt:
+                contour_source = (f"geo.api.gouv.fr, commune {zone_name} "
+                                  f"(INSEE {commune.get('code', '?')})")
         elif "error" not in commune and "lon" in commune:
             # Use commune center with buffer
             lon, lat = float(commune["lon"]), float(commune["lat"])
@@ -1011,6 +1067,13 @@ def set_study_zone(target, buffer_km=2):
     QgsExpressionContextUtils.setProjectVariable(project, "study_zone_bbox_4326", json.dumps(bbox_4326))
     QgsExpressionContextUtils.setProjectVariable(project, "study_zone_bbox_2154", json.dumps(bbox_2154))
     QgsExpressionContextUtils.setProjectVariable(project, "study_zone_timestamp", str(int(time.time())))
+    # Toujours reecrit, meme vide : une zone rectangulaire posee apres une
+    # commune ne doit pas heriter du contour de la precedente (scenario S3,
+    # « zone Lavandou active, charge le bati a Aix »). Taille mesuree le
+    # 2026-09-24 : 1 744 sommets pour Aix-en-Provence, 7 390 pour Marseille,
+    # soit au plus ~160 Ko dans le fichier projet.
+    QgsExpressionContextUtils.setProjectVariable(project, "study_zone_contour_wkt", contour_wkt)
+    QgsExpressionContextUtils.setProjectVariable(project, "study_zone_contour_source", contour_source)
 
     # Zoom canvas
     zoom_to(bbox_4326)
@@ -1033,9 +1096,15 @@ def set_study_zone(target, buffer_km=2):
         "methode": methode,
         "largeur_km": largeur_km,
         "hauteur_km": hauteur_km,
+        "contour": contour_source or None,
         "resume": (f"Zone d'etude : {zone_name} — {largeur_km} x {hauteur_km} km "
                    f"({methode}). La carte est cadree dessus, et les prochains "
-                   f"chargements s'y limiteront sauf emprise explicite."),
+                   f"chargements s'y limiteront sauf emprise explicite. "
+                   + ("Contour communal memorise : clip_to_study_zone decoupera "
+                      "une couche a la limite de la commune."
+                      if contour_wkt else
+                      "Pas de contour administratif (la zone n'est pas une "
+                      "commune) : tout compte portera sur ce rectangle.")),
     }
 
 
@@ -1060,11 +1129,39 @@ def get_study_zone():
     except (json.JSONDecodeError, TypeError):
         return {"error": "Study zone variables are corrupted. Call set_study_zone() again."}
 
+    contour_source = scope.variable("study_zone_contour_source") or ""
     return {
         "name": name,
         "bbox_4326": bbox_4326,
         "bbox_2154": bbox_2154,
+        # Le WKT lui-meme n'est pas rendu (jusqu'a 160 Ko) : voir
+        # get_study_zone_contour().
+        "contour_disponible": bool(scope.variable("study_zone_contour_wkt")),
+        "contour": contour_source or None,
     }
+
+
+def get_study_zone_contour():
+    """Contour administratif de la zone d'etude, memorise par set_study_zone.
+
+    Returns:
+        {"name", "wkt" (EPSG:4326), "source"} or {"error": "..."} en francais.
+    """
+    scope = QgsExpressionContextUtils.projectScope(_project())
+    name = scope.variable("study_zone_name")
+    if not name:
+        return {"error": "Aucune zone d'etude : appelle d'abord set_study_zone "
+                         "avec le nom de la commune."}
+    wkt = scope.variable("study_zone_contour_wkt") or ""
+    if not wkt:
+        return {"error": (f"La zone d'etude « {name} » n'a pas de contour "
+                          f"administratif : elle a ete definie par une emprise, "
+                          f"un point ou une adresse, ou avant que le contour ne "
+                          f"soit memorise. Redefinis-la avec set_study_zone et "
+                          f"le nom exact de la commune ou de l'arrondissement "
+                          f"(ex. « Aix-en-Provence », « Marseille 4e »).")}
+    return {"name": name, "wkt": wkt,
+            "source": scope.variable("study_zone_contour_source") or ""}
 
 
 # ── Smart Download ───────────────────────────────────────────

@@ -245,7 +245,7 @@ class QGISBridge:
         "add_vector_layer", "add_raster_layer", "add_wfs_layer", "add_wms_layer",
         "remove_layer", "run_processing", "zoom_to_extent",
         "set_layer_style", "set_layer_visibility", "apply_style",
-        "add_from_catalog", "set_study_zone", "smart_load",
+        "add_from_catalog", "set_study_zone", "smart_load", "clip_to_study_zone",
         "apply_layout_template", "export_web_map", "export_flood_map", "export_temporal_map", "export_qfield", "export_grist",
         "mouse_click", "mouse_scroll", "key_press", "mouse_drag",
     })
@@ -5733,11 +5733,12 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
     #   <raison> » au-dela du plafond), echecs (codes), avertissement (texte).
     #
     # Codes d'echec : emprise_aberrante, zero_entite, geometries_invalides,
-    # crs_inconnu (donnee douteuse : corriger avant tout chiffre) et memoire
-    # (couche a sauvegarder, la donnee n'est pas en cause).
+    # crs_inconnu, rien_retire (decoupage sans effet, cf. clip_to_study_zone)
+    # -- donnee douteuse : corriger avant tout chiffre -- et memoire (couche a
+    # sauvegarder, la donnee n'est pas en cause).
 
     _ECHECS_DE_DONNEE = ("emprise_aberrante", "zero_entite",
-                         "geometries_invalides", "crs_inconnu")
+                         "geometries_invalides", "crs_inconnu", "rien_retire")
 
     def _zone_etude(self):
         """(emprise EPSG:4326, nom) de la zone d'etude, ou (None, None)."""
@@ -5965,7 +5966,8 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
             "filtre": "rectangle (bbox) -- pas le contour administratif",
             "suite": ("Pour une carte, la couche convient telle quelle. Pour un "
                       "chiffre « dans la commune », decoupe d'abord au contour "
-                      "(native:clip avec la limite communale), puis compte."),
+                      "avec clip_to_study_zone (native:clip sur la limite "
+                      "communale), puis compte."),
         }
         if couche is None:
             return verification
@@ -5988,6 +5990,194 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
         """Get the current study zone (name, bbox in 4326 and 2154)."""
         import qgis_helpers
         return qgis_helpers.get_study_zone()
+
+    # ── Decoupage au contour de la zone ───────────────────────────
+    #
+    # Incident S1 du 2026-09-24 (« uniquement les batis d'Aix ») : l'agent
+    # a charge le bati dans le rectangle d'Aix, puis tente de decouper a la
+    # main -- geo.api.gouv, WFS IGN, GeoJSON -- en sept execute_python, trois
+    # couches `commune_aix` reduites a un point, deux couches temporaires
+    # invalides, et un arret automatique sur boucle d'erreurs avant tout
+    # decoupage. Le besoin est recurrent : il devient un outil.
+
+    # Au-dela de ce rapport entre l'emprise de la couche d'entree et celle du
+    # contour, un decoupage qui ne retire rien est suspect : la couche
+    # deborde nettement de la commune, des entites auraient du partir.
+    _RAPPORT_DEBORDEMENT_SUSPECT = 1.5
+
+    @staticmethod
+    def _nom_normalise(texte) -> str:
+        """« Bâtiments (BD TOPO) » + « Aix-en-Provence » -> nom de fichier
+        et de couche sans accent : batiments_bd_topo_aix_en_provence."""
+        import re
+        import unicodedata
+        ascii_ = (unicodedata.normalize("NFKD", str(texte or ""))
+                  .encode("ascii", "ignore").decode("ascii"))
+        return re.sub(r"[^a-z0-9]+", "_", ascii_.lower()).strip("_")[:80]
+
+    @staticmethod
+    def _dossier_donnees_etude() -> Path:
+        """Dossier des donnees de l'etude active, /data a defaut.
+
+        Meme regle que _chemin_d_export : un fichier hors de l'etude ne part
+        pas dans son archive. Les donnees d'une etude vivent dans
+        /data/studies/<id>/data (cf. _action_list_files).
+        """
+        etude = lire_etude_active()
+        if etude and Path(f"/data/studies/{etude}").is_dir():
+            dossier = Path("/data/studies") / etude / "data"
+        else:
+            dossier = Path("/data")
+        try:
+            dossier.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            dossier = Path("/data")
+        return dossier
+
+    def _action_clip_to_study_zone(self, params: dict) -> dict:
+        """Decoupe une couche vecteur au contour administratif de la zone.
+
+        Le contour est celui memorise par set_study_zone (commune ou
+        arrondissement, geo.api.gouv.fr) : jamais le rectangle. Le resultat
+        est un GeoPackage dans les donnees de l'etude, pas une couche en
+        memoire qui disparaitrait au prochain redemarrage.
+        """
+        import qgis_helpers
+        from qgis.core import QgsGeometry, QgsFeature
+
+        couche, err = self._resolve_layer(params.get("layer_id", ""), vector_only=True)
+        if err:
+            return err
+        contour = qgis_helpers.get_study_zone_contour()
+        if "error" in contour:
+            return {"error": contour["error"]}
+        geometrie = QgsGeometry.fromWkt(contour["wkt"])
+        if geometrie is None or geometrie.isNull() or geometrie.isEmpty():
+            return {"error": "Le contour memorise est illisible : redefinis la "
+                             "zone avec set_study_zone."}
+        if not geometrie.isGeosValid():
+            geometrie = geometrie.makeValid()
+        emprise_contour = geometrie.boundingBox()
+        contour_bbox = [emprise_contour.xMinimum(), emprise_contour.yMinimum(),
+                        emprise_contour.xMaximum(), emprise_contour.yMaximum()]
+
+        projet = QgsProject.instance()
+        crs = couche.crs()
+        if not crs.isValid():
+            return {"error": f"La couche « {couche.name()} » n'a pas de CRS : "
+                             f"impossible d'y superposer le contour."}
+        if crs.authid() != "EPSG:4326":
+            geometrie.transform(QgsCoordinateTransform(
+                QgsCoordinateReferenceSystem("EPSG:4326"), crs, projet))
+        geometrie.convertToMultiType()
+
+        nom = self._nom_normalise(params.get("name")
+                                  or f"{couche.name()}_{contour['name']}")
+        if not nom:
+            return {"error": "Nom de sortie vide apres normalisation : donne "
+                             "un nom (name) fait de lettres ou de chiffres."}
+        chemin = str(self._dossier_donnees_etude() / f"{nom}.gpkg")
+        source_entree = (couche.source() or "").split("|", 1)[0]
+        if source_entree and Path(source_entree) == Path(chemin):
+            return {"error": "La sortie ecraserait la couche d'entree : donne "
+                             "un autre nom (name)."}
+
+        proc = _get_processing()
+        if not proc:
+            return {"error": "Processing indisponible : decoupage impossible."}
+
+        masque = QgsVectorLayer(f"MultiPolygon?crs={crs.authid()}", "contour_zone", "memory")
+        masque.setCrs(crs)
+        entite = QgsFeature()
+        entite.setGeometry(geometrie)
+        masque.dataProvider().addFeatures([entite])
+        masque.updateExtents()
+
+        avant = couche.featureCount()
+        try:
+            sortie = proc.run("native:clip", {
+                "INPUT": couche, "OVERLAY": masque, "OUTPUT": "TEMPORARY_OUTPUT",
+            })["OUTPUT"]
+        except Exception as e:
+            # Par defaut, Processing s'arrete sur une geometrie invalide :
+            # mieux vaut un echec explicite qu'un compte ampute en silence.
+            return {"error": (f"Le decoupage a echoue : {e}. Si la couche "
+                              f"contient des geometries invalides, repare-la "
+                              f"d'abord (run_processing native:fixgeometries), "
+                              f"puis relance clip_to_study_zone.")}
+
+        # Un nouveau decoupage sous le meme nom remplace le precedent, au lieu
+        # d'empiler des doublons dans la legende (incident S1 : trois
+        # `commune_aix`).
+        remplacees = [l.id() for l in projet.mapLayers().values()
+                      if (l.source() or "").split("|", 1)[0] == chemin]
+        if remplacees:
+            projet.removeMapLayers(remplacees)
+        options = QgsVectorFileWriter.SaveVectorOptions()
+        options.driverName = "GPKG"
+        options.layerName = nom
+        options.fileEncoding = "UTF-8"
+        options.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteFile
+        erreur = QgsVectorFileWriter.writeAsVectorFormatV3(
+            sortie, chemin, projet.transformContext(), options)
+        if erreur[0] != QgsVectorFileWriter.WriterError.NoError:
+            return {"error": f"Ecriture du GeoPackage impossible : {erreur[1]}"}
+        resultat = QgsVectorLayer(f"{chemin}|layername={nom}", nom, "ogr")
+        if not resultat.isValid():
+            return {"error": f"GeoPackage ecrit mais illisible : {chemin}"}
+        projet.addMapLayer(resultat)
+
+        apres = resultat.featureCount()
+        zone_bbox, zone_nom = self._zone_etude()
+        verification = {
+            "feature_count": apres,
+            "avant": avant,
+            "apres": apres,
+            "retirees": avant - apres if avant >= 0 else None,
+            "zone_etude": contour["name"],
+            "contour": contour.get("source") or None,
+            "filtre": ("contour administratif (native:clip : les entites a "
+                       "cheval sur la limite sont coupees a la limite)"),
+            "fichier": chemin,
+        }
+        commun = self._verification_couche(resultat, zone_bbox, zone_nom)
+        for cle, valeur in commun.items():
+            verification.setdefault(cle, valeur)
+
+        echecs = list(verification.get("echecs", []))
+        messages = [verification["avertissement"]] if verification.get("avertissement") else []
+        if apres == 0:
+            messages.insert(0, (f"Aucune entite dans le contour de {contour['name']} : "
+                                f"la couche ne recouvre pas la commune. Verifie la "
+                                f"couche source et la zone."))
+        elif avant > 0 and apres == avant:
+            _, rapport = self._emprise_et_rapport(couche, contour_bbox)
+            if rapport is not None and rapport > self._RAPPORT_DEBORDEMENT_SUSPECT:
+                echecs.append("rien_retire")
+                messages.insert(0, (f"Aucune entite retiree alors que la couche "
+                                    f"deborde du contour ({rapport:.1f} fois son "
+                                    f"emprise) : le decoupage n'a pas agi, ne "
+                                    f"presente pas ce chiffre comme communal."))
+            else:
+                verification["note"] = ("Aucune entite retiree : la couche etait "
+                                        "deja dans le contour.")
+        if echecs:
+            verification["echecs"] = echecs
+        if messages:
+            verification["avertissement"] = " ".join(messages)
+        self._retenir_verification("clip_to_study_zone", [verification])
+
+        reponse = {
+            "success": True,
+            "layer_id": resultat.id(),
+            "name": nom,
+            "path": chemin,
+            "source_layer_id": couche.id(),
+            "verification": verification,
+        }
+        if remplacees:
+            reponse["remplace"] = "couche precedente du meme nom retiree du projet et reecrite"
+        return reponse
 
     def _action_smart_load(self, params: dict) -> dict:
         """Smart load from catalog: WFS→local GPKG via ogr2ogr, raster→streaming."""

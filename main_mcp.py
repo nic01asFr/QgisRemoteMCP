@@ -678,6 +678,18 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}, "required": []}
     },
     {
+        "name": "clip_to_study_zone",
+        "description": "Decoupe une couche vecteur au CONTOUR administratif de la zone d'etude (commune ou arrondissement memorise par set_study_zone), pas au rectangle. A utiliser avant tout chiffre « dans la commune » : smart_load charge un rectangle qui deborde sur les communes voisines. Le resultat est un GeoPackage dans les donnees de l'etude, ajoute au projet, nomme <couche>_<zone> par defaut. Le retour porte un bloc `verification` (avant, apres, retirees, emprise, contour utilise, avertissement). Echoue en clair si la zone n'a pas de contour (emprise, point ou adresse) : redefinis-la alors avec le nom de la commune.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "layer_id": {"type": "string", "description": "ID de la couche vecteur a decouper"},
+                "name": {"type": "string", "description": "Nom de la couche et du fichier produits (defaut : <couche>_<zone>, sans accent ni espace, ex. batiment_aix_en_provence)", "default": ""}
+            },
+            "required": ["layer_id"]
+        }
+    },
+    {
         "name": "smart_load",
         "description": "Load data from the catalog. WFS sources are downloaded as local GeoPackage via ogr2ogr (automatic pagination, R-tree spatial index, fast for Processing). Raster sources (WMS/WMTS/XYZ) stream as usual. Use set_study_zone first to define the area, or provide a bbox. Il gere les grandes emprises : une ville entiere passe (300 551 batiments sur Marseille, mesure), le resultat est mis en cache 24 h et porte un index spatial. N'ecris JAMAIS ton propre telechargement WFS en execute_python : la combinaison `-spat` + `-t_srs` que tu ecrirais naturellement rend ZERO entite sans erreur, et cet outil contourne deja ce piege. Si le retour porte un `avertissement` disant qu'aucune entite n'a ete trouvee, ne poursuis pas l'analyse : verifie l'emprise.",
         "inputSchema": {
@@ -1524,6 +1536,21 @@ def _tool_smart_load(arguments: dict) -> dict:
     return {"content": content}
 
 
+def _tool_clip_to_study_zone(arguments: dict) -> dict:
+    err = _validate_required(arguments, "layer_id")
+    if err:
+        return _error(err)
+    params = {"layer_id": arguments["layer_id"]}
+    if arguments.get("name"):
+        params["name"] = arguments["name"]
+    # Decouper le bati d'une ville entiere (300 000 entites) prend du temps.
+    response = qgis_command("clip_to_study_zone", params, timeout=SOCKET_TIMEOUT_LONG)
+    content = _text(response, indent=2)
+    if not response.get("error"):
+        content += _auto_screenshot()
+    return {"content": content}
+
+
 def _tool_set_layer_style(arguments: dict) -> dict:
     err = _validate_required(arguments, "layer_id")
     if err:
@@ -1803,7 +1830,7 @@ def _tool_publish_artifact(arguments: dict) -> dict:
 
 # Actions that need longer timeouts (WFS downloads, heavy exports)
 _LONG_TIMEOUT_ACTIONS = frozenset({
-    "smart_load", "add_from_catalog", "export_flood_map", "export_web_map", "export_temporal_map", "export_qfield", "export_grist", "execute_python",
+    "smart_load", "add_from_catalog", "clip_to_study_zone", "export_flood_map", "export_web_map", "export_temporal_map", "export_qfield", "export_grist", "execute_python",
 })
 
 
@@ -2118,6 +2145,7 @@ TOOL_HANDLERS = {
     "set_study_zone": _tool_set_study_zone,
     "get_study_zone": _tool_get_study_zone,
     "smart_load": _tool_smart_load,
+    "clip_to_study_zone": _tool_clip_to_study_zone,
     "set_layer_style": _tool_set_layer_style,
     "set_layer_visibility": _tool_set_layer_visibility,
     "list_layout_templates": _tool_list_layout_templates,
@@ -2157,9 +2185,10 @@ INSTRUCTIONS = f"""You control a live QGIS Desktop instance. Every modifying too
 ## Recommended workflow for data analysis
 1. **set_study_zone** — Define where: "Montpellier", "Sete", "Gare de Lyon, Paris". Stores bbox in project variables.
 2. **smart_load** — Load data by catalog ID (e.g. 'bdtopo_batiments'). WFS data is downloaded as local GeoPackage with spatial index (fast for Processing). Rasters stream as usual.
-3. **Act** — run_processing, execute_python on local layers (no network delays)
-4. **Verify** — get_screenshot, describe what you see
-5. **Deliver** — export_layer, export_pdf, download_project
+3. **clip_to_study_zone** — Before any figure "in the commune": cut the layer to the administrative outline (smart_load loads a rectangle).
+4. **Act** — run_processing, execute_python on local layers (no network delays)
+5. **Verify** — read the `verification` block returned by each tool (count, extent vs zone, warnings), then get_screenshot
+6. **Deliver** — export_layer, export_pdf, download_project
 
 IMPORTANT: Always call set_study_zone BEFORE smart_load for WFS sources. Downloaded WFS layers are in EPSG:2154 (Lambert 93) with R-tree spatial index. Results are cached 24h in /data/cache/.
 
@@ -2187,7 +2216,8 @@ Use these instead of writing boilerplate. Read skill://helpers for full docs and
 - `helpers.load_catalog_source(id, bbox)` — Load source from datasources.json by ID
 - `helpers.bbox_from_canvas()` — Get current canvas extent in EPSG:4326
 - `helpers.set_study_zone(target, buffer_km)` — Define study zone, store in project variables
-- `helpers.get_study_zone()` — Read stored study zone (name, bbox_4326, bbox_2154)
+- `helpers.get_study_zone()` — Read stored study zone (name, bbox_4326, bbox_2154, contour_disponible)
+- `helpers.get_study_zone_contour()` — Administrative outline of the zone (WKT EPSG:4326), stored by set_study_zone for a commune
 - `helpers.download_wfs_ogr(url, typename, bbox_4326)` — Download WFS as local GPKG via ogr2ogr
 - `helpers.overpass_query(tags, bbox_4326)` — Query OpenStreetMap via Overpass API. tags: dict like {{"amenity": "school"}} or string "amenity=school". Auto-uses study zone bbox.
 
