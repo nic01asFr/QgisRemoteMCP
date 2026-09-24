@@ -231,6 +231,9 @@ class QGISBridge:
         # Derniere verification de donnee (cf. _retenir_verification) : le
         # contexte rendu a l'agent en tient compte pour dire quoi faire.
         self._derniere_verification = None
+        # Couches chargees dans un rectangle par smart_load, pas encore
+        # decoupees au contour : {layer_id: nom}.
+        self._charges_par_bbox = {}
 
     @property
     def iface(self):
@@ -324,12 +327,21 @@ class QGISBridge:
     # ── Workflow context ──────────────────────────────────────────
 
     def _build_context(self) -> dict:
-        """Lightweight project state snapshot, appended to mutating action responses.
-        Inspired by BigLocalApps' _mode_context() pattern."""
+        """Etat du projet joint aux reponses des actions qui le modifient.
+
+        Strategie qualite (2026-09-24, §3.3) : la phrase generique en anglais
+        (« Analyze (run_processing, execute_python) or style layers ») ne
+        tenait compte ni d'une alerte de donnee, ni d'une couche chargee
+        dans un rectangle, ni d'une couche en memoire. Le contexte est
+        desormais en francais, calcule sur l'etat reel, court -- une ligne
+        d'etat, une ligne de suite -- et la liste des couches est plafonnee
+        comme la L2 de l'agent.
+        """
         from qgis.core import QgsExpressionContextUtils
         project = QgsProject.instance()
         scope = QgsExpressionContextUtils.projectScope(project)
         zone_name = scope.variable("study_zone_name")
+        contour = bool(scope.variable("study_zone_contour_wkt"))
 
         layers = list(project.mapLayers().values())
         vector_layers = [l for l in layers if isinstance(l, QgsVectorLayer)]
@@ -352,31 +364,124 @@ class QGISBridge:
         else:
             phase = "setup"
 
-        return {
+        # Seules comptent les couches encore presentes : une alerte sur une
+        # couche retiree depuis n'a plus d'objet.
+        presentes = set(project.mapLayers().keys())
+        derniere = getattr(self, "_derniere_verification", None) or {}
+        alertes = [a for a in derniere.get("alertes", [])
+                   if a.get("layer_id") in presentes]
+        par_bbox = getattr(self, "_charges_par_bbox", {})
+        for lid in [i for i in par_bbox if i not in presentes]:
+            par_bbox.pop(lid, None)
+
+        etat, suite = self._hint_contexte({
+            "zone": zone_name or None,
+            "contour": contour,
+            "phase": phase,
+            "nb_vecteurs": len(vector_layers),
+            "nb_rasters": len(raster_layers),
+            "memoire": [l.name() for l in vector_layers
+                        if l.providerType() == "memory"],
+            "alertes": alertes,
+            "par_bbox": list(par_bbox.values()),
+        })
+
+        contexte = {
             "phase": phase,
             "study_zone": zone_name or None,
+            "contour": contour,
             "layers": [
                 {"name": l.name(), "id": l.id(), "features": l.featureCount()}
-                for l in vector_layers
+                for l in vector_layers[:_PLAFOND_VERIFICATIONS]
             ],
             "raster_count": len(raster_layers),
             "has_layouts": has_layouts,
-            "hint": self._phase_hint(phase, zone_name, len(vector_layers)),
+            "etat": etat,
+            "suite": suite,
+            "hint": suite,
         }
+        if len(vector_layers) > _PLAFOND_VERIFICATIONS:
+            contexte["layers_omises"] = len(vector_layers) - _PLAFOND_VERIFICATIONS
+        return contexte
 
-    @staticmethod
-    def _phase_hint(phase: str, zone_name, vector_count: int) -> str:
-        if phase == "setup" and not zone_name:
-            return "Start with set_study_zone to define your area, then smart_load to load data"
-        if phase == "setup":
-            return "Load data with smart_load (e.g. bdtopo_batiments, osm_xyz). Use list_datasources to browse."
-        if phase == "analysis":
-            return "Analyze (run_processing, execute_python) or style layers (set_layer_style)"
-        if phase == "cartography":
-            return "Apply a layout (apply_layout_template) then export (export_pdf, export_web_map)"
-        if phase == "export":
-            return "Export: export_pdf, export_web_map, download_project, export_layer"
-        return ""
+    # Que faire d'une alerte de donnee, par code (cf. _verification_couche).
+    _CONSEILS_D_ALERTE = {
+        "emprise_aberrante": "decoupe-la a la zone (clip_to_study_zone)",
+        "zero_entite": "elle est vide, verifie l'emprise et les parametres puis relance",
+        "geometries_invalides": "repare-la (run_processing native:fixgeometries)",
+        "crs_inconnu": "definis son CRS",
+        "rien_retire": "le decoupage n'a pas agi, verifie la couche et la zone",
+    }
+
+    @classmethod
+    def _hint_contexte(cls, etat: dict) -> tuple:
+        """(ligne d'etat, ligne de suite) en francais, a partir de l'etat reel.
+
+        Ordre de la suite : une alerte de donnee se corrige avant tout ; puis
+        la zone ; puis le decoupage d'une couche chargee dans un rectangle ;
+        puis la sauvegarde d'une couche en memoire ; enfin l'etape suivante
+        de la phase.
+        """
+        def _court(nom):
+            nom = str(nom or "?")
+            return nom if len(nom) <= 40 else nom[:39] + "..."
+
+        zone = etat.get("zone")
+        contour = etat.get("contour")
+        memoire = etat.get("memoire") or []
+        alertes = etat.get("alertes") or []
+        par_bbox = etat.get("par_bbox") or []
+        nv, nr = etat.get("nb_vecteurs", 0), etat.get("nb_rasters", 0)
+
+        if not zone:
+            morceaux = ["Zone : aucune"]
+        elif contour:
+            morceaux = [f"Zone : {_court(zone)} (contour communal)"]
+        else:
+            morceaux = [f"Zone : {_court(zone)} (rectangle, sans contour)"]
+        morceaux.append(f"{nv + nr} couche(s) ({nv} vecteur, {nr} raster)")
+        if memoire:
+            morceaux.append(f"{len(memoire)} en memoire non sauvee(s)")
+        if alertes:
+            premiere = alertes[0]
+            texte = (f"alerte sur « {_court(premiere.get('name'))} » : "
+                     f"{', '.join(premiere.get('echecs', []))}")
+            if len(alertes) > 1:
+                texte += f" (+{len(alertes) - 1})"
+            morceaux.append(texte)
+        ligne_etat = " | ".join(morceaux)
+
+        if alertes:
+            premiere = alertes[0]
+            codes = premiere.get("echecs") or []
+            conseil = cls._CONSEILS_D_ALERTE.get(codes[0] if codes else "", "verifie-la")
+            if codes and codes[0] == "emprise_aberrante" and not contour:
+                conseil = "recharge-la dans l'emprise de la zone (smart_load)"
+            suite = (f"Corrige « {_court(premiere.get('name'))} » avant tout "
+                     f"chiffre : {conseil}.")
+        elif not zone:
+            suite = ("Definis la zone avec set_study_zone (nom de la commune) "
+                     "avant de charger des donnees.")
+        elif par_bbox and contour:
+            suite = (f"Avant de compter dans la commune, decoupe "
+                     f"« {_court(par_bbox[0])} » au contour : clip_to_study_zone.")
+        elif par_bbox:
+            suite = ("Zone sans contour : un compte porte sur le rectangle, "
+                     "dis-le a l'utilisateur.")
+        elif memoire:
+            suite = (f"Exporte « {_court(memoire[0])} » (export_layer) pour la "
+                     f"garder : une couche en memoire disparait au redemarrage.")
+        elif nv == 0:
+            suite = ("Charge les donnees avec smart_load (list_datasources "
+                     "pour le catalogue).")
+        elif etat.get("phase") == "export":
+            suite = "Livre : export_pdf, export_web_map, publish_artifact."
+        elif etat.get("phase") == "cartography":
+            suite = ("Mise en page (apply_layout_template), puis export "
+                     "(export_pdf, export_web_map).")
+        else:
+            suite = "Analyse (run_processing) ou mets en forme (set_layer_style)."
+        return ligne_etat, suite
 
     # ══════════════════════════════════════════════════════════════
     # ACTIONS
@@ -6166,6 +6271,7 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
         if messages:
             verification["avertissement"] = " ".join(messages)
         self._retenir_verification("clip_to_study_zone", [verification])
+        getattr(self, "_charges_par_bbox", {}).pop(couche.id(), None)
 
         reponse = {
             "success": True,
@@ -6220,6 +6326,8 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
                     result, QgsProject.instance().mapLayer(result.get("layer_id", "")),
                     zone_bbox, zone_nom)
                 self._retenir_verification("smart_load", [result["verification"]])
+                if result.get("layer_id"):
+                    self._charges_par_bbox[result["layer_id"]] = result.get("name")
 
             # Emprise reellement chargee vs zone d'etude declaree.
             #

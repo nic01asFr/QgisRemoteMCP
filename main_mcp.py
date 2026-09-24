@@ -1062,25 +1062,28 @@ def _auto_screenshot() -> list:
 
 
 def _extract_context(response: dict) -> list:
-    """Extract _context from bridge response and format as a compact text block.
-    Returns a list with one text content item, or empty list if no context."""
+    """Extrait le `_context` du pont en deux lignes : etat, puis suite.
+
+        --- Contexte : Zone : Aix-en-Provence (contour communal) | 3 couche(s) ...
+            Suite : Avant de compter dans la commune, decoupe « batiment » ...
+
+    Les deux lignes sont calculees par le pont sur l'etat reel
+    (_build_context). Face a un pont plus ancien, sans `etat`, on retombe
+    sur sa zone et son `hint`.
+    """
     ctx = response.pop("_context", None)
     if not ctx:
         return []
-    zone = ctx.get("study_zone") or "none"
-    phase = ctx.get("phase", "?")
-    layers = ctx.get("layers", [])
-    rasters = ctx.get("raster_count", 0)
-    hint = ctx.get("hint", "")
-    vec_count = len(layers)
-    total = vec_count + rasters
-    parts = [f"phase={phase}", f"zone={zone}", f"{total} layers ({vec_count} vector, {rasters} raster)"]
-    if ctx.get("has_layouts"):
-        parts.append("layouts=yes")
-    line = " | ".join(parts)
-    text = f"\n--- Context: {line}"
-    if hint:
-        text += f"\n    Hint: {hint}"
+    etat = ctx.get("etat")
+    suite = ctx.get("suite")
+    if not etat:
+        zone = ctx.get("study_zone") or "aucune"
+        total = len(ctx.get("layers", [])) + ctx.get("raster_count", 0)
+        etat = f"Zone : {zone} | {total} couche(s)"
+        suite = ctx.get("hint", "")
+    text = f"\n--- Contexte : {etat}"
+    if suite:
+        text += f"\n    Suite : {suite}"
     return [{"type": "text", "text": text}]
 
 
