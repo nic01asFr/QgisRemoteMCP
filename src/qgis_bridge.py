@@ -6253,6 +6253,60 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
             dossier = Path("/data")
         return dossier
 
+    def _couche_par_id_ou_nom(self, params: dict, vector_only: bool = False):
+        """(couche, None) depuis `layer_id`, ou depuis un nom exact
+        (`layer` ou `layer_name`) ; sinon (None, erreur en francais).
+
+        Mesure du 2026-09-26 (defaut D3) : clip_to_study_zone exigeait
+        `layer_id`, que la L2 de l'agent ne donne pas ; le modele passait
+        donc par get_project_info a chaque decoupage. Un nom unique suffit
+        desormais ; un nom passe par erreur dans `layer_id` aussi. Egalite
+        exacte d'abord, puis sans tenir compte de la casse ; jamais de
+        correspondance partielle, qui choisirait en silence.
+        """
+        projet = QgsProject.instance()
+        couches = projet.mapLayers()
+        identifiant = str(params.get("layer_id") or "").strip()
+        nom = str(params.get("layer") or params.get("layer_name") or "").strip()
+        if identifiant and identifiant in couches:
+            return self._resolve_layer(identifiant, vector_only=vector_only)
+        nom = nom or identifiant
+        if not nom:
+            return None, {"error": ("Couche non precisee : donne layer_id, ou "
+                                    "le nom exact de la couche (layer).")}
+
+        def _fiche(c):
+            fiche = {"id": c.id(), "name": c.name()}
+            if isinstance(c, QgsVectorLayer):
+                fiche["features"] = c.featureCount()
+            return fiche
+
+        candidates = [c for c in couches.values() if c.name() == nom]
+        if not candidates:
+            candidates = [c for c in couches.values()
+                          if c.name().casefold() == nom.casefold()]
+        if vector_only:
+            vecteurs = [c for c in candidates if isinstance(c, QgsVectorLayer)]
+            if candidates and not vecteurs:
+                return None, {"error": (f"« {nom} » n'est pas une couche vecteur : "
+                                        f"seule une couche vecteur se decoupe.")}
+            candidates = vecteurs
+        if len(candidates) == 1:
+            return candidates[0], None
+        if len(candidates) > 1:
+            return None, {"error": (f"Plusieurs couches s'appellent « {nom} » : "
+                                    f"precise layer_id parmi les candidates."),
+                          "candidates": [_fiche(c) for c in candidates]}
+        disponibles = [c for c in couches.values()
+                       if not vector_only or isinstance(c, QgsVectorLayer)]
+        reponse = {"error": (f"Aucune couche ne s'appelle « {nom} ». Reprends "
+                             f"le nom exact, ou layer_id, parmi les couches "
+                             f"{'vecteur ' if vector_only else ''}du projet."),
+                   "candidates": [_fiche(c) for c in disponibles[:_PLAFOND_VERIFICATIONS]]}
+        if len(disponibles) > _PLAFOND_VERIFICATIONS:
+            reponse["candidates_omises"] = len(disponibles) - _PLAFOND_VERIFICATIONS
+        return None, reponse
+
     def _action_clip_to_study_zone(self, params: dict) -> dict:
         """Decoupe une couche vecteur au contour administratif de la zone.
 
@@ -6264,7 +6318,7 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
         import qgis_helpers
         from qgis.core import QgsGeometry, QgsFeature
 
-        couche, err = self._resolve_layer(params.get("layer_id", ""), vector_only=True)
+        couche, err = self._couche_par_id_ou_nom(params, vector_only=True)
         if err:
             return err
         contour = qgis_helpers.get_study_zone_contour()

@@ -679,14 +679,15 @@ TOOLS = [
     },
     {
         "name": "clip_to_study_zone",
-        "description": "Decoupe une couche vecteur au CONTOUR administratif de la zone d'etude (commune ou arrondissement memorise par set_study_zone), pas au rectangle. A utiliser avant tout chiffre « dans la commune » : smart_load charge un rectangle qui deborde sur les communes voisines. Le resultat est un GeoPackage dans les donnees de l'etude, ajoute au projet, nomme <couche>_<zone> par defaut. Le retour porte un bloc `verification` (avant, apres, retirees, emprise, contour utilise, avertissement). Echoue en clair si la zone n'a pas de contour (emprise, point ou adresse) : redefinis-la alors avec le nom de la commune.",
+        "description": "Decoupe une couche vecteur au CONTOUR administratif de la zone d'etude (commune ou arrondissement memorise par set_study_zone), pas au rectangle. Couche designee par layer_id ou par son nom exact (layer). A utiliser avant tout chiffre « dans la commune » : smart_load charge un rectangle qui deborde sur les communes voisines. Le resultat est un GeoPackage dans les donnees de l'etude, ajoute au projet, nomme <couche>_<zone> par defaut. Le retour porte un bloc `verification` (avant, apres, retirees, emprise, contour utilise, avertissement). Echoue en clair si la zone n'a pas de contour (emprise, point ou adresse) : redefinis-la alors avec le nom de la commune.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "layer_id": {"type": "string", "description": "ID de la couche vecteur a decouper"},
+                "layer": {"type": "string", "description": "Ou son nom exact, s'il est unique"},
                 "name": {"type": "string", "description": "Nom de la couche et du fichier produits (defaut : <couche>_<zone>, sans accent ni espace, ex. batiment_aix_en_provence)", "default": ""}
             },
-            "required": ["layer_id"]
+            "required": []
         }
     },
     {
@@ -1540,10 +1541,13 @@ def _tool_smart_load(arguments: dict) -> dict:
 
 
 def _tool_clip_to_study_zone(arguments: dict) -> dict:
-    err = _validate_required(arguments, "layer_id")
-    if err:
-        return _error(err)
-    params = {"layer_id": arguments["layer_id"]}
+    # Un id ou un nom exact (defaut D3 du 2026-09-26) : le pont resout le
+    # nom et liste les candidates s'il est ambigu ou introuvable.
+    params = {cle: arguments[cle] for cle in ("layer_id", "layer", "layer_name")
+              if arguments.get(cle)}
+    if not params:
+        return _error("Couche non precisee : donne layer_id, ou le nom exact "
+                      "de la couche (layer).")
     if arguments.get("name"):
         params["name"] = arguments["name"]
     # Decouper le bati d'une ville entiere (300 000 entites) prend du temps.
