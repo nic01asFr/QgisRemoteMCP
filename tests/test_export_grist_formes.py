@@ -237,3 +237,14 @@ def test_la_table_de_statistiques_porte_les_cles_que_la_carte_lit():
     debut = _SRC.find("'source_layer': '(computed)'")
     bloc = _SRC[debut:debut + 400]
     assert "'geom_type'" in bloc and "'layer_obj'" in bloc
+
+
+def test_le_document_est_en_francais():
+    """Separateur decimal et format de date suivent la locale du document."""
+    assert '"locale":"en-US"' not in _SRC
+    assert _SRC.count('"locale":"fr-FR"') == 2
+
+
+def test_les_tables_prennent_une_majuscule_initiale():
+    debut = _SRC.find("def sanitize_table(name):")
+    assert "s[0].upper()" in _SRC[debut:debut + 600]

@@ -3223,7 +3223,9 @@ class QGISBridge:
             s = _re.sub(r'_+', '_', s)  # collapse double underscores
             if not s or s[0].isdigit():
                 s = 'T' + s
-            return s or 'Unnamed'
+            # Grist nomme ses tables avec une majuscule initiale, comme les
+            # tables creees depuis son interface ou par qgis2grist.
+            return (s[0].upper() + s[1:]) if s else 'Unnamed'
 
         def sanitize_col(name):
             s = _strip_accents(name)
@@ -3650,7 +3652,7 @@ class QGISBridge:
         self._grist_create_meta_tables(cur)
 
         # 3b. DocInfo
-        cur.execute("INSERT INTO _grist_DocInfo VALUES (1,'','','',46,?,?)", (tz, '{"locale":"en-US"}'))
+        cur.execute("INSERT INTO _grist_DocInfo VALUES (1,'','','',46,?,?)", (tz, '{"locale":"fr-FR"}'))
 
         # Counters
         col_id_ctr = 0
@@ -4548,7 +4550,7 @@ class QGISBridge:
         self._grist_create_meta_tables(cur)
 
         # 5b. DocInfo
-        cur.execute("INSERT INTO _grist_DocInfo VALUES (1,'','','',46,?,?)", (tz, '{"locale":"en-US"}'))
+        cur.execute("INSERT INTO _grist_DocInfo VALUES (1,'','','',46,?,?)", (tz, '{"locale":"fr-FR"}'))
 
         # Counters
         col_id_ctr = 0
