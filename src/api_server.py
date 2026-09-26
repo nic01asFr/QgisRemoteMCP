@@ -62,6 +62,20 @@ app.add_middleware(
 )
 
 
+def _lire_reponse_pont(texte: str):
+    """Decode une reponse du pont en remplacant NaN et les infinis par null.
+
+    Le pont serialise avec `json.dumps`, qui ecrit `NaN` pour un flottant non
+    fini -- l'emprise d'une couche vide, par exemple. `json.loads` l'accepte,
+    mais la reponse HTTP, elle, doit etre du JSON strict : Starlette levait
+    « Out of range float values are not JSON compliant: nan » et l'appelant
+    recevait un 500 au lieu du resultat. Constate le 2026-09-26 en lisant
+    l'etat d'une etude contenant une couche vide ; le bloc `verification`
+    calcule des emprises et y etait donc expose.
+    """
+    return json.loads(texte, parse_constant=lambda _constante: None)
+
+
 def send_command(action: str, params: dict = None, timeout: int = None) -> dict:
     """Send a command to QGIS bridge via UNIX socket."""
     if not os.path.exists(SOCKET_PATH):
@@ -96,7 +110,7 @@ def send_command(action: str, params: dict = None, timeout: int = None) -> dict:
             data += chunk
 
         sock.close()
-        return json.loads(data.decode())
+        return _lire_reponse_pont(data.decode())
 
     except socket.timeout:
         raise HTTPException(504, f"QGIS bridge timeout ({effective_timeout}s)")
@@ -228,7 +242,7 @@ def _read_frames(sock: socket.socket):
             # Flush any remaining bytes as a final line
             if buffer.strip():
                 try:
-                    yield json.loads(buffer.decode())
+                    yield _lire_reponse_pont(buffer.decode())
                 except Exception:
                     pass
             return
@@ -239,7 +253,7 @@ def _read_frames(sock: socket.socket):
             if not line:
                 continue
             try:
-                yield json.loads(line.decode())
+                yield _lire_reponse_pont(line.decode())
             except Exception as e:
                 print(f"[api_server] bad async frame: {e}", flush=True)
 
@@ -460,7 +474,7 @@ def _sonder_le_pont(job_id: str):
                 break
             data += chunk
         probe_sock.close()
-        return json.loads(data.decode()) if data else None
+        return _lire_reponse_pont(data.decode()) if data else None
     except Exception as e:
         return {"error": f"status probe failed: {e}"}
 
@@ -491,7 +505,7 @@ async def cancel_job(job_id: str):
                 break
             data += chunk
         sock.close()
-        resp = json.loads(data.decode()) if data else {"error": "no response"}
+        resp = _lire_reponse_pont(data.decode()) if data else {"error": "no response"}
     except Exception as e:
         raise HTTPException(502, f"Cancel probe failed: {e}")
 
