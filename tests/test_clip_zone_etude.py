@@ -214,6 +214,7 @@ def test_la_description_dit_contour_et_verification():
     assert "GeoPackage" in bloc
 
 
+
 # ── 4. Contrat en conteneur ──────────────────────────────────────────────
 
 @pytest.mark.container
@@ -257,3 +258,23 @@ class TestDansLeConteneur:
         assert (v["avant"], v["apres"], v["retirees"]) == (3, 2, 1)
         assert r["name"] == "points_carre"
         assert Path(r["path"]).parent == tmp_path
+
+    def test_surfaces_de_la_zone_d_aix(self):
+        """Rectangle d'Aix mesure sur l'ellipsoide : environ 382 km2 (la
+        sphere authalique donne 381,9). Contour pose egal au rectangle :
+        rapport 1."""
+        qgis_core = pytest.importorskip("qgis.core")
+        import sys
+        if qgis_core.QgsApplication.instance() is None:
+            app = qgis_core.QgsApplication([], False)
+            app.initQgis()
+        sys.path.insert(0, str(_RACINE / "src"))
+        espace = {"__name__": "qgis_bridge_essai"}
+        exec(compile(_PONT.split("# ── Start bridge")[0], "qgis_bridge.py", "exec"), espace)
+        x0, y0, x1, y1 = _AIX
+        qgis_core.QgsExpressionContextUtils.setProjectVariable(
+            qgis_core.QgsProject.instance(), "study_zone_contour_wkt",
+            f"POLYGON (({x0} {y0}, {x1} {y0}, {x1} {y1}, {x0} {y1}, {x0} {y0}))")
+        rectangle, commune = espace["QGISBridge"]()._surfaces_zone(_AIX)
+        assert rectangle == pytest.approx(381.9, rel=0.01)
+        assert commune == pytest.approx(rectangle, rel=0.001)

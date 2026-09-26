@@ -59,8 +59,9 @@ import qgis.utils
 
 processing = None  # Lazy-loaded (voir _ensure_processing_providers ci-dessous)
 
-# Au-dela de ce rapport entre l'emprise chargee et celle de la zone d'etude,
-# le chargement n'a pas ete borne par la zone (cf. _verification_chargement).
+# Au-dela de ce rapport entre l'emprise chargee et le rectangle de la zone
+# d'etude, le chargement n'a pas ete borne par la zone (cf.
+# _verification_chargement, champ `emprise_couche_sur_rectangle_zone`).
 _RATIO_EMPRISE_ABERRANTE = 25
 
 # Controle des geometries dans le bloc `verification` : plafonne, parce qu'il
@@ -5834,8 +5835,16 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
     #
     #   layer_id, name, feature_count (vecteur), crs, origine
     #   (fichier | memoire | service distant), emprise_4326, zone_etude,
-    #   rapport_emprise_zone, geometries_invalides (entier, ou « non calcule :
-    #   <raison> » au-dela du plafond), echecs (codes), avertissement (texte).
+    #   emprise_couche_sur_rectangle_zone, surface_rectangle_zone_km2,
+    #   surface_commune_km2 et rectangle_sur_commune (si contour connu),
+    #   lecture (phrase qui dit ce que ces chiffres comparent),
+    #   geometries_invalides (entier, ou « non calcule : <raison> » au-dela
+    #   du plafond), echecs (codes), avertissement (texte).
+    #
+    # `rapport_emprise_zone` (jusqu'au lot qualite 1) a disparu sans alias :
+    # voir _lecture_emprise. Aucun code ne le lisait (les tests en
+    # recalculaient la valeur, l'agent et le hub ne l'analysent pas) ; son
+    # seul lecteur etait le modele, et c'est lui qui le lisait de travers.
     #
     # Codes d'echec : emprise_aberrante, zero_entite, geometries_invalides,
     # crs_inconnu, rien_retire (decoupage sans effet, cf. clip_to_study_zone)
@@ -5881,6 +5890,107 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
             if aire_zone > 0:
                 rapport = (e.width() * e.height()) / aire_zone
         return emprise_4326, rapport
+
+    def _surfaces_zone(self, zone_bbox):
+        """(surface du rectangle de zone, surface du contour communal) en km2.
+
+        Mesure ellipsoidale (QgsDistanceArea, comme export_flood_map) plutot
+        qu'en EPSG:2154 : meme resultat en metropole a quelques pour mille
+        pres (Lambert 93 conserve les angles, pas les surfaces), et juste
+        aussi outre-mer, ou 2154 ne vaut rien. Mise en cache par zone : le
+        contour d'Aix compte 1 744 sommets, et une verification couvre
+        jusqu'a 15 couches. None pour ce qui ne peut etre calcule.
+        """
+        if not zone_bbox:
+            return None, None
+        from qgis.core import QgsDistanceArea, QgsExpressionContextUtils, QgsGeometry
+        projet = QgsProject.instance()
+        wkt = (QgsExpressionContextUtils.projectScope(projet)
+               .variable("study_zone_contour_wkt") or "")
+        cle = (tuple(zone_bbox), len(wkt), hash(wkt))
+        cache = getattr(self, "_cache_surfaces_zone", None)
+        if cache and cache[0] == cle:
+            return cache[1]
+        rectangle = commune = None
+        try:
+            mesure = QgsDistanceArea()
+            mesure.setSourceCrs(QgsCoordinateReferenceSystem("EPSG:4326"),
+                                projet.transformContext())
+            mesure.setEllipsoid("WGS84")
+            if mesure.willUseEllipsoid():
+                cadre = QgsGeometry.fromRect(QgsRectangle(*zone_bbox))
+                rectangle = mesure.measureArea(cadre) / 1e6 or None
+                contour = QgsGeometry.fromWkt(wkt) if wkt else None
+                if contour is not None and not contour.isNull() and not contour.isEmpty():
+                    if not contour.isGeosValid():
+                        contour = contour.makeValid()
+                    commune = mesure.measureArea(contour) / 1e6 or None
+        except Exception:
+            rectangle = commune = None
+        self._cache_surfaces_zone = (cle, (rectangle, commune))
+        return rectangle, commune
+
+    @staticmethod
+    def _lecture_emprise(rapport, surface_rectangle, surface_commune):
+        """Champs d'emprise du bloc `verification`, et leur `lecture`.
+
+        Mesure du 2026-09-26 apres le lot qualite 1 (defaut D2) : l'ancien
+        champ `rapport_emprise_zone` a ete lu deux fois comme « rectangle /
+        commune ». A Aix, « rectangle legerement plus grand que la commune
+        (rapport 1.1) » : 1,1 etait l'emprise chargee rapportee au
+        rectangle, et ce rectangle couvre en fait 2 fois la commune (382 km2
+        contre 187,6). Au Lavandou, « une zone 19 fois plus grande que la
+        commune » : 19 etait l'emprise des routes chargees, rapportee au
+        rectangle. Chaque champ nomme donc ses deux termes, la comparaison
+        rectangle / commune est calculee, et une phrase dit en clair ce que
+        les chiffres veulent dire.
+        """
+        def _fois(x):
+            texte = f"{x:.1f}".replace(".", ",")
+            return texte[:-2] if texte.endswith(",0") else texte
+
+        champs, phrases = {}, []
+        if rapport is not None:
+            champs["emprise_couche_sur_rectangle_zone"] = round(rapport, 1)
+            if rapport > _RATIO_EMPRISE_ABERRANTE:
+                phrases.append(
+                    f"L'emprise de la couche couvre {rapport:.0f} fois le "
+                    f"rectangle de la zone d'etude : elle n'a pas ete bornee "
+                    f"a la zone.")
+            elif rapport > 1.5:
+                phrases.append(
+                    f"L'emprise de la couche deborde du rectangle de la zone "
+                    f"d'etude ({_fois(rapport)} fois sa surface) : des "
+                    f"entites qui touchent le rectangle s'etendent au-dela. "
+                    f"Ce chiffre ne dit rien de la commune.")
+            elif rapport >= 0.5:
+                phrases.append(
+                    f"La couche couvre a peu pres le rectangle de la zone "
+                    f"d'etude (son emprise vaut {_fois(rapport)} fois ce "
+                    f"rectangle).")
+            else:
+                phrases.append(
+                    f"La couche n'occupe qu'une partie du rectangle de la "
+                    f"zone d'etude ({_fois(rapport)} fois sa surface).")
+        if surface_rectangle:
+            champs["surface_rectangle_zone_km2"] = round(surface_rectangle, 1)
+        if surface_commune:
+            champs["surface_commune_km2"] = round(surface_commune, 1)
+        if surface_rectangle and surface_commune:
+            fois = surface_rectangle / surface_commune
+            champs["rectangle_sur_commune"] = round(fois, 1)
+            phrases.append(
+                f"Ce rectangle couvre environ {_fois(fois)} fois la surface de "
+                f"la commune ({_fois(surface_rectangle)} km2 contre "
+                f"{_fois(surface_commune)} km2) : un chiffre communal exige "
+                f"un decoupage au contour.")
+        elif surface_rectangle:
+            phrases.append(
+                f"La zone n'a pas de contour communal : tout compte porte sur "
+                f"ce rectangle ({_fois(surface_rectangle)} km2), dis-le.")
+        if phrases:
+            champs["lecture"] = " ".join(phrases)
+        return champs
 
     @staticmethod
     def _geometries_invalides(couche, origine, budget=None):
@@ -5932,16 +6042,20 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
         if emprise:
             bloc["emprise_4326"] = emprise
         bloc["zone_etude"] = zone_nom
+        try:
+            surface_rectangle, surface_commune = self._surfaces_zone(zone_bbox)
+        except Exception:
+            surface_rectangle = surface_commune = None
+        bloc.update(self._lecture_emprise(rapport, surface_rectangle, surface_commune))
         if rapport is not None:
-            bloc["rapport_emprise_zone"] = round(rapport, 1)
             # Seuil large : ogr2ogr garde les entites qui touchent le
             # rectangle, et un tampon deborde un peu la zone.
             if rapport > _RATIO_EMPRISE_ABERRANTE:
                 echecs.append("emprise_aberrante")
                 messages.append(
                     f"L'emprise {libelle} est {rapport:.0f} fois plus "
-                    f"vaste que la zone d'etude : ne presente aucun chiffre avant "
-                    f"d'avoir decoupe la couche a la zone.")
+                    f"vaste que le rectangle de la zone d'etude : ne presente "
+                    f"aucun chiffre avant d'avoir decoupe la couche a la zone.")
 
         if vecteur and n == 0:
             echecs.append("zero_entite")
@@ -6244,6 +6358,11 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
             "filtre": ("contour administratif (native:clip : les entites a "
                        "cheval sur la limite sont coupees a la limite)"),
             "fichier": chemin,
+            # Prime sur la lecture commune : apres decoupage, la comparaison
+            # rectangle / commune n'appelle plus de decoupage (defaut D2).
+            "lecture": (f"Couche decoupee au contour de {contour['name']} : "
+                        f"ses comptes portent sur la commune, pas sur le "
+                        f"rectangle de la zone."),
         }
         commun = self._verification_couche(resultat, zone_bbox, zone_nom)
         for cle, valeur in commun.items():
