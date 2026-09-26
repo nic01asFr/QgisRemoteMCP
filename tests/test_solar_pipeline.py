@@ -46,12 +46,22 @@ TOLERANCE_PCT = 5  # +/-5% acceptable pour modele DSM 5m + Linke regional
 # ─────────────────────────────────────────────────────────────────────
 # Tests deterministes (pas de run_full prealable requis)
 # ─────────────────────────────────────────────────────────────────────
+#
+# `_sun_pos` prend l'heure LEGALE francaise (UTC+2 d'avril a octobre, UTC+1
+# sinon) : c'est ainsi que l'appellent analyze_facades et analyze_troncons,
+# heure par heure de 5 h a 22 h. Le midi solaire n'y tombe donc pas a 12 h :
+# a Marseille (5,4 E) il tombe vers 13 h 40 l'ete et 12 h 38 l'hiver, a
+# Paris (2,35 E) vers 13 h 52 l'ete. Ces tests ont longtemps appele 12 h 00
+# en le croyant midi solaire ; ils ne tournaient nulle part (le module ne
+# s'importait pas hors conteneur), et l'ecart -- 61,4 deg mesures contre
+# 70,1 attendus -- n'avait pas ete vu. On les appelle au vrai midi solaire :
+# la valeur theorique 90 - |lat - decl| redevient la bonne reference.
 
 def test_sun_position_summer_solstice_marseille():
     """Elevation solaire au midi solaire du solstice d'ete, lat 43.3 N."""
     from solar_pipeline import _sun_pos
-    # 21 juin 12h00 UTC+2 -> midi solaire approximatif
-    az, el = _sun_pos(2024, 6, 21, 12, 0, 43.3, 5.4)
+    # 21 juin 13h40 UTC+2 -> midi solaire a Marseille
+    az, el = _sun_pos(2024, 6, 21, 13, 40, 43.3, 5.4)
     # Elevation theorique : 90 - (43.3 - 23.44) = 70.1 degres
     assert 65 < el < 75, (
         f"Solstice ete midi : elevation {el:.1f} deg hors plage attendue [65,75]"
@@ -61,7 +71,8 @@ def test_sun_position_summer_solstice_marseille():
 def test_sun_position_winter_solstice_marseille():
     """Elevation solaire au midi solaire du solstice d'hiver, lat 43.3 N."""
     from solar_pipeline import _sun_pos
-    az, el = _sun_pos(2024, 12, 21, 12, 0, 43.3, 5.4)
+    # 21 decembre 12h38 UTC+1 -> midi solaire a Marseille
+    az, el = _sun_pos(2024, 12, 21, 12, 38, 43.3, 5.4)
     # Elevation theorique : 90 - (43.3 + 23.44) = 23.3 degres
     assert 18 < el < 28, (
         f"Solstice hiver midi : elevation {el:.1f} deg hors plage attendue [18,28]"
@@ -71,7 +82,8 @@ def test_sun_position_winter_solstice_marseille():
 def test_sun_position_high_latitude_paris():
     """Solstice ete a Paris (48.85 N) : elevation reduite vs Marseille."""
     from solar_pipeline import _sun_pos
-    az, el = _sun_pos(2024, 6, 21, 12, 0, 48.85, 2.35)
+    # 21 juin 13h52 UTC+2 -> midi solaire a Paris
+    az, el = _sun_pos(2024, 6, 21, 13, 52, 48.85, 2.35)
     # Theorique : 90 - (48.85 - 23.44) = 64.6 degres
     assert 60 < el < 70, (
         f"Paris solstice ete : elevation {el:.1f} deg hors plage attendue [60,70]"

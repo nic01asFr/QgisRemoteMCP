@@ -291,7 +291,7 @@ TOOLS = [
     },
     {
         "name": "execute_python",
-        "description": "Execute Python/PyQGIS code inside the running QGIS instance. The script has access to qgis.core.*, iface, processing.run(), project = QgsProject.instance(), canvas = iface.mapCanvas(). A `helpers` module is available with ready-made functions: helpers.geocode(addr), helpers.add_wfs(url, typename, bbox), helpers.add_wms(url, layers), helpers.add_wmts(url, layers), helpers.add_xyz(url, name), helpers.zoom_to(target), helpers.create_point_layer(name, points), helpers.load_catalog_source(id), helpers.bbox_from_canvas(), helpers.search_commune(name), helpers.get_elevation(lon, lat). Store return values in the `result` dict. Read skill://helpers for full reference.",
+        "description": "Execute Python/PyQGIS code inside the running QGIS instance. The script has access to qgis.core.*, iface, processing.run(), project = QgsProject.instance(), canvas = iface.mapCanvas(). A `helpers` module is available with ready-made functions: helpers.geocode(addr), helpers.add_wfs(url, typename, bbox), helpers.add_wms(url, layers), helpers.add_wmts(url, layers), helpers.add_xyz(url, name), helpers.zoom_to(target), helpers.create_point_layer(name, points), helpers.load_catalog_source(id), helpers.bbox_from_canvas(), helpers.search_commune(name), helpers.get_elevation(lon, lat). Store return values in the `result` dict. Read skill://helpers for full reference. Les couches creees par le script recoivent un bloc `verification` (compte, emprise vs zone, origine) : lis-le. Avant d'ecrire du code, verifie qu'un outil ne couvre pas le besoin (smart_load, clip_to_study_zone, run_processing).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -456,7 +456,7 @@ TOOLS = [
     },
     {
         "name": "run_processing",
-        "description": "Execute a QGIS Processing algorithm. 1000+ algorithms from native, GDAL, GRASS, SAGA.",
+        "description": "Execute a QGIS Processing algorithm (~730: native, qgis, gdal, grass, 3d; no SAGA). Chaque couche produite recoit un bloc `verification` (compte, emprise vs zone, CRS, origine, avertissement). Une sortie TEMPORARY_OUTPUT reste en memoire : export_layer pour la garder. Pour decouper a la commune, prefere clip_to_study_zone.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -662,7 +662,7 @@ TOOLS = [
     # ── Study zone & smart load ─────────────────────────────────
     {
         "name": "set_study_zone",
-        "description": "Define the geographic study area. CALL THIS FIRST before loading WFS data. Geocodes the target, stores bbox in project variables (EPSG:4326 + EPSG:2154), and zooms the canvas. Subsequent smart_load calls auto-use this zone.",
+        "description": "Define the geographic study area. CALL THIS FIRST before loading WFS data. Geocodes the target, stores bbox in project variables (EPSG:4326 + EPSG:2154), and zooms the canvas. Subsequent smart_load calls auto-use this zone. Pour une commune ou un arrondissement (« Aix-en-Provence », « Marseille 4e »), le contour administratif est aussi memorise : clip_to_study_zone s'en sert. Une adresse, un point ou une emprise ne donnent qu'un rectangle.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -678,8 +678,20 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}, "required": []}
     },
     {
+        "name": "clip_to_study_zone",
+        "description": "Decoupe une couche vecteur au CONTOUR administratif de la zone d'etude (commune ou arrondissement memorise par set_study_zone), pas au rectangle. A utiliser avant tout chiffre « dans la commune » : smart_load charge un rectangle qui deborde sur les communes voisines. Le resultat est un GeoPackage dans les donnees de l'etude, ajoute au projet, nomme <couche>_<zone> par defaut. Le retour porte un bloc `verification` (avant, apres, retirees, emprise, contour utilise, avertissement). Echoue en clair si la zone n'a pas de contour (emprise, point ou adresse) : redefinis-la alors avec le nom de la commune.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "layer_id": {"type": "string", "description": "ID de la couche vecteur a decouper"},
+                "name": {"type": "string", "description": "Nom de la couche et du fichier produits (defaut : <couche>_<zone>, sans accent ni espace, ex. batiment_aix_en_provence)", "default": ""}
+            },
+            "required": ["layer_id"]
+        }
+    },
+    {
         "name": "smart_load",
-        "description": "Load data from the catalog. WFS sources are downloaded as local GeoPackage via ogr2ogr (automatic pagination, R-tree spatial index, fast for Processing). Raster sources (WMS/WMTS/XYZ) stream as usual. Use set_study_zone first to define the area, or provide a bbox. Il gere les grandes emprises : une ville entiere passe (300 551 batiments sur Marseille, mesure), le resultat est mis en cache 24 h et porte un index spatial. N'ecris JAMAIS ton propre telechargement WFS en execute_python : la combinaison `-spat` + `-t_srs` que tu ecrirais naturellement rend ZERO entite sans erreur, et cet outil contourne deja ce piege. Si le retour porte un `avertissement` disant qu'aucune entite n'a ete trouvee, ne poursuis pas l'analyse : verifie l'emprise.",
+        "description": "Load data from the catalog. WFS sources are downloaded as local GeoPackage via ogr2ogr (automatic pagination, R-tree spatial index, fast for Processing). Raster sources (WMS/WMTS/XYZ) stream as usual. Use set_study_zone first to define the area, or provide a bbox. Il gere les grandes emprises : une ville entiere passe (300 551 batiments sur Marseille, mesure), le resultat est mis en cache 24 h et porte un index spatial. N'ecris JAMAIS ton propre telechargement WFS en execute_python : la combinaison `-spat` + `-t_srs` que tu ecrirais naturellement rend ZERO entite sans erreur, et cet outil contourne deja ce piege. Si le retour porte un `avertissement` disant qu'aucune entite n'a ete trouvee, ne poursuis pas l'analyse : verifie l'emprise. Lis le bloc `verification` (compte local, emprise vs zone) avant tout chiffre. Le chargement couvre un rectangle : pour un chiffre dans la commune, clip_to_study_zone ensuite.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1050,25 +1062,28 @@ def _auto_screenshot() -> list:
 
 
 def _extract_context(response: dict) -> list:
-    """Extract _context from bridge response and format as a compact text block.
-    Returns a list with one text content item, or empty list if no context."""
+    """Extrait le `_context` du pont en deux lignes : etat, puis suite.
+
+        --- Contexte : Zone : Aix-en-Provence (contour communal) | 3 couche(s) ...
+            Suite : Avant de compter dans la commune, decoupe « batiment » ...
+
+    Les deux lignes sont calculees par le pont sur l'etat reel
+    (_build_context). Face a un pont plus ancien, sans `etat`, on retombe
+    sur sa zone et son `hint`.
+    """
     ctx = response.pop("_context", None)
     if not ctx:
         return []
-    zone = ctx.get("study_zone") or "none"
-    phase = ctx.get("phase", "?")
-    layers = ctx.get("layers", [])
-    rasters = ctx.get("raster_count", 0)
-    hint = ctx.get("hint", "")
-    vec_count = len(layers)
-    total = vec_count + rasters
-    parts = [f"phase={phase}", f"zone={zone}", f"{total} layers ({vec_count} vector, {rasters} raster)"]
-    if ctx.get("has_layouts"):
-        parts.append("layouts=yes")
-    line = " | ".join(parts)
-    text = f"\n--- Context: {line}"
-    if hint:
-        text += f"\n    Hint: {hint}"
+    etat = ctx.get("etat")
+    suite = ctx.get("suite")
+    if not etat:
+        zone = ctx.get("study_zone") or "aucune"
+        total = len(ctx.get("layers", [])) + ctx.get("raster_count", 0)
+        etat = f"Zone : {zone} | {total} couche(s)"
+        suite = ctx.get("hint", "")
+    text = f"\n--- Contexte : {etat}"
+    if suite:
+        text += f"\n    Suite : {suite}"
     return [{"type": "text", "text": text}]
 
 
@@ -1524,6 +1539,21 @@ def _tool_smart_load(arguments: dict) -> dict:
     return {"content": content}
 
 
+def _tool_clip_to_study_zone(arguments: dict) -> dict:
+    err = _validate_required(arguments, "layer_id")
+    if err:
+        return _error(err)
+    params = {"layer_id": arguments["layer_id"]}
+    if arguments.get("name"):
+        params["name"] = arguments["name"]
+    # Decouper le bati d'une ville entiere (300 000 entites) prend du temps.
+    response = qgis_command("clip_to_study_zone", params, timeout=SOCKET_TIMEOUT_LONG)
+    content = _text(response, indent=2)
+    if not response.get("error"):
+        content += _auto_screenshot()
+    return {"content": content}
+
+
 def _tool_set_layer_style(arguments: dict) -> dict:
     err = _validate_required(arguments, "layer_id")
     if err:
@@ -1803,8 +1833,30 @@ def _tool_publish_artifact(arguments: dict) -> dict:
 
 # Actions that need longer timeouts (WFS downloads, heavy exports)
 _LONG_TIMEOUT_ACTIONS = frozenset({
-    "smart_load", "add_from_catalog", "export_flood_map", "export_web_map", "export_temporal_map", "export_qfield", "export_grist", "execute_python",
+    "smart_load", "add_from_catalog", "clip_to_study_zone", "export_flood_map", "export_web_map", "export_temporal_map", "export_qfield", "export_grist", "execute_python",
 })
+
+
+def _couches_avant_recette() -> list:
+    """Identifiants des couches presentes avant l'execution d'une recette."""
+    return qgis_command("verify_layers", {"layer_ids": []}).get("layer_ids", [])
+
+
+def _verification_recette(avant: list) -> dict:
+    """Bloc `verification` des couches creees par une recette.
+
+    Calcule par le pont sur l'etat FINAL du projet, une fois toutes les
+    etapes jouees : une couche creee puis retiree par une etape suivante
+    n'y figure pas, une couche restylee y figure avec sa donnee reelle.
+    """
+    verif = qgis_command("verify_layers", {"sauf": avant, "outil": "run_recipe"},
+                         timeout=SOCKET_TIMEOUT_LONG)
+    if "error" in verif:
+        return {"verification_erreur": verif["error"]}
+    retour = {"verification": verif.get("verification", [])}
+    if verif.get("verification_omise"):
+        retour["verification_omise"] = verif["verification_omise"]
+    return retour
 
 
 def _tool_run_recipe(arguments: dict) -> dict:
@@ -1819,6 +1871,7 @@ def _tool_run_recipe(arguments: dict) -> dict:
     # 1. Optionally start a new project
     if arguments.get("new_project", True):
         qgis_command("new_project", {"title": f"{recipe_id} — {zone}"})
+    avant = _couches_avant_recette()
 
     # 2. Get the resolved recipe (with $zone substituted)
     recipe_params = {"id": recipe_id, "zone": zone}
@@ -1877,7 +1930,7 @@ def _tool_run_recipe(arguments: dict) -> dict:
         else:
             # Include key metrics from response (keep it compact)
             for key in ("feature_count", "layer_id", "name", "path",
-                        "download_url", "size", "stats"):
+                        "download_url", "size", "stats", "avertissement"):
                 if key in resp:
                     step_result[key] = resp[key]
             # For execute_python, include the result dict
@@ -1906,6 +1959,9 @@ def _tool_run_recipe(arguments: dict) -> dict:
         "steps": step_results,
         "outputs": recipe_resp.get("outputs", []),
     }
+    # Les sorties declarees sont des descriptions ; la verification porte sur
+    # les couches reellement creees.
+    response.update(_verification_recette(avant))
 
     return {"content": _text(response, indent=2) + _auto_screenshot()}
 
@@ -1951,6 +2007,7 @@ async def stream_run_recipe(arguments: dict, msg_id: Any, session_id: str,
     if arguments.get("new_project", True):
         await asyncio.to_thread(qgis_command, "new_project",
                                 {"title": f"{recipe_id} — {zone}"})
+    avant = await asyncio.to_thread(_couches_avant_recette)
 
     # 2. Resolve recipe
     recipe_params = {"id": recipe_id, "zone": zone}
@@ -2012,7 +2069,7 @@ async def stream_run_recipe(arguments: dict, msg_id: Any, session_id: str,
             step_result["error"] = resp.get("error", "Unknown error")
         else:
             for key in ("feature_count", "layer_id", "name", "path",
-                        "download_url", "size", "stats"):
+                        "download_url", "size", "stats", "avertissement"):
                 if key in resp:
                     step_result[key] = resp[key]
             if action == "execute_python" and "result" in resp:
@@ -2039,6 +2096,7 @@ async def stream_run_recipe(arguments: dict, msg_id: Any, session_id: str,
         "steps": results,
         "outputs": recipe_resp.get("outputs", []),
     }
+    response_data.update(await asyncio.to_thread(_verification_recette, avant))
 
     yield progress(total, total, f"Terminé — {succeeded}/{total} étapes réussies")
 
@@ -2090,6 +2148,7 @@ TOOL_HANDLERS = {
     "set_study_zone": _tool_set_study_zone,
     "get_study_zone": _tool_get_study_zone,
     "smart_load": _tool_smart_load,
+    "clip_to_study_zone": _tool_clip_to_study_zone,
     "set_layer_style": _tool_set_layer_style,
     "set_layer_visibility": _tool_set_layer_visibility,
     "list_layout_templates": _tool_list_layout_templates,
@@ -2129,9 +2188,10 @@ INSTRUCTIONS = f"""You control a live QGIS Desktop instance. Every modifying too
 ## Recommended workflow for data analysis
 1. **set_study_zone** — Define where: "Montpellier", "Sete", "Gare de Lyon, Paris". Stores bbox in project variables.
 2. **smart_load** — Load data by catalog ID (e.g. 'bdtopo_batiments'). WFS data is downloaded as local GeoPackage with spatial index (fast for Processing). Rasters stream as usual.
-3. **Act** — run_processing, execute_python on local layers (no network delays)
-4. **Verify** — get_screenshot, describe what you see
-5. **Deliver** — export_layer, export_pdf, download_project
+3. **clip_to_study_zone** — Before any figure "in the commune": cut the layer to the administrative outline (smart_load loads a rectangle).
+4. **Act** — run_processing, execute_python on local layers (no network delays)
+5. **Verify** — read the `verification` block returned by each tool (count, extent vs zone, warnings), then get_screenshot
+6. **Deliver** — export_layer, export_pdf, download_project
 
 IMPORTANT: Always call set_study_zone BEFORE smart_load for WFS sources. Downloaded WFS layers are in EPSG:2154 (Lambert 93) with R-tree spatial index. Results are cached 24h in /data/cache/.
 
@@ -2159,7 +2219,8 @@ Use these instead of writing boilerplate. Read skill://helpers for full docs and
 - `helpers.load_catalog_source(id, bbox)` — Load source from datasources.json by ID
 - `helpers.bbox_from_canvas()` — Get current canvas extent in EPSG:4326
 - `helpers.set_study_zone(target, buffer_km)` — Define study zone, store in project variables
-- `helpers.get_study_zone()` — Read stored study zone (name, bbox_4326, bbox_2154)
+- `helpers.get_study_zone()` — Read stored study zone (name, bbox_4326, bbox_2154, contour_disponible)
+- `helpers.get_study_zone_contour()` — Administrative outline of the zone (WKT EPSG:4326), stored by set_study_zone for a commune
 - `helpers.download_wfs_ogr(url, typename, bbox_4326)` — Download WFS as local GPKG via ogr2ogr
 - `helpers.overpass_query(tags, bbox_4326)` — Query OpenStreetMap via Overpass API. tags: dict like {{"amenity": "school"}} or string "amenity=school". Auto-uses study zone bbox.
 
