@@ -23,9 +23,13 @@ from typing import Any, Dict, Optional, Tuple
 import httpx
 import uvicorn
 from starlette.applications import Starlette
+from starlette.datastructures import Headers
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
+
+from src import workspace_auth
 
 # Multi-user managers (imported lazily — only used when MULTI_USER_MODE=true)
 try:
@@ -2759,10 +2763,44 @@ async def lifespan(app):
         print("[QgisRemoteMCP] Container manager stopped")
 
 
+# ── Authentification des appelants (audit securite des acces, 2026-09-26) ──
+#
+# Le serveur MCP ne verifiait rien en mode mono-utilisateur (celui du
+# deploiement hub) : `tools/call execute_python` etait ouvert a tout pod
+# joignant le Service. En MULTI_USER_MODE, l'authentification propre du
+# serveur (AuthManager) s'applique et ce filtre est neutre.
+
+class _AuthentificationWorkspace:
+    """Middleware ASGI pur : ne bufferise pas les reponses SSE (run_recipe)."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or MULTI_USER_MODE:
+            await self.app(scope, receive, send)
+            return
+        client = scope.get("client")
+        hote = client[0] if client else None
+        autorise, raison = workspace_auth.decider(
+            scope.get("path", ""), hote, Headers(scope=scope))
+        if not autorise:
+            reponse = JSONResponse(
+                {"jsonrpc": "2.0", "id": None,
+                 "error": {"code": -32001,
+                           "message": f"Authentification requise ({raison})."}},
+                status_code=401,
+            )
+            await reponse(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
 # ── Create Starlette app ──────────────────────────────────────────
 
 app = Starlette(
     lifespan=lifespan,
+    middleware=[Middleware(_AuthentificationWorkspace)],
     routes=[
         Route("/mcp", handle_mcp, methods=["GET", "POST", "DELETE"]),
         Route("/health", handle_health, methods=["GET"]),
