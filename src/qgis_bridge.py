@@ -3204,7 +3204,9 @@ class QGISBridge:
             except Exception:
                 pass
         else:
-            grist_path = f"/data/{doc_name}.grist"
+            # Comme les autres exports : dans l'etude active quand il y en a
+            # une, sinon a la racine de /data.
+            grist_path = self._chemin_d_export(f"{doc_name}.grist", "grist")
         if os.path.exists(grist_path):
             os.remove(grist_path)
 
@@ -3221,7 +3223,9 @@ class QGISBridge:
             s = _re.sub(r'_+', '_', s)  # collapse double underscores
             if not s or s[0].isdigit():
                 s = 'T' + s
-            return s or 'Unnamed'
+            # Grist nomme ses tables avec une majuscule initiale, comme les
+            # tables creees depuis son interface ou par qgis2grist.
+            return (s[0].upper() + s[1:]) if s else 'Unnamed'
 
         def sanitize_col(name):
             s = _strip_accents(name)
@@ -3275,6 +3279,8 @@ class QGISBridge:
 
         def extract_renderer_info(layer):
             """Extract QGIS renderer info (graduated/categorized/single) as dict."""
+            if layer is None:  # table calculee (statistiques)
+                return None
             renderer = layer.renderer()
             if not renderer:
                 return None
@@ -3346,6 +3352,15 @@ class QGISBridge:
             return None
 
         def coerce(val, gtype):
+            # Grist range Date et DateTime en secondes epoch. Une chaine ISO
+            # dans ces colonnes s'affiche en rouge, comme une valeur invalide,
+            # et ne se trie ni ne se filtre.
+            v = _coerce_brut(val, gtype)
+            if gtype == 'Date' or gtype.startswith('DateTime'):
+                return self._grist_horodatage(v, gtype)
+            return v
+
+        def _coerce_brut(val, gtype):
             if val is None:
                 return None
             # Unwrap QVariant and PyQt types early
@@ -3405,6 +3420,7 @@ class QGISBridge:
         map_table = None  # first point table for map page
         obs_table = None  # observations table for form page
         temporal_table = None  # table with year field for stats
+        colonnes_ecartees = {}  # table -> champs QGIS non exportes (plafond)
 
         for layer in project.mapLayers().values():
             if not isinstance(layer, QgsVectorLayer):
@@ -3478,6 +3494,10 @@ class QGISBridge:
                         and not any(p in c['col_id'].lower() for p in _priority_pats)]
                 budget = MAX_GRIST_COLS - len(geo_keep) - len(prio_keep)
                 columns = geo_keep + prio_keep + rest[:max(budget, 0)]
+                # Dire ce qui manque : une colonne ecartee en silence est une
+                # donnee que l'utilisateur croit avoir et n'a pas.
+                colonnes_ecartees[tname] = [
+                    c['original_name'] for c in rest[max(budget, 0):]]
 
             # Extract features
             export_orignames = {c['original_name'] for c in columns if c['original_name']}
@@ -3616,6 +3636,10 @@ class QGISBridge:
                         ],
                         'records': stats_records, 'is_point': False, 'is_polygon': False,
                         'source_layer': '(computed)', 'has_lat_lon': False,
+                        # La page Carte parcourt toutes les tables et lit ces
+                        # deux cles : absentes, un projet avec un champ annee
+                        # et une couche de points levait KeyError.
+                        'geom_type': 'none', 'layer_obj': None,
                     }
                     layer_specs.append(stats_spec)
 
@@ -3628,7 +3652,7 @@ class QGISBridge:
         self._grist_create_meta_tables(cur)
 
         # 3b. DocInfo
-        cur.execute("INSERT INTO _grist_DocInfo VALUES (1,'','','',46,?,?)", (tz, '{"locale":"en-US"}'))
+        cur.execute("INSERT INTO _grist_DocInfo VALUES (1,'','','',46,?,?)", (tz, '{"locale":"fr-FR"}'))
 
         # Counters
         col_id_ctr = 0
@@ -4021,8 +4045,12 @@ class QGISBridge:
             name_col = ocrefs.get('titre') or ocrefs.get('latitude')
             if name_col:
                 obs_mapping["Name"] = name_col
+            # Grist lit la configuration d'un widget personnalise sous
+            # `customView`, en chaine JSON -- comme la page Carte ci-dessus.
+            # Sous `customDef`, la cle etait ignoree et la section s'ouvrait
+            # sans widget.
             obs_map_opts = json.dumps({
-                "customDef": {
+                "customView": json.dumps({
                     "mode": "url",
                     "url": "https://gristlabs.github.io/grist-widget/map/",
                     "access": "full",
@@ -4030,7 +4058,7 @@ class QGISBridge:
                     "renderAfterReady": True,
                     "pluginId": "",
                     "sectionId": ""
-                }
+                })
             })
 
             cur.execute("INSERT INTO _grist_Views VALUES (?,?,'',?)",
@@ -4086,120 +4114,84 @@ class QGISBridge:
         cur.execute("INSERT INTO _grist_ACLResources VALUES (1,'','')")
         cur.execute("INSERT INTO _grist_ACLRules VALUES (1,1,63,'[1]','',0,'','',1e999,'','')")
 
-        # NEW 2026-06-24 : optional embedded Scene Manifest V0.2.
-        # Quand un consumer externe (ex: qgis-sspcloud) fournit le JSON,
-        # on l'embarque comme table _custom_SceneManifest dans le .grist.
-        # Permet aux widgets atlas/Grist de lire le style declarative
-        # cross-runtime (cohérence avec la spec V0.2 cerema-offre-de-service).
-        # Idempotent : si scene_manifest_json absent, table non creee.
+        # ── 6. Scene Manifest ────────────────────────────────
+        # La table SceneManifest dit a Atlas quelles tables sont des couches,
+        # ou est leur geometrie et comment les peindre. Sans elle, Atlas
+        # devine -- et ne reconnait pas `_geojson` : polygones et lignes
+        # restaient invisibles. Un manifest fourni (qgis-sspcloud) est
+        # rattache aux tables du document ; sinon on en ecrit un minimal
+        # depuis le projet.
+        couches_manifest = []
+        try:
+            _racine = project.layerTreeRoot()
+        except Exception:
+            _racine = None
+        for spec in layer_specs:
+            if spec.get('geom_type') not in ('point', 'line', 'polygon'):
+                continue
+            _couche = spec['layer_obj']
+            _visible = True
+            try:
+                _noeud = _racine.findLayer(_couche.id()) if _racine else None
+                if _noeud is not None:
+                    _visible = bool(_noeud.isVisible())
+            except Exception:
+                pass
+            couches_manifest.append({
+                'table': spec['table_name'],
+                'nom': spec['source_layer'],
+                'geometrie': spec['geom_type'],
+                'visible': _visible,
+                'n': len(spec['records']),
+                'champs': [
+                    {'name': c['col_id'], 'label': c['label'],
+                     'gType': c['grist_type']}
+                    for c in spec['columns'] if c['original_name']],
+                'style': self._grist_style_declaratif(
+                    extract_renderer_info(_couche),
+                    {c['original_name']: c['col_id']
+                     for c in spec['columns'] if c['original_name']}),
+            })
+
         scene_manifest_embedded = False
         scene_manifest_meta = {}
+        manifest = None
         if scene_manifest_json:
             try:
-                import json as _json
-                import hashlib as _hashlib
-                from datetime import datetime as _dt
-                from datetime import timezone as _timezone
-                # Valider que le JSON parse (best-effort, pas de validation
-                # Pydantic ici pour ne pas tirer la dep cote QgisRemoteMCP).
-                _parsed = _json.loads(scene_manifest_json)
-                _hash = _hashlib.sha256(
-                    scene_manifest_json.encode("utf-8")
-                ).hexdigest()
-                # Creer la table physique (donnees brutes) + entries dans
-                # _grist_Tables / _grist_Tables_column pour qu'elle soit
-                # visible dans l'UI Grist (sinon table fantome SQL-only).
-                # Schema canonique de la table, tel que qgis2grist la cree et
-                # qu'Atlas la lit : manifest_json / scene_hash / source_file /
-                # created_at. Nous ecrivions `content` et `created_at_iso` :
-                # Atlas cherchait `data.manifest_json[i]`, trouvait undefined,
-                # et rendait une carte vide en signalant « manifest JSON
-                # invalide ». Un .grist produit ici n'etait donc lisible par
-                # aucun widget de l'ecosysteme.
-                # `n_layers` est en plus du canonique -- lisible dans l'UI Grist
-                # sans avoir a ouvrir le JSON.
-                cur.execute("""
-                    CREATE TABLE SceneManifest (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        manualSort REAL DEFAULT 0,
-                        manifest_json TEXT DEFAULT '',
-                        scene_hash TEXT DEFAULT '',
-                        source_file TEXT DEFAULT '',
-                        created_at INTEGER DEFAULT 0,
-                        n_layers INTEGER DEFAULT 0
-                    )
-                """)
-                cur.execute(
-                    "INSERT INTO SceneManifest "
-                    "(manualSort, manifest_json, scene_hash, source_file, "
-                    "created_at, n_layers) VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        1.0,
-                        scene_manifest_json,
-                        _hash,
-                        doc_name,
-                        # Grist stocke les DateTime en secondes epoch, pas en
-                        # chaine ISO. Atlas s'en sert pour retenir la ligne la
-                        # plus recente.
-                        int(_dt.now(_timezone.utc).timestamp()),
-                        len(_parsed.get("layers", [])),
-                    ),
-                )
-                # Registry Grist : ajout dans _grist_Tables + colonnes.
-                # ID arbitraire mais unique (max_id+1 evite collisions avec
-                # tables QGIS deja creees ci-dessus).
-                cur.execute("SELECT COALESCE(MAX(id), 0) FROM _grist_Tables")
-                sm_tid = cur.fetchone()[0] + 1
-                cur.execute(
-                    "INSERT INTO _grist_Tables VALUES (?, 'SceneManifest', 0, 0, '', '', '', 0)",
-                    (sm_tid,),
-                )
-                # Colonnes (sans manualSort qui est dejaautocree par Grist).
-                _sm_columns = [
-                    ("manifest_json", "Text",         1.0),
-                    ("scene_hash",    "Text",         2.0),
-                    ("source_file",   "Text",         3.0),
-                    ("created_at",    "DateTime:UTC", 4.0),
-                    ("n_layers",      "Int",          5.0),
-                ]
-                cur.execute("SELECT COALESCE(MAX(id), 0) FROM _grist_Tables_column")
-                sm_col_id = cur.fetchone()[0]
-                for col_name, col_type, col_pos in _sm_columns:
-                    sm_col_id += 1
-                    cur.execute(
-                        "INSERT INTO _grist_Tables_column VALUES "
-                        "(?,?,?,?,?,'','','','',0,0,'')",
-                        (sm_col_id, sm_tid, col_name, col_type, col_pos),
-                    )
-                scene_manifest_embedded = True
-                scene_manifest_meta = {
-                    "scene_hash": _hash,
-                    # `version` est le champ du contrat publie ; `manifest_version`
-                    # est l'ancienne graphie interne de qgis-sspcloud. On lit la
-                    # premiere, on retombe sur la seconde tant qu'elle circule.
-                    "version": str(
-                        _parsed.get("version")
-                        or _parsed.get("manifest_version")
-                        or "0.2.2"
-                    ),
-                    "n_layers": len(_parsed.get("layers", [])),
-                }
+                manifest = json.loads(scene_manifest_json)
+                if not isinstance(manifest, dict):
+                    raise ValueError("le manifest n'est pas un objet JSON")
+                scene_manifest_meta["origine"] = "fourni"
             except Exception as _sm_exc:
-                # Best-effort : on n'echoue pas le .grist global si le SM
-                # est invalide. Le consumer verra scene_manifest_embedded=False.
-                scene_manifest_meta = {"error": str(_sm_exc)}
+                manifest = None
+                scene_manifest_meta["erreur_manifest_fourni"] = str(_sm_exc)
+        if manifest is None and couches_manifest and params.get(
+                "scene_manifest", True) is not False:
+            manifest = self._grist_manifest_minimal(doc_name, couches_manifest)
+            scene_manifest_meta["origine"] = "genere"
+        if manifest is not None:
+            try:
+                manifest = self._grist_lier_manifest_aux_tables(
+                    manifest, couches_manifest)
+                scene_manifest_meta.update(
+                    self._grist_embarquer_scene_manifest(cur, manifest, doc_name))
+                scene_manifest_embedded = True
+            except Exception as _sm_exc:
+                # Best-effort : le .grist reste utile sans manifest.
+                scene_manifest_meta["error"] = str(_sm_exc)
 
         conn.commit()
         conn.close()
 
         total_records = sum(len(s['records']) for s in layer_specs)
         size = os.path.getsize(grist_path)
-        fname = os.path.basename(grist_path)
 
-        return {
+        resultat = {
             "success": True,
             "path": grist_path,
-            "download_url": self._lien_hub(fname),
+            # Le chemin complet : un export d'etude se sert sous
+            # /studies/<sid>/file/..., pas a la racine de /files.
+            "download_url": self._lien_hub(grist_path),
             "size_bytes": size,
             "size_mb": round(size / 1024 / 1024, 1),
             "document_name": doc_name,
@@ -4207,10 +4199,267 @@ class QGISBridge:
             "total_records": total_records,
             "pages": pages_created,
             "layers": {s['table_name']: len(s['records']) for s in layer_specs},
-            # NEW 2026-06-24 : metadata Scene Manifest si embarque.
             "scene_manifest_embedded": scene_manifest_embedded,
             "scene_manifest": scene_manifest_meta,
+            "ouvrir_dans_grist": (
+                "Dans Grist : Ajouter > Importer un document, choisir ce "
+                "fichier .grist. Pour la carte Atlas : Ajouter une vue > "
+                "Personnalise > Atlas, acces complet."),
         }
+        if colonnes_ecartees:
+            resultat["colonnes_ecartees"] = colonnes_ecartees
+        return resultat
+
+    # ── Grist : Scene Manifest et dates (sans QGIS, testables) ───
+
+    @staticmethod
+    def _grist_horodatage(valeur, gtype):
+        """Une date ou un horodatage en secondes epoch, comme Grist les range.
+
+        `Date` : minuit UTC du jour. `DateTime:<fuseau>` : l'heure lue dans ce
+        fuseau quand elle n'en porte pas. Ce qui ne se lit pas comme une date
+        est rendu tel quel -- Grist le montrera comme invalide plutot que de le
+        perdre.
+        """
+        from datetime import date as _date, datetime as _datetime, timezone as _tz
+        if valeur is None or isinstance(valeur, (int, float)):
+            return valeur
+        if isinstance(valeur, _datetime):
+            instant = valeur
+        elif isinstance(valeur, _date):
+            instant = _datetime(valeur.year, valeur.month, valeur.day)
+        else:
+            texte = str(valeur).strip()
+            if not texte:
+                return None
+            try:
+                instant = _datetime.fromisoformat(texte.replace("Z", "+00:00"))
+            except ValueError:
+                return valeur
+        if gtype == 'Date':
+            return int(_datetime(instant.year, instant.month, instant.day,
+                                 tzinfo=_tz.utc).timestamp())
+        if instant.tzinfo is None:
+            fuseau = gtype.split(':', 1)[1] if ':' in gtype else 'UTC'
+            try:
+                from zoneinfo import ZoneInfo
+                instant = instant.replace(tzinfo=ZoneInfo(fuseau))
+            except Exception:
+                instant = instant.replace(tzinfo=_tz.utc)
+        return int(instant.timestamp())
+
+    @staticmethod
+    def _grist_style_declaratif(rendu, colonnes):
+        """Le rendu QGIS, dans la forme `style.declarative` que lit Atlas.
+
+        `colonnes` associe le nom QGIS d'un champ a sa colonne Grist : Atlas lit
+        la valeur dans la ligne, donc sous le nom de colonne. Un rendu sur une
+        expression (aucune colonne) retombe sur une couleur unique.
+        """
+        if not rendu:
+            return None
+        if rendu.get('type') == 'single':
+            return {'kind': 'single', 'color': rendu.get('color') or '#808080',
+                    'opacity': 1.0}
+        champ = colonnes.get(rendu.get('field') or '')
+        if rendu.get('type') == 'categorized':
+            arrets = [{'value': c.get('value'), 'color': c.get('color'),
+                       'label': c.get('label')}
+                      for c in rendu.get('categories') or []]
+        elif rendu.get('type') == 'graduated':
+            arrets = [{'value': c.get('min'), 'lower': c.get('min'),
+                       'upper': c.get('max'), 'color': c.get('color'),
+                       'label': c.get('label')}
+                      for c in rendu.get('classes') or []]
+        else:
+            return None
+        if not champ or not arrets:
+            couleur = arrets[0]['color'] if arrets else '#808080'
+            return {'kind': 'single', 'color': couleur, 'opacity': 1.0}
+        return {'kind': rendu['type'], 'field': champ, 'stops': arrets}
+
+    @staticmethod
+    def _grist_colonnes_geometrie(geometrie):
+        """Les colonnes ou `export_grist` range la geometrie d'une couche."""
+        if geometrie == 'point':
+            return {'lat': 'latitude', 'lon': 'longitude'}
+        return {'geojson': '_geojson', 'lat': 'centroid_lat', 'lon': 'centroid_lon'}
+
+    @classmethod
+    def _grist_manifest_minimal(cls, titre, couches):
+        """Un Scene Manifest 0.2.2 minimal, une couche par table du document."""
+        from datetime import datetime as _datetime, timezone as _tz
+        layers = []
+        for ordre, c in enumerate(couches):
+            couche = {
+                'id': c['table'],
+                'name': c['nom'],
+                'order': ordre,
+                'geometry_type': c['geometrie'],
+                'featureCount': c.get('n', 0),
+                'visibility': {'defaultVisible': bool(c.get('visible', True))},
+            }
+            if c.get('champs'):
+                couche['fields'] = c['champs']
+            if c.get('style'):
+                couche['style'] = {'qml_source': None, 'declarative': c['style']}
+            layers.append(couche)
+        return {
+            'format': 'scene-manifest',
+            'version': '0.2.2',
+            'title': titre,
+            'crs': 'EPSG:4326',
+            'layers': layers,
+            'provenance': [{
+                'platform_id': 'qgis-remote-mcp/export_grist',
+                'produced_at': _datetime.now(_tz.utc).isoformat(),
+            }],
+        }
+
+    @classmethod
+    def _grist_lier_manifest_aux_tables(cls, manifest, couches):
+        """Fait pointer chaque couche du manifest vers sa table du document.
+
+        Un manifest d'etude designe ses donnees par un fichier du volume
+        (`geojson_path`) : dans un .grist, ce chemin ne mene nulle part, et
+        Atlas classe la couche « d'atelier », non chargee. On reconnait la
+        couche par son nom QGIS, son identifiant ou sa table, et on la
+        rattache a la table (`source.table`) avec ses colonnes de geometrie.
+        Une couche sans table (raster, flux) reste telle quelle.
+        """
+        import copy as _copy
+        resultat = _copy.deepcopy(manifest)
+        index = {}
+        for c in couches:
+            for cle in (c['table'], c['nom']):
+                if cle:
+                    index.setdefault(str(cle).strip().lower(), c)
+        for couche in resultat.get('layers') or []:
+            if not isinstance(couche, dict):
+                continue
+            trouvee = None
+            for cle in (couche.get('name'), couche.get('displayName'),
+                        couche.get('id')):
+                if cle and str(cle).strip().lower() in index:
+                    trouvee = index[str(cle).strip().lower()]
+                    break
+            if trouvee is None:
+                continue
+            for cle in ('geojson_path', 'geojson', 'data_url'):
+                couche.pop(cle, None)
+            couche['source'] = {
+                'type': 'grist',
+                'table': trouvee['table'],
+                'geometry_fields': cls._grist_colonnes_geometrie(
+                    trouvee['geometrie']),
+            }
+            couche.setdefault('geometry_type', trouvee['geometrie'])
+        return resultat
+
+    @staticmethod
+    def _grist_embarquer_scene_manifest(cur, manifest, source_file):
+        """Ecrit la table SceneManifest et la declare a Grist.
+
+        Schema canonique, tel que qgis2grist la cree et qu'Atlas la lit :
+        manifest_json / scene_hash / source_file / created_at (secondes
+        epoch, Atlas retient la ligne la plus recente). `n_layers` s'y ajoute,
+        lisible dans l'interface sans ouvrir le JSON.
+
+        La declaration suit la forme des autres tables : `manualSort`, une
+        section brute (`rawViewSectionRef`), des lignes de 7 et 17 valeurs.
+        Elle en avait 8 et 12 : SQLite refusait l'insertion, l'exception etait
+        avalee, et la table restait en SQL sans exister pour Grist -- aucun
+        .grist n'a jamais porte de manifest lisible.
+        """
+        import hashlib as _hashlib
+        import json as _json
+        from datetime import datetime as _dt
+        from datetime import timezone as _timezone
+        texte = _json.dumps(manifest, ensure_ascii=False)
+        _parsed = manifest
+        _hash = _hashlib.sha256(texte.encode("utf-8")).hexdigest()
+        cur.execute("""
+            CREATE TABLE SceneManifest (
+                id INTEGER PRIMARY KEY,
+                manualSort REAL DEFAULT 0,
+                manifest_json TEXT DEFAULT '',
+                scene_hash TEXT DEFAULT '',
+                source_file TEXT DEFAULT '',
+                created_at REAL DEFAULT 0,
+                n_layers INTEGER DEFAULT 0
+            )
+        """)
+        cur.execute(
+            "INSERT INTO SceneManifest "
+            "(id, manualSort, manifest_json, scene_hash, source_file, "
+            "created_at, n_layers) VALUES (1, 1.0, ?, ?, ?, ?, ?)",
+            (
+                texte,
+                _hash,
+                source_file,
+                # Grist stocke les DateTime en secondes epoch.
+                int(_dt.now(_timezone.utc).timestamp()),
+                len(_parsed.get("layers", [])),
+            ),
+        )
+
+        def _suivant(table):
+            cur.execute(f"SELECT COALESCE(MAX(id), 0) FROM {table}")
+            return cur.fetchone()[0] + 1
+
+        sm_tid = _suivant("_grist_Tables")
+        sm_section = _suivant("_grist_Views_section")
+        # Table sans page (primaryViewId 0) : elle figure dans « Donnees
+        # brutes », sans encombrer la navigation du lecteur.
+        cur.execute(
+            "INSERT INTO _grist_Tables VALUES (?, 'SceneManifest', 0, 0, 0, ?, 0)",
+            (sm_tid, sm_section),
+        )
+        cur.execute(
+            "INSERT INTO _grist_Views_section VALUES "
+            "(?,?,0,'record','','',0,0,'','','','','','',0,0,0,'','','')",
+            (sm_section, sm_tid),
+        )
+        sm_col_id = _suivant("_grist_Tables_column")
+        cur.execute(
+            "INSERT INTO _grist_Tables_column VALUES "
+            "(?,?,1.0,'manualSort','ManualSortPos','',0,'','manualSort','',0,0,0,0,NULL,0,NULL)",
+            (sm_col_id, sm_tid),
+        )
+        _sm_columns = [
+            ("manifest_json", "Text",         2.0),
+            ("scene_hash",    "Text",         3.0),
+            ("source_file",   "Text",         4.0),
+            ("created_at",    "DateTime:UTC", 5.0),
+            ("n_layers",      "Int",          6.0),
+        ]
+        champ = _suivant("_grist_Views_section_field")
+        for col_name, col_type, col_pos in _sm_columns:
+            sm_col_id += 1
+            cur.execute(
+                "INSERT INTO _grist_Tables_column VALUES "
+                "(?,?,?,?,?,'',0,'',?,'',1,0,0,0,NULL,0,NULL)",
+                (sm_col_id, sm_tid, col_pos, col_name, col_type, col_name),
+            )
+            cur.execute(
+                "INSERT INTO _grist_Views_section_field VALUES "
+                "(?,?,?,?,100,'',0,0,'','')",
+                (champ, sm_section, col_pos, sm_col_id),
+            )
+            champ += 1
+        scene_manifest_meta = {
+            "scene_hash": _hash,
+            # `version` est le champ du contrat publie ; `manifest_version`
+            # est l'ancienne graphie interne de qgis-sspcloud. On lit la
+            # premiere, on retombe sur la seconde tant qu'elle circule.
+            "version": str(
+                _parsed.get("version")
+                or _parsed.get("manifest_version")
+                or "0.2.2"
+            ),
+            "n_layers": len(_parsed.get("layers", [])),
+        }
+        return scene_manifest_meta
 
     # ── Grist from HTML — universal HTML→Grist converter ─────────
 
@@ -4238,7 +4487,14 @@ class QGISBridge:
 
         max_feat = params.get("max_features_per_layer", 50000)
 
-        grist_path = f"/data/{doc_name}.grist"
+        # `output_path` est annonce pour les deux modes ; il n'etait lu
+        # qu'en mode projet.
+        grist_path = (params.get("output_path") or "").strip() or \
+            self._chemin_d_export(f"{doc_name}.grist", "grist")
+        try:
+            Path(grist_path).parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
         if os.path.exists(grist_path):
             os.remove(grist_path)
 
@@ -4294,7 +4550,7 @@ class QGISBridge:
         self._grist_create_meta_tables(cur)
 
         # 5b. DocInfo
-        cur.execute("INSERT INTO _grist_DocInfo VALUES (1,'','','',46,?,?)", (tz, '{"locale":"en-US"}'))
+        cur.execute("INSERT INTO _grist_DocInfo VALUES (1,'','','',46,?,?)", (tz, '{"locale":"fr-FR"}'))
 
         # Counters
         col_id_ctr = 0
@@ -4619,12 +4875,11 @@ class QGISBridge:
 
         total_records = sum(len(s['records']) for s in table_specs)
         size = os.path.getsize(grist_path)
-        fname = os.path.basename(grist_path)
 
         return {
             "success": True,
             "path": grist_path,
-            "download_url": self._lien_hub(fname),
+            "download_url": self._lien_hub(grist_path),
             "size_bytes": size,
             "size_mb": round(size / 1024 / 1024, 1),
             "document_name": doc_name,
