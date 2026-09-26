@@ -818,18 +818,18 @@ TOOLS = [
     # ── Grist Export ─────────────────────────────────────────────
     {
         "name": "export_grist",
-        "description": "Export as a .grist file (SQLite). Two modes: (1) From QGIS project layers (default) — creates tables, typed columns, map widget, stats, form. (2) From HTML file (html_path) — takes any HTML containing GeoJSON (export_web_map, export_flood_map, export_temporal_map, qgis2web, or any Leaflet HTML), extracts data into Grist tables, and transforms the original map into a Grist custom widget reading from those tables. Same interactive map, but data lives in Grist. Optional: pass output_path to customize the .grist destination (default /data/{doc_name}.grist) and/or scene_manifest_json to embed a Scene Manifest V0.2 as an extra SceneManifest table (cross-runtime style bridge for atlas widgets).",
+        "description": "Livrable Grist : un fichier .grist a importer dans Grist (Ajouter > Importer un document). Mode projet (defaut) : une table par couche vecteur (colonnes typees, geometrie en WGS84 : latitude/longitude pour les points, centroid_lat/centroid_lon + _geojson pour lignes et surfaces, couleur QGIS dans _color), une table SceneManifest que lit le widget Atlas (couches, geometrie, style), et des pages Carte, Statistiques (si un champ annee/year) et Saisie terrain (couche 'observation' ou a formulaire). Mode HTML (html_path) : les GeoJSON d'une page export_web_map/flood/temporal deviennent des tables. Rendu dans l'etude active ; donne a l'utilisateur `download_url` et la consigne `ouvrir_dans_grist` (pas de publish_artifact : aucun kind ne couvre .grist). Signale `colonnes_ecartees` : au-dela de 30 colonnes, les moins utiles sont omises. Avant l'export : ne garder visibles que les couches du livrable, renommer les couches comme le lecteur doit les lire, symboliser dans QGIS.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "html_path": {"type": "string", "description": "Path to any HTML file containing GeoJSON data (from export_web_map, export_flood_map, export_temporal_map, qgis2web, or any Leaflet HTML with inline FeatureCollections). Converts it into a .grist document with data in tables and the original map as a Grist custom widget."},
-                "document_name": {"type": "string", "description": "Document name (default: derived from html filename or project name)"},
-                "max_features_per_layer": {"type": "integer", "description": "Max features per layer (default: 50000)", "default": 50000},
-                "include_stats": {"type": "boolean", "description": "Generate stats summary table (default: true)", "default": True},
-                "detect_relationships": {"type": "boolean", "description": "Auto-detect Ref columns between tables (default: true)", "default": True},
-                "timezone": {"type": "string", "description": "Timezone for DateTime columns (default: Europe/Paris)", "default": "Europe/Paris"},
-                "output_path": {"type": "string", "description": "Optional: custom absolute path for the output .grist file. Default: /data/{document_name}.grist. Parent directory is created if missing. Used by external consumers like qgis-sspcloud to write into {sid}/projects/{pid}/exports/."},
-                "scene_manifest_json": {"type": "string", "description": "Optional: JSON-serialized Scene Manifest V0.2 (cf. cerema-offre-de-service/docs/scene-manifest-spec.md) to embed as an extra SceneManifest table inside the .grist. Allows atlas/Grist widgets to read the declarative style cross-runtime. If absent, no SceneManifest table is created."}
+                "html_path": {"type": "string", "description": "Page HTML contenant des GeoJSON (export_web_map, export_flood_map, export_temporal_map, qgis2web). Absent : mode projet."},
+                "document_name": {"type": "string", "description": "Nom du document (defaut : nom du projet ou du fichier HTML)."},
+                "max_features_per_layer": {"type": "integer", "description": "Entites max par couche (defaut 50000).", "default": 50000},
+                "include_stats": {"type": "boolean", "description": "Table et page Statistiques quand une couche a un champ annee/year (defaut true).", "default": True},
+                "timezone": {"type": "string", "description": "Fuseau des colonnes DateTime (defaut Europe/Paris).", "default": "Europe/Paris"},
+                "output_path": {"type": "string", "description": "Chemin absolu du .grist (defaut : exports/grist/ de l'etude active)."},
+                "scene_manifest_json": {"type": "string", "description": "Scene Manifest 0.2.x a embarquer ; ses couches sont rattachees aux tables par nom. Absent : un manifest minimal est genere depuis le projet."},
+                "scene_manifest": {"type": "boolean", "description": "false : aucune table SceneManifest (defaut true).", "default": True}
             },
             "required": []
         }
