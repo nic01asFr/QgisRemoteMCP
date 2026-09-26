@@ -214,7 +214,148 @@ def test_la_description_dit_contour_et_verification():
     assert "GeoPackage" in bloc
 
 
-# ── 4. Contrat en conteneur ──────────────────────────────────────────────
+
+# ── 4. La couche se designe par son nom (defaut D3 du 2026-09-26) ─────────
+#
+# Mesure apres le lot qualite 1 : clip_to_study_zone exigeait `layer_id`,
+# absent de la L2 de l'agent, d'ou un get_project_info a chaque decoupage.
+
+class _Couche:
+    def __init__(self, lid, nom, n=10):
+        self._id, self._nom, self._n = lid, nom, n
+
+    def id(self):
+        return self._id
+
+    def name(self):
+        return self._nom
+
+    def featureCount(self):
+        return self._n
+
+
+class _Vecteur(_Couche):
+    pass
+
+
+class _Raster(_Couche):
+    pass
+
+
+@pytest.fixture()
+def designer():
+    couches = {}
+    projet = type("P", (), {"mapLayers": lambda self: couches})()
+    arbre = ast.parse(_PONT)
+    code = next(ast.get_source_segment(_PONT, n) for n in ast.walk(arbre)
+                if isinstance(n, ast.FunctionDef) and n.name == "_couche_par_id_ou_nom")
+    espace = {"QgsProject": type("Q", (), {"instance": staticmethod(lambda: projet)}),
+              "QgsVectorLayer": _Vecteur, "_PLAFOND_VERIFICATIONS": 15}
+    exec(textwrap.dedent(code), espace)
+
+    class _Pont:
+        _couche_par_id_ou_nom = espace["_couche_par_id_ou_nom"]
+
+        def _resolve_layer(self, layer_id, vector_only=False):
+            return couches[layer_id], None
+
+    def designer(params, *presentes):
+        couches.clear()
+        couches.update({c.id(): c for c in presentes})
+        return _Pont()._couche_par_id_ou_nom(params, vector_only=True)
+    return designer
+
+
+_BATI = _Vecteur("bati_8f3", "Batiments (BD TOPO)", 112_816)
+_BATI_AIX = _Vecteur("bati_aix_2c1", "batiment_aix_en_provence", 54_557)
+
+
+def test_l_identifiant_reste_la_voie_directe(designer):
+    couche, err = designer({"layer_id": "bati_8f3"}, _BATI, _BATI_AIX)
+    assert err is None and couche is _BATI
+
+
+@pytest.mark.parametrize("cle", ["layer", "layer_name"])
+def test_un_nom_exact_et_unique_suffit(designer, cle):
+    couche, err = designer({cle: "Batiments (BD TOPO)"}, _BATI, _BATI_AIX)
+    assert err is None and couche is _BATI
+
+
+def test_un_nom_passe_dans_layer_id_est_reconnu(designer):
+    couche, err = designer({"layer_id": "Batiments (BD TOPO)"}, _BATI, _BATI_AIX)
+    assert err is None and couche is _BATI
+
+
+def test_la_casse_ne_compte_qu_a_defaut_d_egalite(designer):
+    couche, err = designer({"layer": "batiments (bd topo)"}, _BATI)
+    assert err is None and couche is _BATI
+
+
+def test_jamais_de_correspondance_partielle(designer):
+    couche, err = designer({"layer": "Batiments"}, _BATI, _BATI_AIX)
+    assert couche is None
+    assert "Aucune couche ne s'appelle « Batiments »" in err["error"]
+    assert {c["name"] for c in err["candidates"]} == {"Batiments (BD TOPO)",
+                                                      "batiment_aix_en_provence"}
+
+
+def test_un_nom_ambigu_liste_les_candidates(designer):
+    double = _Vecteur("bati_9d0", "Batiments (BD TOPO)", 5_048)
+    couche, err = designer({"layer": "Batiments (BD TOPO)"}, _BATI, double)
+    assert couche is None
+    assert "Plusieurs couches s'appellent" in err["error"]
+    assert "layer_id" in err["error"]
+    assert err["candidates"] == [
+        {"id": "bati_8f3", "name": "Batiments (BD TOPO)", "features": 112_816},
+        {"id": "bati_9d0", "name": "Batiments (BD TOPO)", "features": 5_048}]
+
+
+def test_un_raster_du_meme_nom_n_est_pas_decoupe(designer):
+    couche, err = designer({"layer": "Ortho"}, _Raster("o1", "Ortho"))
+    assert couche is None and "n'est pas une couche vecteur" in err["error"]
+
+
+def test_sans_designation_l_erreur_dit_quoi_donner(designer):
+    couche, err = designer({}, _BATI)
+    assert couche is None
+    assert "layer_id" in err["error"] and "(layer)" in err["error"]
+
+
+def test_le_decoupage_passe_par_la_designation():
+    assert "self._couche_par_id_ou_nom(params, vector_only=True)" in _DECOUPE
+
+
+def _outil_decoupage():
+    arbre = ast.parse(_MCP)
+    code = next(ast.get_source_segment(_MCP, n) for n in ast.walk(arbre)
+                if isinstance(n, ast.FunctionDef) and n.name == "_tool_clip_to_study_zone")
+    envoyes = []
+    espace = {
+        "qgis_command": lambda action, params, timeout=None: envoyes.append(params) or {},
+        "_text": lambda r, indent=None: "ok", "_auto_screenshot": lambda: "",
+        "_error": lambda m: {"isError": True, "message": m},
+        "SOCKET_TIMEOUT_LONG": 600,
+    }
+    exec(textwrap.dedent(code), espace)
+    return espace["_tool_clip_to_study_zone"], envoyes
+
+
+def test_l_outil_mcp_transmet_le_nom():
+    outil, envoyes = _outil_decoupage()
+    outil({"layer": "Batiments (BD TOPO)"})
+    outil({"layer_id": "bati_8f3", "name": "bati_aix"})
+    assert envoyes == [{"layer": "Batiments (BD TOPO)"},
+                       {"layer_id": "bati_8f3", "name": "bati_aix"}]
+    assert outil({})["isError"]
+
+
+def test_le_schema_propose_le_nom_sans_l_exiger():
+    bloc = _MCP.split('"name": "clip_to_study_zone"')[1].split('"name": "smart_load"')[0]
+    assert '"layer": {"type": "string"' in bloc
+    assert '"required": []' in bloc
+    assert "nom exact (layer)" in bloc
+
+# ── 5. Contrat en conteneur ──────────────────────────────────────────────
 
 @pytest.mark.container
 class TestDansLeConteneur:
@@ -257,3 +398,23 @@ class TestDansLeConteneur:
         assert (v["avant"], v["apres"], v["retirees"]) == (3, 2, 1)
         assert r["name"] == "points_carre"
         assert Path(r["path"]).parent == tmp_path
+
+    def test_surfaces_de_la_zone_d_aix(self):
+        """Rectangle d'Aix mesure sur l'ellipsoide : environ 382 km2 (la
+        sphere authalique donne 381,9). Contour pose egal au rectangle :
+        rapport 1."""
+        qgis_core = pytest.importorskip("qgis.core")
+        import sys
+        if qgis_core.QgsApplication.instance() is None:
+            app = qgis_core.QgsApplication([], False)
+            app.initQgis()
+        sys.path.insert(0, str(_RACINE / "src"))
+        espace = {"__name__": "qgis_bridge_essai"}
+        exec(compile(_PONT.split("# ── Start bridge")[0], "qgis_bridge.py", "exec"), espace)
+        x0, y0, x1, y1 = _AIX
+        qgis_core.QgsExpressionContextUtils.setProjectVariable(
+            qgis_core.QgsProject.instance(), "study_zone_contour_wkt",
+            f"POLYGON (({x0} {y0}, {x1} {y0}, {x1} {y1}, {x0} {y1}, {x0} {y0}))")
+        rectangle, commune = espace["QGISBridge"]()._surfaces_zone(_AIX)
+        assert rectangle == pytest.approx(381.9, rel=0.01)
+        assert commune == pytest.approx(rectangle, rel=0.001)

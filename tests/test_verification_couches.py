@@ -15,6 +15,7 @@ Ces tests ne demandent pas QGIS : les fonctions du pont sont extraites de la
 source et executees avec des doublures.
 """
 import ast
+import math
 import os
 import textwrap
 from pathlib import Path
@@ -123,7 +124,8 @@ def pont():
     voulus = {"_verification_couche", "_geometries_invalides",
               "_verifier_couches", "_retenir_verification",
               "_origine_de_la_couche", "lire_etude_active",
-              "_verification_chargement", "_couche_depuis_fichier_de_sortie"}
+              "_verification_chargement", "_couche_depuis_fichier_de_sortie",
+              "_lecture_emprise"}
     bouts = {n.name: ast.get_source_segment(_PONT, n) for n in ast.walk(arbre)
              if isinstance(n, ast.FunctionDef) and n.name in voulus}
     assert voulus == set(bouts), voulus - set(bouts)
@@ -149,6 +151,9 @@ def pont():
         _origine_de_la_couche = espace["_origine_de_la_couche"]
         _geometries_invalides = staticmethod(espace["_geometries_invalides"])
         _emprise_et_rapport = staticmethod(_emprise_et_rapport)
+        _lecture_emprise = staticmethod(espace["_lecture_emprise"])
+        # (rectangle, commune) en km2 : QGIS les mesure, les tests les posent.
+        surfaces = (None, None)
         _verification_couche = espace["_verification_couche"]
         _verifier_couches = espace["_verifier_couches"]
         _retenir_verification = espace["_retenir_verification"]
@@ -157,6 +162,9 @@ def pont():
 
         def _zone_etude(self):
             return self.zone
+
+        def _surfaces_zone(self, zone_bbox):
+            return self.surfaces if zone_bbox else (None, None)
 
     return _Pont()
 
@@ -312,3 +320,119 @@ def test_la_recette_s_appuie_sur_l_action_de_verification():
     bloc = _MCP.split("def _verification_recette")[1].split("\ndef ")[0]
     assert '"verify_layers"' in bloc
     assert '"sauf": avant' in bloc
+
+
+# ── 6. L'emprise se lit sans contresens (defaut D2 du 2026-09-26) ────────
+#
+# Mesure apres le lot qualite 1 : `rapport_emprise_zone` a ete lu deux fois
+# comme « rectangle / commune ». A Aix, « rectangle legerement plus grand
+# que la commune (rapport 1.1) », alors que 1,1 rapportait l'emprise chargee
+# au rectangle, et que ce rectangle couvre 2 fois la commune. Au Lavandou,
+# « une zone 19 fois plus grande que la commune », alors que 19 rapportait
+# l'emprise des routes chargees au rectangle.
+
+_LAVANDOU = [6.348912, 43.125273, 6.454027, 43.208483]
+# Surfaces communales : Aix, contour INSEE 13001 mesure le 2026-09-24 (fiche
+# de mesure) ; Le Lavandou, geo.api.gouv.fr/communes/83070 (3 024 ha).
+_COMMUNE_AIX_KM2 = 187.6
+_COMMUNE_LAVANDOU_KM2 = 30.2
+
+
+def _surface_rectangle_km2(b):
+    """Reference independante de QGIS : aire exacte d'un rectangle
+    lon/lat sur la sphere authalique (rayon 6 371,007 km)."""
+    r = 6371.0072
+    return (r * r * math.radians(b[2] - b[0])
+            * (math.sin(math.radians(b[3])) - math.sin(math.radians(b[1]))))
+
+
+def _agrandi(b, facteur_surface):
+    """Rectangle de meme centre, `facteur_surface` fois plus vaste."""
+    k = math.sqrt(facteur_surface)
+    cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+    dx, dy = (b[2] - b[0]) * k / 2, (b[3] - b[1]) * k / 2
+    return [cx - dx, cy - dy, cx + dx, cy + dy]
+
+
+def _phrase(lecture, motif):
+    return next(p for p in lecture.split(". ") if motif in p)
+
+
+def test_aix_le_rectangle_couvre_deux_fois_la_commune(pont):
+    rectangle = _surface_rectangle_km2(_AIX)
+    assert 375 < rectangle < 390, "le rectangle d'Aix fait environ 382 km2"
+    pont.surfaces = (rectangle, _COMMUNE_AIX_KM2)
+    v = pont._verification_chargement({"feature_count": 112_816},
+                                      _Vecteur(emprise=_agrandi(_AIX, 1.1)),
+                                      _AIX, "Aix-en-Provence")
+    assert v["emprise_couche_sur_rectangle_zone"] == 1.1
+    assert v["surface_rectangle_zone_km2"] == pytest.approx(rectangle, abs=0.1)
+    assert v["surface_commune_km2"] == 187.6
+    assert v["rectangle_sur_commune"] == 2.0
+    lecture = v["lecture"]
+    # Le 1,1 est rapporte au rectangle, et la phrase ne parle pas de commune.
+    un_virgule_un = _phrase(lecture, "1,1")
+    assert "rectangle de la zone" in un_virgule_un
+    assert "commune" not in un_virgule_un
+    # Le rapport a la commune est dit, avec ses deux surfaces.
+    assert "environ 2 fois la surface de la commune" in lecture
+    assert "km2 contre 187,6 km2" in lecture
+    assert "un chiffre communal exige un decoupage" in lecture
+
+
+def test_lavandou_dix_neuf_fois_le_rectangle_pas_la_commune(pont):
+    rectangle = _surface_rectangle_km2(_LAVANDOU)
+    pont.surfaces = (rectangle, _COMMUNE_LAVANDOU_KM2)
+    v = pont._verification_chargement({"feature_count": 5_048},
+                                      _Vecteur(emprise=_agrandi(_LAVANDOU, 19)),
+                                      _LAVANDOU, "Le Lavandou")
+    assert v["emprise_couche_sur_rectangle_zone"] == 19.0
+    assert v["rectangle_sur_commune"] == 2.6
+    assert "emprise_aberrante" not in v.get("echecs", []), "19 < seuil de 25"
+    dix_neuf = _phrase(v["lecture"], "19 fois")
+    assert "rectangle de la zone" in dix_neuf
+    assert "ne dit rien de la commune" in v["lecture"]
+    assert "environ 2,6 fois la surface de la commune" in v["lecture"]
+
+
+def test_l_ancien_champ_ambigu_a_disparu(pont):
+    pont.surfaces = (381.9, _COMMUNE_AIX_KM2)
+    b = pont._verification_couche(_Vecteur(emprise=_AIX), _AIX, "Aix-en-Provence")
+    assert "rapport_emprise_zone" not in b
+    assert '["rapport_emprise_zone"]' not in _PONT, "plus aucun producteur"
+
+
+def test_sans_contour_le_compte_porte_sur_le_rectangle(pont):
+    pont.surfaces = (381.9, None)
+    b = pont._verification_couche(_Vecteur(emprise=_AIX), _AIX, "Zone [5.27,43.45]")
+    assert b["surface_rectangle_zone_km2"] == 381.9
+    assert "surface_commune_km2" not in b and "rectangle_sur_commune" not in b
+    assert "pas de contour communal" in b["lecture"]
+
+
+def test_sans_zone_ni_emprise_pas_de_lecture(pont):
+    b = pont._verification_couche(_Vecteur(n=0), None, None)
+    assert "lecture" not in b
+    assert "emprise_couche_sur_rectangle_zone" not in b
+
+
+def test_une_emprise_aberrante_se_lit_aussi(pont):
+    b = pont._verification_couche(_Vecteur(emprise=_FRANCE_ET_OUTRE_MER),
+                                  _AIX, "Aix-en-Provence")
+    assert "n'a pas ete bornee a la zone" in b["lecture"]
+    assert "que le rectangle de la zone d'etude" in b["avertissement"]
+
+
+def test_le_decoupage_dit_que_ses_comptes_sont_communaux():
+    bloc = _methode("_action_clip_to_study_zone")
+    litteral = bloc.split("verification = {")[1].split("\n        }")[0]
+    assert '"lecture": (f"Couche decoupee au contour de' in litteral, \
+        "la lecture du decoupage doit primer sur la lecture commune (setdefault)"
+
+
+def test_les_surfaces_sont_mesurees_sur_l_ellipsoide():
+    bloc = _methode("_surfaces_zone")
+    assert "QgsDistanceArea()" in bloc
+    assert 'setEllipsoid("WGS84")' in bloc
+    assert '"study_zone_contour_wkt"' in bloc
+    assert "/ 1e6" in bloc, "en km2"
