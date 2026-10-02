@@ -310,7 +310,10 @@ TOOLS = [
                 "action": {"type": "string", "description": "Bridge action to run (default 'execute_python')", "default": "execute_python"},
                 "code": {"type": "string", "description": "Python code when action is execute_python"},
                 "params": {"type": "object", "description": "Params for the action (for non-execute_python actions). Ignored when 'code' is provided.", "default": {}},
-                "timeout": {"type": "integer", "description": "Server-side timeout in seconds (default 600)", "default": 600}
+                "timeout": {"type": "integer", "description": "Server-side timeout in seconds (default 600)", "default": 600},
+                "tool": {"type": "string", "description": "Name of an MCP tool to run in the background (e.g. run_recipe, smart_load, export_layer). When set, 'arguments' are that tool's arguments and poll_job returns the tool's own result once done. One background tool runs at a time; others wait in order."},
+                "arguments": {"type": "object", "description": "Arguments of 'tool'", "default": {}},
+                "client_id": {"type": "string", "description": "Idempotency key: submitting again with the same client_id returns the existing job instead of running the tool twice."}
             },
             "required": []
         }
@@ -1137,8 +1140,35 @@ def _tool_execute_python(arguments: dict) -> dict:
     return {"content": _text(response, indent=2) + _auto_screenshot()}
 
 
+# ── Taches de fond au niveau des outils ─────────────────────────
+# `execute_async(tool=..., arguments=...)` lance un outil MCP complet en
+# arriere-plan (run_recipe, smart_load, exports...) et `poll_job` rend, a la
+# fin, le contenu exact que l'outil aurait rendu en direct. Cf.
+# src/taches_outils.py pour les regles (une tache a la fois, soumission
+# idempotente par client_id, battement reel, annulation honnete).
+from src.taches_outils import (  # noqa: E402
+    RegistreTachesOutils, contenu_de_suivi, est_id_de_tache,
+)
+
+_TACHES_OUTILS = RegistreTachesOutils(
+    executer=lambda nom, args: execute_tool(nom, args),
+    outil_connu=lambda nom: nom in TOOL_HANDLERS,
+)
+
+
 def _tool_execute_async(arguments: dict) -> dict:
     """Submit a bridge action for background execution. Returns {job_id}."""
+    if arguments.get("tool"):
+        response = _TACHES_OUTILS.soumettre(
+            arguments["tool"], arguments.get("arguments") or {},
+            client_id=arguments.get("client_id"),
+        )
+        if "error" in response:
+            return {"content": _text(response), "isError": True}
+        response.setdefault("hint",
+            "Poll with poll_job(job_id). When status is 'done', the tool's own "
+            "result follows the status block.")
+        return {"content": _text(response, indent=2)}
     action = arguments.get("action", "execute_python")
     user_timeout = arguments.get("timeout", 600)
 
@@ -1165,6 +1195,12 @@ def _tool_poll_job(arguments: dict) -> dict:
     err = _validate_required(arguments, "job_id")
     if err:
         return _error(err)
+    if est_id_de_tache(arguments["job_id"]):
+        etat = _TACHES_OUTILS.etat(arguments["job_id"])
+        if etat is None:
+            return {"content": _text({"error": f"Unknown job_id: {arguments['job_id']}"})}
+        return {"content": contenu_de_suivi(
+            etat, _TACHES_OUTILS.resultat(arguments["job_id"]))}
     response = qgis_poll(arguments["job_id"])
     return {"content": _text(response, indent=2)}
 
@@ -1174,6 +1210,8 @@ def _tool_cancel_job(arguments: dict) -> dict:
     err = _validate_required(arguments, "job_id")
     if err:
         return _error(err)
+    if est_id_de_tache(arguments["job_id"]):
+        return {"content": _text(_TACHES_OUTILS.annuler(arguments["job_id"]), indent=2)}
     response = qgis_cancel(arguments["job_id"])
     return {"content": _text(response, indent=2)}
 
