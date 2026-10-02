@@ -57,6 +57,21 @@ curl http://localhost:8100/health
 # → {"status":"ok","bridge":true,"server":"QgisRemoteMCP","multi_user":false}
 ```
 
+### Access control
+
+The REST API, the MCP server and noVNC check every non-loopback call
+(`src/workspace_auth.py`). `/health` and calls from `127.0.0.1` stay open.
+
+| Variable | Effect |
+|----------|--------|
+| `WORKSPACE_AUTH_MODE` | `permissive` (default: unauthenticated calls are logged, then served), `enforce` (refused with 401), `off` |
+| `WORKSPACE_TOKEN` | Shared token, sent as `X-Workspace-Token`. Default: HMAC-SHA256 of `HUB_API_KEY` |
+| `WORKSPACE_CORS_ORIGINS` | Comma-separated origins allowed by the REST API. Default: localhost only |
+| `STREAM_BIND_HOST` | Bind address of the MJPEG stream. Default `0.0.0.0`; the hub deployment uses `127.0.0.1` |
+
+In `enforce` mode, noVNC requires HTTP Basic auth (user `hub`, password = the
+token), and x11vnc only listens on the loopback interface.
+
 ### 3. Connect Claude Desktop
 
 Edit `claude_desktop_config.json`:

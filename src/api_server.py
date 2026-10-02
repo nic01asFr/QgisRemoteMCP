@@ -23,10 +23,15 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, JSONResponse, FileResponse, Response
 import uvicorn
+
+try:  # lance comme script (/app/src dans sys.path) ou importe comme paquet
+    import workspace_auth
+except ImportError:  # pragma: no cover - chemin d'import des tests
+    from src import workspace_auth
 
 SOCKET_PATH = "/tmp/qgis_bridge.sock"
 SOCKET_TIMEOUT = 30  # seconds
@@ -54,12 +59,34 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# CORS restreint (audit securite des acces, 2026-09-26). `allow_origins=["*"]`
+# laissait toute page web piloter l'API depuis le navigateur d'un utilisateur
+# qui la joignait. Par defaut : origines locales seulement ; en deploiement
+# hub, aucun navigateur ne joint le workspace directement. Voir
+# `workspace_auth.origines_cors` et WORKSPACE_CORS_ORIGINS.
+_origines, _motif_origines = workspace_auth.origines_cors()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_origines,
+    allow_origin_regex=_motif_origines,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def authentifier_l_appelant(request: Request, call_next):
+    """Refuse (mode enforce) ou journalise (mode permissive) un appel non
+    local sans jeton du hub. Voir src/workspace_auth.py."""
+    hote = request.client.host if request.client else None
+    autorise, raison = workspace_auth.decider(
+        request.url.path, hote, request.headers)
+    if not autorise:
+        return JSONResponse(
+            {"detail": f"Authentification requise ({raison})."},
+            status_code=401,
+        )
+    return await call_next(request)
 
 
 def _lire_reponse_pont(texte: str):

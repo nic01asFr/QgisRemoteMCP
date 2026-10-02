@@ -23,9 +23,13 @@ from typing import Any, Dict, Optional, Tuple
 import httpx
 import uvicorn
 from starlette.applications import Starlette
+from starlette.datastructures import Headers
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
+
+from src import workspace_auth
 
 # Multi-user managers (imported lazily — only used when MULTI_USER_MODE=true)
 try:
@@ -291,7 +295,7 @@ TOOLS = [
     },
     {
         "name": "execute_python",
-        "description": "Execute Python/PyQGIS code inside the running QGIS instance. The script has access to qgis.core.*, iface, processing.run(), project = QgsProject.instance(), canvas = iface.mapCanvas(). A `helpers` module is available with ready-made functions: helpers.geocode(addr), helpers.add_wfs(url, typename, bbox), helpers.add_wms(url, layers), helpers.add_wmts(url, layers), helpers.add_xyz(url, name), helpers.zoom_to(target), helpers.create_point_layer(name, points), helpers.load_catalog_source(id), helpers.bbox_from_canvas(), helpers.search_commune(name), helpers.get_elevation(lon, lat). Store return values in the `result` dict. Read skill://helpers for full reference. Les couches creees par le script recoivent un bloc `verification` (compte, emprise, origine, `lecture` en clair) : lis-le. Avant d'ecrire du code, verifie qu'un outil ne couvre pas le besoin (smart_load, clip_to_study_zone, run_processing).",
+        "description": "Execute Python/PyQGIS code inside the running QGIS instance. The script has access to qgis.core.*, iface, processing.run(), project = QgsProject.instance(), canvas = iface.mapCanvas(). A `helpers` module is available with ready-made functions: helpers.geocode(addr), helpers.add_wfs(url, typename, bbox), helpers.add_wms(url, layers), helpers.add_wmts(url, layers), helpers.add_xyz(url, name), helpers.zoom_to(target), helpers.create_point_layer(name, points), helpers.load_catalog_source(id), helpers.bbox_from_canvas(), helpers.search_commune(name), helpers.get_elevation(lon, lat). Store return values in the `result` dict. Read skill://helpers for full reference. Les couches creees par le script recoivent un bloc `verification` (compte, emprise, origine, `lecture` en clair) : lis-le. Avant d'ecrire du code, verifie qu'un outil ne couvre pas le besoin (smart_load, clip_to_study_zone, densite_par_maille, compter_par_zone, run_processing).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -310,7 +314,10 @@ TOOLS = [
                 "action": {"type": "string", "description": "Bridge action to run (default 'execute_python')", "default": "execute_python"},
                 "code": {"type": "string", "description": "Python code when action is execute_python"},
                 "params": {"type": "object", "description": "Params for the action (for non-execute_python actions). Ignored when 'code' is provided.", "default": {}},
-                "timeout": {"type": "integer", "description": "Server-side timeout in seconds (default 600)", "default": 600}
+                "timeout": {"type": "integer", "description": "Server-side timeout in seconds (default 600)", "default": 600},
+                "tool": {"type": "string", "description": "Name of an MCP tool to run in the background (e.g. run_recipe, smart_load, export_layer). When set, 'arguments' are that tool's arguments and poll_job returns the tool's own result once done. One background tool runs at a time; others wait in order."},
+                "arguments": {"type": "object", "description": "Arguments of 'tool'", "default": {}},
+                "client_id": {"type": "string", "description": "Idempotency key: submitting again with the same client_id returns the existing job instead of running the tool twice."}
             },
             "required": []
         }
@@ -686,6 +693,38 @@ TOOLS = [
                 "layer_id": {"type": "string", "description": "ID de la couche vecteur a decouper"},
                 "layer": {"type": "string", "description": "Ou son nom exact, s'il est unique"},
                 "name": {"type": "string", "description": "Nom de la couche et du fichier produits (defaut : <couche>_<zone>, sans accent ni espace, ex. batiment_aix_en_provence)", "default": ""}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "densite_par_maille",
+        "description": "Densite d'une couche par maille carree, en quelques secondes par algorithmes natifs (native:creategrid + native:countpointsinpolygon sur les centroides, index spatial) : pour toute densite, grille ou carroyage, JAMAIS une boucle PyQGIS. Couche designee par layer_id ou nom exact (layer). Maille en metres (taille_m, defaut 200), calcul en projection metrique. Emprise : contour de la zone d'etude s'il est connu, sinon son rectangle. Mesure : nombre d'entites (defaut, avec densite_km2), surface (m2) ou part_surface (% de la maille), ces deux-la pour des polygones. Sortie : GeoPackage de l'etude, style gradue applique. Le retour porte un bloc `verification` (mailles, total compte = total dans l'emprise, mailles vides, min/max/mediane, `lecture`).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "layer_id": {"type": "string", "description": "ID de la couche a compter"},
+                "layer": {"type": "string", "description": "Ou son nom exact, s'il est unique"},
+                "taille_m": {"type": "number", "description": "Cote de la maille en metres (10 a 10 000)", "default": 200},
+                "mesure": {"type": "string", "enum": ["nombre", "surface", "part_surface"], "description": "nombre d'entites (defaut), surface en m2 ou part de la maille couverte en %", "default": "nombre"},
+                "emprise": {"type": "string", "enum": ["zone", "couche"], "description": "zone : contour de la zone d'etude, a defaut son rectangle (defaut) ; couche : emprise de la couche", "default": "zone"},
+                "name": {"type": "string", "description": "Nom de la couche et du fichier produits (defaut : densite_<couche>_<taille>m)", "default": ""}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "compter_par_zone",
+        "description": "Compte les entites d'une couche dans chaque polygone d'une autre (par quartier, IRIS, ilot, commune...), en quelques secondes par algorithmes natifs (native:countpointsinpolygon sur les centroides, index spatial) : JAMAIS une boucle PyQGIS. Entites : layer_id ou nom exact (layer) ; zones : zones_id ou nom exact (zones), des polygones. Mesure : nombre (defaut, avec densite_km2), surface (m2) ou part_surface (%). Sortie : copie des zones avec les champs comptes, GeoPackage de l'etude, style gradue applique. Le retour porte un bloc `verification` (zones, total compte, entites hors zones, zones vides, min/max/mediane, `lecture`).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "layer_id": {"type": "string", "description": "ID de la couche dont on compte les entites"},
+                "layer": {"type": "string", "description": "Ou son nom exact, s'il est unique"},
+                "zones_id": {"type": "string", "description": "ID de la couche de polygones (quartiers, IRIS, ilots...)"},
+                "zones": {"type": "string", "description": "Ou son nom exact, s'il est unique"},
+                "mesure": {"type": "string", "enum": ["nombre", "surface", "part_surface"], "description": "nombre d'entites (defaut), surface en m2 ou part de la zone couverte en %", "default": "nombre"},
+                "name": {"type": "string", "description": "Nom de la couche et du fichier produits (defaut : <couche>_par_<zones>)", "default": ""}
             },
             "required": []
         }
@@ -1137,8 +1176,35 @@ def _tool_execute_python(arguments: dict) -> dict:
     return {"content": _text(response, indent=2) + _auto_screenshot()}
 
 
+# ── Taches de fond au niveau des outils ─────────────────────────
+# `execute_async(tool=..., arguments=...)` lance un outil MCP complet en
+# arriere-plan (run_recipe, smart_load, exports...) et `poll_job` rend, a la
+# fin, le contenu exact que l'outil aurait rendu en direct. Cf.
+# src/taches_outils.py pour les regles (une tache a la fois, soumission
+# idempotente par client_id, battement reel, annulation honnete).
+from src.taches_outils import (  # noqa: E402
+    RegistreTachesOutils, contenu_de_suivi, est_id_de_tache,
+)
+
+_TACHES_OUTILS = RegistreTachesOutils(
+    executer=lambda nom, args: execute_tool(nom, args),
+    outil_connu=lambda nom: nom in TOOL_HANDLERS,
+)
+
+
 def _tool_execute_async(arguments: dict) -> dict:
     """Submit a bridge action for background execution. Returns {job_id}."""
+    if arguments.get("tool"):
+        response = _TACHES_OUTILS.soumettre(
+            arguments["tool"], arguments.get("arguments") or {},
+            client_id=arguments.get("client_id"),
+        )
+        if "error" in response:
+            return {"content": _text(response), "isError": True}
+        response.setdefault("hint",
+            "Poll with poll_job(job_id). When status is 'done', the tool's own "
+            "result follows the status block.")
+        return {"content": _text(response, indent=2)}
     action = arguments.get("action", "execute_python")
     user_timeout = arguments.get("timeout", 600)
 
@@ -1165,6 +1231,12 @@ def _tool_poll_job(arguments: dict) -> dict:
     err = _validate_required(arguments, "job_id")
     if err:
         return _error(err)
+    if est_id_de_tache(arguments["job_id"]):
+        etat = _TACHES_OUTILS.etat(arguments["job_id"])
+        if etat is None:
+            return {"content": _text({"error": f"Unknown job_id: {arguments['job_id']}"})}
+        return {"content": contenu_de_suivi(
+            etat, _TACHES_OUTILS.resultat(arguments["job_id"]))}
     response = qgis_poll(arguments["job_id"])
     return {"content": _text(response, indent=2)}
 
@@ -1174,6 +1246,8 @@ def _tool_cancel_job(arguments: dict) -> dict:
     err = _validate_required(arguments, "job_id")
     if err:
         return _error(err)
+    if est_id_de_tache(arguments["job_id"]):
+        return {"content": _text(_TACHES_OUTILS.annuler(arguments["job_id"]), indent=2)}
     response = qgis_cancel(arguments["job_id"])
     return {"content": _text(response, indent=2)}
 
@@ -1558,6 +1632,47 @@ def _tool_clip_to_study_zone(arguments: dict) -> dict:
     return {"content": content}
 
 
+def _params_de_comptage(arguments: dict, cles: tuple) -> dict:
+    """Arguments transmis au pont : ceux renseignes, parmi `cles`."""
+    return {cle: arguments[cle] for cle in cles
+            if arguments.get(cle) not in (None, "")}
+
+
+def _tool_densite_par_maille(arguments: dict) -> dict:
+    # Constat live du 2026-10-02 : trois execute_python pour une densite
+    # batie par maille, le dernier au-dela de 12 minutes. Ici, des
+    # algorithmes natifs et un index spatial : quelques secondes.
+    params = _params_de_comptage(arguments, ("layer_id", "layer", "layer_name"))
+    if not params:
+        return _error("Couche non precisee : donne layer_id, ou le nom exact "
+                      "de la couche (layer).")
+    params.update(_params_de_comptage(
+        arguments, ("taille_m", "mesure", "emprise", "name")))
+    response = qgis_command("densite_par_maille", params, timeout=SOCKET_TIMEOUT_LONG)
+    content = _text(response, indent=2)
+    if not response.get("error"):
+        content += _auto_screenshot()
+    return {"content": content}
+
+
+def _tool_compter_par_zone(arguments: dict) -> dict:
+    params = _params_de_comptage(arguments, ("layer_id", "layer", "layer_name"))
+    if not params:
+        return _error("Couche non precisee : donne layer_id, ou le nom exact "
+                      "de la couche dont on compte les entites (layer).")
+    zones = _params_de_comptage(arguments, ("zones_id", "zones"))
+    if not zones:
+        return _error("Zones non precisees : donne zones_id, ou le nom exact "
+                      "de la couche de polygones (zones).")
+    params.update(zones)
+    params.update(_params_de_comptage(arguments, ("mesure", "name")))
+    response = qgis_command("compter_par_zone", params, timeout=SOCKET_TIMEOUT_LONG)
+    content = _text(response, indent=2)
+    if not response.get("error"):
+        content += _auto_screenshot()
+    return {"content": content}
+
+
 def _tool_set_layer_style(arguments: dict) -> dict:
     err = _validate_required(arguments, "layer_id")
     if err:
@@ -1837,7 +1952,7 @@ def _tool_publish_artifact(arguments: dict) -> dict:
 
 # Actions that need longer timeouts (WFS downloads, heavy exports)
 _LONG_TIMEOUT_ACTIONS = frozenset({
-    "smart_load", "add_from_catalog", "clip_to_study_zone", "export_flood_map", "export_web_map", "export_temporal_map", "export_qfield", "export_grist", "execute_python",
+    "smart_load", "add_from_catalog", "clip_to_study_zone", "densite_par_maille", "compter_par_zone", "export_flood_map", "export_web_map", "export_temporal_map", "export_qfield", "export_grist", "execute_python",
 })
 
 
@@ -2153,6 +2268,8 @@ TOOL_HANDLERS = {
     "get_study_zone": _tool_get_study_zone,
     "smart_load": _tool_smart_load,
     "clip_to_study_zone": _tool_clip_to_study_zone,
+    "densite_par_maille": _tool_densite_par_maille,
+    "compter_par_zone": _tool_compter_par_zone,
     "set_layer_style": _tool_set_layer_style,
     "set_layer_visibility": _tool_set_layer_visibility,
     "list_layout_templates": _tool_list_layout_templates,
@@ -2193,7 +2310,7 @@ INSTRUCTIONS = f"""You control a live QGIS Desktop instance. Every modifying too
 1. **set_study_zone** — Define where: "Montpellier", "Sete", "Gare de Lyon, Paris". Stores bbox in project variables.
 2. **smart_load** — Load data by catalog ID (e.g. 'bdtopo_batiments'). WFS data is downloaded as local GeoPackage with spatial index (fast for Processing). Rasters stream as usual.
 3. **clip_to_study_zone** — Before any figure "in the commune": cut the layer to the administrative outline (smart_load loads a rectangle).
-4. **Act** — run_processing, execute_python on local layers (no network delays)
+4. **Act** — densite_par_maille / compter_par_zone for density or counts per zone (native algorithms, seconds; never a PyQGIS loop), run_processing, execute_python on local layers (no network delays)
 5. **Verify** — read the `verification` block returned by each tool (count, extent vs zone, warnings), then get_screenshot
 6. **Deliver** — export_layer, export_pdf, download_project
 
@@ -2759,10 +2876,44 @@ async def lifespan(app):
         print("[QgisRemoteMCP] Container manager stopped")
 
 
+# ── Authentification des appelants (audit securite des acces, 2026-09-26) ──
+#
+# Le serveur MCP ne verifiait rien en mode mono-utilisateur (celui du
+# deploiement hub) : `tools/call execute_python` etait ouvert a tout pod
+# joignant le Service. En MULTI_USER_MODE, l'authentification propre du
+# serveur (AuthManager) s'applique et ce filtre est neutre.
+
+class _AuthentificationWorkspace:
+    """Middleware ASGI pur : ne bufferise pas les reponses SSE (run_recipe)."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or MULTI_USER_MODE:
+            await self.app(scope, receive, send)
+            return
+        client = scope.get("client")
+        hote = client[0] if client else None
+        autorise, raison = workspace_auth.decider(
+            scope.get("path", ""), hote, Headers(scope=scope))
+        if not autorise:
+            reponse = JSONResponse(
+                {"jsonrpc": "2.0", "id": None,
+                 "error": {"code": -32001,
+                           "message": f"Authentification requise ({raison})."}},
+                status_code=401,
+            )
+            await reponse(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
 # ── Create Starlette app ──────────────────────────────────────────
 
 app = Starlette(
     lifespan=lifespan,
+    middleware=[Middleware(_AuthentificationWorkspace)],
     routes=[
         Route("/mcp", handle_mcp, methods=["GET", "POST", "DELETE"]),
         Route("/health", handle_health, methods=["GET"]),

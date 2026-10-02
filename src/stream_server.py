@@ -113,5 +113,10 @@ class StreamHandler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     print(f"[Stream Server] Starting MJPEG stream on :{PORT}/stream")
     print(f"[Stream Server] Single frame: :{PORT}/frame")
-    server = HTTPServer(("0.0.0.0", PORT), StreamHandler)
+    # STREAM_BIND_HOST (2026-09-26, audit securite des acces) : le flux montre
+    # l'ecran QGIS sans authentification. Le deploiement hub le restreint a la
+    # boucle locale (127.0.0.1) ; le defaut reste 0.0.0.0 pour l'usage
+    # autonome (docker-compose publie le port 8081).
+    hote = os.environ.get("STREAM_BIND_HOST", "0.0.0.0") or "0.0.0.0"
+    server = HTTPServer((hote, PORT), StreamHandler)
     server.serve_forever()
