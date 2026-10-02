@@ -250,6 +250,7 @@ class QGISBridge:
         "remove_layer", "run_processing", "zoom_to_extent",
         "set_layer_style", "set_layer_visibility", "apply_style",
         "add_from_catalog", "set_study_zone", "smart_load", "clip_to_study_zone",
+        "densite_par_maille", "compter_par_zone",
         "apply_layout_template", "export_web_map", "export_flood_map", "export_temporal_map", "export_qfield", "export_grist",
         "mouse_click", "mouse_scroll", "key_press", "mouse_drag",
     })
@@ -6102,12 +6103,14 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
     # seul lecteur etait le modele, et c'est lui qui le lisait de travers.
     #
     # Codes d'echec : emprise_aberrante, zero_entite, geometries_invalides,
-    # crs_inconnu, rien_retire (decoupage sans effet, cf. clip_to_study_zone)
+    # crs_inconnu, rien_retire (decoupage sans effet, cf. clip_to_study_zone),
+    # rien_compte (aucune entite comptee, cf. densite_par_maille)
     # -- donnee douteuse : corriger avant tout chiffre -- et memoire (couche a
     # sauvegarder, la donnee n'est pas en cause).
 
     _ECHECS_DE_DONNEE = ("emprise_aberrante", "zero_entite",
-                         "geometries_invalides", "crs_inconnu", "rien_retire")
+                         "geometries_invalides", "crs_inconnu", "rien_retire",
+                         "rien_compte")
 
     def _zone_etude(self):
         """(emprise EPSG:4326, nom) de la zone d'etude, ou (None, None)."""
@@ -6712,6 +6715,630 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
         if remplacees:
             reponse["remplace"] = "couche precedente du meme nom retiree du projet et reecrite"
         return reponse
+
+    # ── Densite par maille, comptage par zone ─────────────────────
+    #
+    # Constat live du 2026-10-02 (« Sur Rousset, affiche les trames vertes
+    # et bleues, la densite batie et les reseaux ») : chargements corrects,
+    # puis trois execute_python pour compter le bati par maille ; le dernier
+    # a depasse 12 minutes (boucle entite par entite, sans index spatial).
+    # Les algorithmes natifs font le meme calcul en quelques secondes :
+    # native:creategrid, puis native:countpointsinpolygon sur les centroides,
+    # qui interroge un index spatial. Le besoin est recurrent : il devient
+    # un outil, comme le decoupage au contour.
+
+    _TAILLE_MAILLE_DEFAUT = 200
+    _TAILLE_MAILLE_MIN = 10
+    _TAILLE_MAILLE_MAX = 10_000
+    # Au-dela, la grille ne se lit plus a l'ecran et son ecriture s'allonge :
+    # mieux vaut demander une maille plus grande que figer QGIS.
+    _PLAFOND_MAILLES = 250_000
+    # Mesure -> (champ de la couche produite, unite affichee, prefixe du nom).
+    _MESURES_COMPTAGE = {
+        "nombre": ("nombre", "", "densite"),
+        "surface": ("surface_m2", " m2", "surface"),
+        "part_surface": ("part_surface_pct", " %", "part_surface"),
+    }
+    # Rampe sequentielle jaune -> rouge (ColorBrewer YlOrRd, 5 classes),
+    # lisible sur fond de plan comme sur orthophoto.
+    _RAMPE_DENSITE = ("#ffffb2", "#fecc5c", "#fd8d3c", "#f03b20", "#bd0026")
+
+    @staticmethod
+    def _grille_alignee(xmin, ymin, xmax, ymax, taille):
+        """((x0, y0, x1, y1), nombre de mailles) d'une grille calee sur des
+        multiples de la maille, qui couvre l'emprise.
+
+        Caler l'origine sur la maille (comme le carroyage INSEE) rend deux
+        grilles de meme taille superposables d'un calcul a l'autre.
+        """
+        import math
+        x0 = math.floor(xmin / taille) * taille
+        y0 = math.floor(ymin / taille) * taille
+        x1 = max(math.ceil(xmax / taille) * taille, x0 + taille)
+        y1 = max(math.ceil(ymax / taille) * taille, y0 + taille)
+        n = round((x1 - x0) / taille) * round((y1 - y0) / taille)
+        return (x0, y0, x1, y1), n
+
+    @staticmethod
+    def _taille_pour_plafond(largeur, hauteur, plafond):
+        """Plus petite maille, arrondie aux 50 m superieurs, dont la grille
+        tient sous le plafond (une rangee de calage comprise)."""
+        import math
+        taille = math.sqrt(max(largeur * hauteur, 1.0) / plafond)
+        taille = int(math.ceil(taille / 50.0) * 50)
+        while (math.ceil(largeur / taille) + 1) * (math.ceil(hauteur / taille) + 1) > plafond:
+            taille += 50
+        return taille
+
+    @staticmethod
+    def _champ_libre(noms_existants, base):
+        """`base`, ou `base_2`, `base_3`... s'il existe deja dans la couche
+        de zones (une couche de quartiers peut deja porter un champ nombre)."""
+        existants = {str(n).casefold() for n in noms_existants}
+        nom, i = base, 2
+        while nom.casefold() in existants:
+            nom, i = f"{base}_{i}", i + 1
+        return nom
+
+    @staticmethod
+    def _statistiques_mailles(valeurs):
+        """Mailles, vides, occupees, min, max, mediane (toutes les mailles) et
+        mediane des mailles occupees. Une valeur absente compte pour 0."""
+        def nombre(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return 0.0
+
+        def net(x):
+            return int(x) if float(x).is_integer() else round(x, 2)
+
+        def mediane(xs):
+            m = len(xs) // 2
+            return xs[m] if len(xs) % 2 else (xs[m - 1] + xs[m]) / 2
+
+        propres = sorted(nombre(v) for v in valeurs)
+        if not propres:
+            return {"mailles": 0, "vides": 0, "occupees": 0}
+        occupees = [v for v in propres if v > 0]
+        stats = {"mailles": len(propres), "vides": len(propres) - len(occupees),
+                 "occupees": len(occupees), "min": net(propres[0]),
+                 "max": net(propres[-1]), "mediane": net(mediane(propres))}
+        if occupees:
+            stats["mediane_occupees"] = net(mediane(occupees))
+        return stats
+
+    @staticmethod
+    def _bornes_classes(valeurs, n_classes=5):
+        """Bornes (bas, haut) des classes du style gradue, par quantiles des
+        seules mailles occupees.
+
+        Les mailles vides ont leur propre classe, hors de ces bornes : sur une
+        commune en partie agricole, sinon, la moitie des classes decrirait des
+        mailles a 0 ou 1. Des bornes egales (comptes entiers repetes) sont
+        fusionnees.
+        """
+        def nombre(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return 0.0
+
+        occupees = sorted(x for x in (nombre(v) for v in valeurs) if x > 0)
+        if not occupees:
+            return []
+        n = len(occupees)
+        bornes = [occupees[0]]
+        for k in range(1, n_classes):
+            seuil = occupees[round(k * (n - 1) / n_classes)]
+            if seuil > bornes[-1]:
+                bornes.append(seuil)
+        if occupees[-1] > bornes[-1]:
+            bornes.append(occupees[-1])
+        if len(bornes) == 1:
+            return [(bornes[0], bornes[0])]
+        return list(zip(bornes[:-1], bornes[1:]))
+
+    @staticmethod
+    def _nombre_fr(x):
+        """12345.6 -> « 12 345,6 » ; 4.0 -> « 4 »."""
+        if x is None:
+            return "?"
+        x = float(x)
+        if x.is_integer():
+            return f"{int(x):,}".replace(",", " ")
+        return f"{x:,.1f}".replace(",", " ").replace(".", ",")
+
+    @staticmethod
+    def _lecture_comptage(v):
+        """La phrase `lecture` d'un comptage, en francais courant.
+
+        Dit ce qui a ete compte, sur quelle emprise, si le total retrouve
+        toutes les entites de l'emprise, et la distribution par unite.
+        """
+        def fr(x):
+            if x is None:
+                return "?"
+            x = float(x)
+            if x.is_integer():
+                return f"{int(x):,}".replace(",", " ")
+            return f"{x:,.1f}".replace(",", " ").replace(".", ",")
+
+        unite = v.get("unite", "maille")
+        ou = "ces zones" if unite == "zone" else "cette emprise"
+        compte, dans = v.get("total_compte", 0), v.get("total_source_dans_emprise", 0)
+        phrases = [f"{v.get('cadre', '')} : {fr(compte)} entite(s) de "
+                   f"« {v.get('source', '?')} » comptee(s) par leur centroide"]
+        if compte == dans:
+            phrases[0] += f", soit toutes celles de la couche dans {ou}."
+        elif compte < dans:
+            phrases[0] += (f", sur {fr(dans)} dans {ou} : {fr(dans - compte)} "
+                           f"non attribuee(s) (centroide sur une limite). "
+                           f"Signale cet ecart avec le chiffre.")
+        else:
+            phrases[0] += (f", pour {fr(dans)} entites distinctes : des "
+                           f"{unite}s se chevauchent, une entite y est comptee "
+                           f"plusieurs fois. Ne somme pas les {unite}s.")
+        if v.get("hors_emprise"):
+            phrases.append(f"{fr(v['hors_emprise'])} entite(s) de la couche sont "
+                           f"hors de {ou} et ne sont pas comptees.")
+        phrases.append(f"{fr(v.get('vides', 0))} {unite}(s) vide(s) sur "
+                       f"{fr(v.get('mailles', 0))}.")
+        if v.get("max") is not None:
+            libelle = {"nombre": "Entites", "surface": "Surface (m2)",
+                       "part_surface": "Part de surface couverte (%)"}.get(
+                           v.get("mesure"), "Valeur")
+            texte = (f"{libelle} par {unite} : de {fr(v.get('min'))} a "
+                     f"{fr(v.get('max'))}, mediane {fr(v.get('mediane'))}")
+            if v.get("mediane_occupees") is not None and v.get("vides"):
+                texte += f" ({fr(v['mediane_occupees'])} parmi les {unite}s occupees)"
+            phrases.append(texte + ".")
+        if v.get("densite_max_km2") is not None:
+            phrases.append(f"La maille la plus dense en compte {fr(v.get('max'))}, "
+                           f"soit {fr(v['densite_max_km2'])} par km2.")
+        if v.get("mesure") in ("surface", "part_surface"):
+            phrases.append(f"La surface de chaque entite est affectee a la "
+                           f"{unite} de son centroide (approximation).")
+        return " ".join(p.strip() for p in phrases if p.strip())
+
+    @staticmethod
+    def _crs_metrique(couche):
+        """CRS de calcul en metres : celui de la couche, a defaut celui du
+        projet, a defaut Lambert 93 (EPSG:2154)."""
+        from qgis.core import QgsUnitTypes
+
+        def metrique(crs):
+            return (crs is not None and crs.isValid() and not crs.isGeographic()
+                    and crs.mapUnits() == QgsUnitTypes.DistanceMeters)
+
+        if metrique(couche.crs()):
+            return couche.crs()
+        if metrique(QgsProject.instance().crs()):
+            return QgsProject.instance().crs()
+        return QgsCoordinateReferenceSystem("EPSG:2154")
+
+    def _masque_de_zone(self, couche, crs, emprise):
+        """(couche masque en memoire ou None, emprise du masque dans `crs`,
+        libelle) : contour de la zone d'etude s'il est connu, sinon son
+        rectangle, sinon (ou `emprise` = « couche ») l'emprise de la couche,
+        sans masque."""
+        import qgis_helpers
+        from qgis.core import QgsGeometry, QgsFeature
+        projet = QgsProject.instance()
+        geometrie, libelle = None, None
+        if emprise != "couche":
+            contour = qgis_helpers.get_study_zone_contour()
+            if "error" not in contour:
+                g = QgsGeometry.fromWkt(contour["wkt"])
+                if g is not None and not g.isNull() and not g.isEmpty():
+                    geometrie = g if g.isGeosValid() else g.makeValid()
+                    libelle = f"le contour de {contour['name']}"
+            if geometrie is None:
+                zone_bbox, zone_nom = self._zone_etude()
+                if zone_bbox:
+                    geometrie = QgsGeometry.fromRect(QgsRectangle(*zone_bbox))
+                    libelle = (f"le rectangle de la zone {zone_nom or ''} "
+                               f"(pas de contour communal)").replace("  ", " ")
+        if geometrie is None:
+            emprise_couche = QgsCoordinateTransform(
+                couche.crs(), crs, projet).transformBoundingBox(couche.extent())
+            return None, emprise_couche, f"l'emprise de la couche « {couche.name()} »"
+        geometrie.transform(QgsCoordinateTransform(
+            QgsCoordinateReferenceSystem("EPSG:4326"), crs, projet))
+        geometrie.convertToMultiType()
+        masque = QgsVectorLayer(f"MultiPolygon?crs={crs.authid()}", "emprise_comptage", "memory")
+        masque.setCrs(crs)
+        entite = QgsFeature()
+        entite.setGeometry(geometrie)
+        masque.dataProvider().addFeatures([entite])
+        masque.updateExtents()
+        return masque, geometrie.boundingBox(), libelle
+
+    def _compter_par_polygones(self, proc, source, polygones, masque, crs, mesure,
+                               champs):
+        """Compte les entites de `source`, par leur centroide, dans chaque
+        polygone de `polygones` (deja dans `crs`).
+
+        Que des algorithmes natifs : aucun parcours entite par entite en
+        Python. countpointsinpolygon interroge l'index spatial des points ;
+        extractbylocation, le masque (un seul polygone, ou les zones).
+        Rend (couche comptee en memoire, nombre de centroides retenus).
+        """
+        def lancer(algo, parametres):
+            parametres = dict(parametres, OUTPUT="TEMPORARY_OUTPUT")
+            return proc.run(algo, parametres)["OUTPUT"]
+
+        entites = source
+        if entites.crs() != crs:
+            entites = lancer("native:reprojectlayer", {"INPUT": entites, "TARGET_CRS": crs})
+        if mesure != "nombre":
+            entites = lancer("native:fieldcalculator", {
+                "INPUT": entites, "FIELD_NAME": "_surface_m2", "FIELD_TYPE": 0,
+                "FIELD_LENGTH": 20, "FIELD_PRECISION": 2,
+                "FORMULA": "area($geometry)"})
+        points = lancer("native:centroids", {"INPUT": entites, "ALL_PARTS": False})
+        if masque is not None:
+            points = lancer("native:extractbylocation", {
+                "INPUT": points, "PREDICATE": [0], "INTERSECT": masque})
+        proc.run("native:createspatialindex", {"INPUT": points})
+        comptees = lancer("native:countpointsinpolygon", {
+            "POLYGONS": polygones, "POINTS": points, "WEIGHT": "",
+            "CLASSFIELD": "", "FIELD": champs["nombre"]})
+        aire = "area($geometry)"
+        if mesure == "nombre":
+            formules = [(champs["densite"],
+                         f'CASE WHEN {aire} > 0 THEN round("{champs["nombre"]}" '
+                         f'/ ({aire} / 1000000), 1) END')]
+        else:
+            comptees = lancer("native:countpointsinpolygon", {
+                "POLYGONS": comptees, "POINTS": points, "WEIGHT": "_surface_m2",
+                "CLASSFIELD": "", "FIELD": champs["surface"]})
+            formules = [(champs["surface"], f'round("{champs["surface"]}", 1)')]
+            if mesure == "part_surface":
+                formules.append((champs["part_surface"],
+                                 f'CASE WHEN {aire} > 0 THEN min(100, round('
+                                 f'"{champs["surface"]}" / {aire} * 100, 2)) END'))
+        for champ, formule in formules:
+            comptees = lancer("native:fieldcalculator", {
+                "INPUT": comptees, "FIELD_NAME": champ, "FIELD_TYPE": 0,
+                "FIELD_LENGTH": 20, "FIELD_PRECISION": 2, "FORMULA": formule})
+        return comptees, points.featureCount()
+
+    def _ecrire_couche_d_etude(self, sortie, nom, entrees):
+        """Ecrit `sortie` en GeoPackage dans les donnees de l'etude et
+        l'ajoute au projet, en remplacant une couche du meme fichier.
+        Rend (couche, chemin, remplacees) ou (None, None, erreur)."""
+        projet = QgsProject.instance()
+        chemin = str(self._dossier_donnees_etude() / f"{nom}.gpkg")
+        for entree in entrees:
+            source_entree = (entree.source() or "").split("|", 1)[0]
+            if source_entree and Path(source_entree) == Path(chemin):
+                return None, None, {"error": "La sortie ecraserait une couche "
+                                             "d'entree : donne un autre nom (name)."}
+        remplacees = [l.id() for l in projet.mapLayers().values()
+                      if (l.source() or "").split("|", 1)[0] == chemin]
+        if remplacees:
+            projet.removeMapLayers(remplacees)
+        options = QgsVectorFileWriter.SaveVectorOptions()
+        options.driverName = "GPKG"
+        options.layerName = nom
+        options.fileEncoding = "UTF-8"
+        options.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteFile
+        erreur = QgsVectorFileWriter.writeAsVectorFormatV3(
+            sortie, chemin, projet.transformContext(), options)
+        if erreur[0] != QgsVectorFileWriter.WriterError.NoError:
+            return None, None, {"error": f"Ecriture du GeoPackage impossible : {erreur[1]}"}
+        couche = QgsVectorLayer(f"{chemin}|layername={nom}", nom, "ogr")
+        if not couche.isValid():
+            return None, None, {"error": f"GeoPackage ecrit mais illisible : {chemin}"}
+        return couche, chemin, remplacees
+
+    def _styler_comptage(self, couche, champ, valeurs, unite):
+        """Style gradue lisible : mailles vides transparentes, puis classes
+        par quantiles des mailles occupees, du jaune au rouge."""
+        bornes = self._bornes_classes(valeurs)
+        rampe = self._RAMPE_DENSITE
+        if len(bornes) < len(rampe):
+            pas = (len(rampe) - 1) / max(len(bornes) - 1, 1)
+            rampe = [rampe[round(i * pas)] for i in range(len(bornes))]
+
+        def symbole(couleur, opacite):
+            c = QColor(couleur)
+            return QgsFillSymbol.createSimple({
+                "color": f"{c.red()},{c.green()},{c.blue()},{opacite}",
+                "outline_color": "255,255,255,110", "outline_width": "0.1"})
+
+        classes = []
+        if any(not v for v in valeurs):
+            vide = QgsFillSymbol.createSimple({
+                "color": "0,0,0,0", "outline_color": "128,128,128,90",
+                "outline_width": "0.1"})
+            classes.append(QgsRendererRange(0, 0, vide, "0 (vide)"))
+        for (bas, haut), couleur in zip(bornes, rampe):
+            libelle = (f"{self._nombre_fr(bas)}{unite}" if bas == haut else
+                       f"{self._nombre_fr(bas)} – {self._nombre_fr(haut)}{unite}")
+            classes.append(QgsRendererRange(bas, haut, symbole(couleur, 200), libelle))
+        couche.setRenderer(QgsGraduatedSymbolRenderer(champ, classes))
+        couche.triggerRepaint()
+
+    def _lire_comptage(self, couche, champ_nombre, champ_mesure):
+        """(nombres, valeurs de la mesure) lus en une passe, sans geometrie."""
+        requete = QgsFeatureRequest()
+        requete.setFlags(QgsFeatureRequest.NoGeometry)
+        requete.setSubsetOfAttributes([champ_nombre, champ_mesure], couche.fields())
+
+        def nombre(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return 0.0
+
+        nombres, mesures = [], []
+        for f in couche.getFeatures(requete):
+            nombres.append(nombre(f[champ_nombre]))
+            mesures.append(nombre(f[champ_mesure]))
+        return nombres, mesures
+
+    def _parametres_de_comptage(self, params):
+        """(mesure, None) ou (None, erreur) : mesure acceptee, et polygones
+        exiges pour une surface."""
+        mesure = str(params.get("mesure") or "nombre").strip().lower()
+        mesure = {"compte": "nombre", "count": "nombre", "part": "part_surface",
+                  "surface_batie": "surface", "area": "surface"}.get(mesure, mesure)
+        if mesure not in self._MESURES_COMPTAGE:
+            return None, {"error": (f"Mesure inconnue « {mesure} » : nombre "
+                                    f"(defaut), surface ou part_surface.")}
+        return mesure, None
+
+    def _finir_comptage(self, outil, couche_source, resultat, chemin, remplacees,
+                        verification, champs, mesure, debut):
+        """Style, statistiques, lecture et reponse communes aux deux outils."""
+        champ_mesure = champs[mesure]
+        nombres, mesures = self._lire_comptage(resultat, champs["nombre"], champ_mesure)
+        stats = self._statistiques_mailles(mesures)
+        total_compte = int(round(sum(nombres)))
+        verification.update(stats)
+        verification["total_compte"] = total_compte
+        verification["champ"] = champ_mesure
+        surface_maille = verification.get("surface_maille_km2")
+        if mesure == "nombre" and surface_maille and stats.get("max"):
+            verification["densite_max_km2"] = round(stats["max"] / surface_maille, 1)
+        unite = self._MESURES_COMPTAGE[mesure][1]
+        self._styler_comptage(resultat, champ_mesure, mesures, unite)
+        QgsProject.instance().addMapLayer(resultat)
+
+        dans = verification["total_source_dans_emprise"]
+        echecs, messages = [], []
+        if total_compte == 0:
+            echecs.append("rien_compte")
+            messages.append("Aucune entite comptee : la couche ne recouvre pas "
+                            "l'emprise. Verifie la couche source et la zone "
+                            "avant d'en tirer une conclusion.")
+        elif total_compte != dans:
+            echecs.append("ecart_comptage")
+            verification["ecart"] = total_compte - dans
+            messages.append(f"Total compte ({total_compte}) different du total "
+                            f"dans l'emprise ({dans}) : lis `lecture` et "
+                            f"signale l'ecart.")
+        verification["lecture"] = self._lecture_comptage(verification)
+        for cle in ("cadre", "unite"):
+            verification.pop(cle, None)
+        verification["duree_s"] = round(time.time() - debut, 1)
+
+        # Du bloc commun, seulement l'identite de la couche et ses controles :
+        # sa lecture compare le rectangle de la zone et la commune, sans
+        # objet pour une grille deja bornee a l'emprise.
+        zone_bbox, zone_nom = self._zone_etude()
+        commun = self._verification_couche(resultat, zone_bbox, zone_nom)
+        for cle in ("layer_id", "name", "feature_count", "crs", "origine",
+                    "emprise_4326", "zone_etude", "geometries_invalides"):
+            if cle in commun:
+                verification.setdefault(cle, commun[cle])
+        autres = [e for e in commun.get("echecs", []) if e != "memoire"]
+        if autres:
+            echecs += autres
+            messages.append(commun.get("avertissement", ""))
+        if echecs:
+            verification["echecs"] = echecs
+        if messages:
+            verification["avertissement"] = " ".join(m for m in messages if m)
+        self._retenir_verification(outil, [verification])
+
+        reponse = {"success": True, "layer_id": resultat.id(), "name": resultat.name(),
+                   "path": chemin, "source_layer_id": couche_source.id(),
+                   "champ_style": champ_mesure, "verification": verification}
+        if remplacees:
+            reponse["remplace"] = "couche precedente du meme nom retiree du projet et reecrite"
+        return reponse
+
+    def _action_densite_par_maille(self, params: dict) -> dict:
+        """Densite d'une couche par maille carree, en algorithmes natifs.
+
+        Grille calee sur la maille (native:creategrid) sur le contour de la
+        zone d'etude (a defaut son rectangle, a defaut l'emprise de la
+        couche), en projection metrique ; centroides des entites dans
+        l'emprise ; comptage par native:countpointsinpolygon (index spatial).
+        Sortie : GeoPackage de l'etude, style gradue, bloc `verification`.
+        """
+        debut = time.time()
+        couche, err = self._couche_par_id_ou_nom(params, vector_only=True)
+        if err:
+            return err
+        mesure, err = self._parametres_de_comptage(params)
+        if err:
+            return err
+        if mesure != "nombre" and couche.geometryType() != QgsWkbTypes.PolygonGeometry:
+            return {"error": (f"La mesure « {mesure} » demande des polygones : "
+                              f"« {couche.name()} » n'en contient pas. Utilise "
+                              f"mesure=nombre.")}
+        try:
+            taille = float(params.get("taille_m") or params.get("taille")
+                           or self._TAILLE_MAILLE_DEFAUT)
+        except (TypeError, ValueError):
+            return {"error": "taille_m doit etre un nombre de metres (ex. 200)."}
+        if not self._TAILLE_MAILLE_MIN <= taille <= self._TAILLE_MAILLE_MAX:
+            return {"error": (f"Maille de {taille:g} m hors bornes : entre "
+                              f"{self._TAILLE_MAILLE_MIN} et "
+                              f"{self._TAILLE_MAILLE_MAX} m.")}
+        if not couche.crs().isValid():
+            return {"error": f"La couche « {couche.name()} » n'a pas de CRS : "
+                             f"impossible de la projeter en metres."}
+        proc = _get_processing()
+        if not proc:
+            return {"error": "Processing indisponible : comptage impossible."}
+
+        crs = self._crs_metrique(couche)
+        emprise = str(params.get("emprise") or "zone").strip().lower()
+        masque, cadre, libelle_emprise = self._masque_de_zone(couche, crs, emprise)
+        if cadre is None or cadre.isEmpty():
+            return {"error": f"La couche « {couche.name()} » est vide ou sans "
+                             f"emprise : rien a compter."}
+        (x0, y0, x1, y1), n_mailles = self._grille_alignee(
+            cadre.xMinimum(), cadre.yMinimum(), cadre.xMaximum(), cadre.yMaximum(), taille)
+        if n_mailles > self._PLAFOND_MAILLES:
+            conseil = self._taille_pour_plafond(x1 - x0, y1 - y0, self._PLAFOND_MAILLES)
+            return {"error": (f"{n_mailles} mailles de {taille:g} m sur "
+                              f"{libelle_emprise} : au-dela de "
+                              f"{self._PLAFOND_MAILLES}. Prends une maille d'au "
+                              f"moins {conseil} m."), "taille_conseillee_m": conseil}
+
+        mesure_champ, _, prefixe = self._MESURES_COMPTAGE[mesure]
+        champs = {"nombre": "nombre", "densite": "densite_km2",
+                  "surface": "surface_m2", "part_surface": "part_surface_pct"}
+        nom = self._nom_normalise(params.get("name")
+                                  or f"{prefixe}_{couche.name()}_{int(taille)}m")
+        if not nom:
+            return {"error": "Nom de sortie vide apres normalisation : donne un "
+                             "nom (name) fait de lettres ou de chiffres."}
+        try:
+            grille = proc.run("native:creategrid", {
+                "TYPE": 2, "EXTENT": f"{x0},{x1},{y0},{y1} [{crs.authid()}]",
+                "HSPACING": taille, "VSPACING": taille, "HOVERLAY": 0,
+                "VOVERLAY": 0, "CRS": crs, "OUTPUT": "TEMPORARY_OUTPUT"})["OUTPUT"]
+            if masque is not None:
+                grille = proc.run("native:extractbylocation", {
+                    "INPUT": grille, "PREDICATE": [0], "INTERSECT": masque,
+                    "OUTPUT": "TEMPORARY_OUTPUT"})["OUTPUT"]
+            comptees, dans = self._compter_par_polygones(
+                proc, couche, grille, masque, crs, mesure, champs)
+        except Exception as e:
+            return {"error": (f"Le comptage a echoue : {e}. Si la couche contient "
+                              f"des geometries invalides, repare-la d'abord "
+                              f"(run_processing native:fixgeometries).")}
+        resultat, chemin, remplacees = self._ecrire_couche_d_etude(comptees, nom, [couche])
+        if resultat is None:
+            return remplacees
+
+        total_source = couche.featureCount()
+        verification = {
+            "outil": "densite_par_maille",
+            "source": couche.name(),
+            "mesure": mesure,
+            "taille_maille_m": taille if not float(taille).is_integer() else int(taille),
+            "emprise": libelle_emprise,
+            "crs_calcul": crs.authid(),
+            "filtre": "centroide de chaque entite dans l'emprise",
+            "total_source": total_source,
+            "total_source_dans_emprise": dans,
+            "hors_emprise": max(total_source - dans, 0) if total_source >= 0 else None,
+            "surface_maille_km2": taille * taille / 1e6,
+            "unite": "maille",
+            "cadre": (f"Grille de {self._nombre_fr(resultat.featureCount())} "
+                      f"mailles carrees de {self._nombre_fr(taille)} m sur "
+                      f"{libelle_emprise}"),
+            "fichier": chemin,
+        }
+        return self._finir_comptage("densite_par_maille", couche, resultat, chemin,
+                                    remplacees, verification, champs, mesure, debut)
+
+    def _action_compter_par_zone(self, params: dict) -> dict:
+        """Compte les entites d'une couche dans chaque polygone d'une autre
+        (quartiers, IRIS, ilots, communes...), en algorithmes natifs.
+
+        Meme chaine que densite_par_maille, la grille remplacee par les zones.
+        Sortie : copie des zones avec les champs comptes, en GeoPackage de
+        l'etude, style gradue, bloc `verification`.
+        """
+        debut = time.time()
+        couche, err = self._couche_par_id_ou_nom(params, vector_only=True)
+        if err:
+            return err
+        zones, err = self._couche_par_id_ou_nom(
+            {"layer_id": params.get("zones_id"), "layer": params.get("zones")},
+            vector_only=True)
+        if err:
+            err["error"] = ("Couche de zones : " + err["error"]
+                            .replace("layer_id", "zones_id").replace("(layer)", "(zones)"))
+            return err
+        if zones.geometryType() != QgsWkbTypes.PolygonGeometry:
+            return {"error": f"« {zones.name()} » ne contient pas de polygones : "
+                             f"les zones doivent en etre."}
+        if zones.id() == couche.id():
+            return {"error": "La couche comptee et la couche de zones sont la meme."}
+        if zones.featureCount() > self._PLAFOND_MAILLES:
+            return {"error": (f"{zones.featureCount()} zones : au-dela de "
+                              f"{self._PLAFOND_MAILLES}, regroupe-les d'abord.")}
+        mesure, err = self._parametres_de_comptage(params)
+        if err:
+            return err
+        if mesure != "nombre" and couche.geometryType() != QgsWkbTypes.PolygonGeometry:
+            return {"error": (f"La mesure « {mesure} » demande des polygones : "
+                              f"« {couche.name()} » n'en contient pas. Utilise "
+                              f"mesure=nombre.")}
+        for c in (couche, zones):
+            if not c.crs().isValid():
+                return {"error": f"La couche « {c.name()} » n'a pas de CRS."}
+        proc = _get_processing()
+        if not proc:
+            return {"error": "Processing indisponible : comptage impossible."}
+
+        crs = self._crs_metrique(zones)
+        noms = [f.name() for f in zones.fields()]
+        champs = {"nombre": self._champ_libre(noms, "nombre"),
+                  "densite": self._champ_libre(noms, "densite_km2"),
+                  "surface": self._champ_libre(noms, "surface_m2"),
+                  "part_surface": self._champ_libre(noms, "part_surface_pct")}
+        nom = self._nom_normalise(params.get("name")
+                                  or f"{couche.name()}_par_{zones.name()}")
+        if not nom:
+            return {"error": "Nom de sortie vide apres normalisation : donne un "
+                             "nom (name) fait de lettres ou de chiffres."}
+        try:
+            polygones = zones
+            if zones.crs() != crs:
+                polygones = proc.run("native:reprojectlayer", {
+                    "INPUT": zones, "TARGET_CRS": crs,
+                    "OUTPUT": "TEMPORARY_OUTPUT"})["OUTPUT"]
+            comptees, dans = self._compter_par_polygones(
+                proc, couche, polygones, polygones, crs, mesure, champs)
+        except Exception as e:
+            return {"error": (f"Le comptage a echoue : {e}. Si une couche "
+                              f"contient des geometries invalides, repare-la "
+                              f"d'abord (run_processing native:fixgeometries).")}
+        resultat, chemin, remplacees = self._ecrire_couche_d_etude(
+            comptees, nom, [couche, zones])
+        if resultat is None:
+            return remplacees
+
+        total_source = couche.featureCount()
+        verification = {
+            "outil": "compter_par_zone",
+            "source": couche.name(),
+            "zones": zones.name(),
+            "mesure": mesure,
+            "emprise": f"les zones de « {zones.name()} »",
+            "crs_calcul": crs.authid(),
+            "filtre": "centroide de chaque entite dans une zone",
+            "total_source": total_source,
+            "total_source_dans_emprise": dans,
+            "hors_emprise": max(total_source - dans, 0) if total_source >= 0 else None,
+            "unite": "zone",
+            "cadre": (f"{self._nombre_fr(resultat.featureCount())} zones de "
+                      f"« {zones.name()} »"),
+            "fichier": chemin,
+        }
+        return self._finir_comptage("compter_par_zone", couche, resultat, chemin,
+                                    remplacees, verification, champs, mesure, debut)
 
     def _action_smart_load(self, params: dict) -> dict:
         """Smart load from catalog: WFS→local GPKG via ogr2ogr, raster→streaming."""
