@@ -254,3 +254,13 @@ def test_les_deux_chemins_wmts_partagent_la_meme_adresse():
     branche = _PONT.split('elif src_type == "wmts":')[1].split("elif src_type")[0]
     assert "qgis_helpers.uri_wmts(" in branche and "type=xyz" not in branche
     assert "tilematrixset={" not in _PONT, "plus aucune copie de l'ancienne adresse"
+
+
+def test_les_outils_voisins_orientent_vers_charger_sur_commune():
+    """Essai en direct du 2026-10-03 : un passage sur trois, le modele a suivi
+    smart_load puis clip_to_study_zone, que la description de smart_load
+    suggerait (« pour un chiffre dans la commune, clip_to_study_zone ensuite »)."""
+    smart = _description("smart_load")
+    assert smart.startswith("Pour « charge / affiche <donnees> sur <commune> », utilise charger_sur_commune")
+    assert "clip_to_study_zone ensuite" not in smart
+    assert "charger_sur_commune fait tout en un appel" in _description("clip_to_study_zone")
