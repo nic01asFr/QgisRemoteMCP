@@ -698,6 +698,20 @@ TOOLS = [
         }
     },
     {
+        "name": "charger_sur_commune",
+        "description": "Le reflexe pour « charge / affiche <donnees> sur <commune> » : en UN appel, la zone d'etude (si commune donnee), le chargement du catalogue, le decoupage au contour administratif, le retrait de la couche rectangle intermediaire, le contour de la commune SEULE (trait, sans remplissage), le fond orthophoto IGN et le cadrage sur la commune. Aucun style thematique ni analyse : propose-les ensuite, ne les lance pas d'office. Le retour porte la couche produite, le contour, le fond et le bloc `verification` du decoupage (chiffre communal). Pour un raster, ou une zone sans contour, le chargement est garde tel quel et le retour dit pourquoi il n'est pas decoupe.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "ID catalogue des donnees (ex. 'bdtopo_batiments', 'bdtopo_routes'). list_datasources pour les trouver."},
+                "commune": {"type": "string", "description": "Nom de la commune (ou arrondissement). Facultatif si la zone d'etude est deja la bonne.", "default": ""},
+                "fond": {"type": "boolean", "description": "Ajouter le fond de plan (defaut : oui, une seule fois, sous les couches)", "default": True},
+                "fond_id": {"type": "string", "description": "ID catalogue du fond (defaut : ign_ortho_wmts, orthophoto IGN)", "default": ""}
+            },
+            "required": ["id"]
+        }
+    },
+    {
         "name": "densite_par_maille",
         "description": "Densite d'une couche par maille carree, en quelques secondes par algorithmes natifs (native:creategrid + native:countpointsinpolygon sur les centroides, index spatial) : pour toute densite, grille ou carroyage, JAMAIS une boucle PyQGIS. Couche designee par layer_id ou nom exact (layer). Maille en metres (taille_m, defaut 200), calcul en projection metrique. Emprise : contour de la zone d'etude s'il est connu, sinon son rectangle. Mesure : nombre d'entites (defaut, avec densite_km2), surface (m2) ou part_surface (% de la maille), ces deux-la pour des polygones. Sortie : GeoPackage de l'etude, style gradue applique. Le retour porte un bloc `verification` (mailles, total compte = total dans l'emprise, mailles vides, min/max/mediane, `lecture`).",
         "inputSchema": {
@@ -1632,6 +1646,73 @@ def _tool_clip_to_study_zone(arguments: dict) -> dict:
     return {"content": content}
 
 
+def _tool_charger_sur_commune(arguments: dict) -> dict:
+    """« Charge le bati sur Aix » : le rendu attendu en un seul appel.
+
+    Vecu le 2026-10-03 : quatre messages et un redemarrage de QGIS pour
+    obtenir le bati decoupe a la commune, Aix seule, et un affichage propre.
+    Enchainement fixe, sans code ecrit par le modele : zone (si commune
+    donnee), chargement, decoupage au contour, retrait de la couche
+    rectangle (memoire), contour de la commune seul, fond de plan, cadrage.
+    Aucun style thematique et aucune analyse : on les propose ensuite.
+    """
+    err = _validate_required(arguments, "id")
+    if err:
+        return _error(err)
+    commune = str(arguments.get("commune") or "").strip()
+    if commune:
+        zone = qgis_command("set_study_zone", {"target": commune},
+                            timeout=SOCKET_TIMEOUT_LONG)
+        if zone.get("error"):
+            return _error(f"Zone « {commune} » introuvable : {zone['error']}")
+
+    charge = qgis_command("smart_load", {"id": arguments["id"]},
+                          timeout=SOCKET_TIMEOUT_LONG)
+    if charge.get("error"):
+        return {"content": _text(charge, indent=2)}
+    source_id = charge.get("layer_id", "")
+
+    resume: dict = {"success": True, "source": arguments["id"]}
+    decoupe = qgis_command("clip_to_study_zone", {"layer_id": source_id},
+                           timeout=SOCKET_TIMEOUT_LONG) if source_id else {}
+    if decoupe.get("success"):
+        # Le rectangle charge ne sert plus : le garder doublait la memoire
+        # de QGIS (112 816 batiments en plus des 54 557 d'Aix, 2026-10-03).
+        qgis_command("remove_layer", {"layer_id": source_id})
+        resume["couche"] = {"layer_id": decoupe.get("layer_id"),
+                            "name": decoupe.get("name"), "path": decoupe.get("path")}
+        resume["verification"] = decoupe.get("verification")
+        resume["couche_rectangle_retiree"] = True
+    else:
+        # Raster, ou zone sans contour : on garde le chargement tel quel, et
+        # on dit pourquoi il n'est pas decoupe.
+        resume["couche"] = {"layer_id": source_id, "name": charge.get("name")}
+        resume["verification"] = charge.get("verification")
+        if decoupe.get("error"):
+            resume["decoupage"] = f"non fait : {decoupe['error']}"
+
+    contour = qgis_command("contour_zone_etude", {})
+    if contour.get("success"):
+        resume["commune"] = {"layer_id": contour["layer_id"], "name": contour["name"],
+                             **(contour.get("verification") or {})}
+        qgis_command("zoom_to_extent", {"extent": contour["extent"],
+                                        "crs": contour.get("crs", "")})
+    else:
+        resume["commune"] = f"contour non ajoute : {contour.get('error')}"
+        if resume["couche"].get("layer_id"):
+            qgis_command("zoom_to_extent", {"layer_id": resume["couche"]["layer_id"]})
+
+    if arguments.get("fond", True) is not False:
+        fond = qgis_command("fond_de_plan", {"id": arguments.get("fond_id") or ""},
+                            timeout=SOCKET_TIMEOUT_LONG)
+        resume["fond"] = (fond.get("name") if fond.get("success")
+                          else f"non ajoute : {fond.get('error')}")
+
+    resume["suite"] = ("Rien d'autre n'a ete calcule : propose un style ou une "
+                       "analyse, ne la lance pas d'office.")
+    return {"content": _text(resume, indent=2) + _auto_screenshot()}
+
+
 def _params_de_comptage(arguments: dict, cles: tuple) -> dict:
     """Arguments transmis au pont : ceux renseignes, parmi `cles`."""
     return {cle: arguments[cle] for cle in cles
@@ -1952,7 +2033,7 @@ def _tool_publish_artifact(arguments: dict) -> dict:
 
 # Actions that need longer timeouts (WFS downloads, heavy exports)
 _LONG_TIMEOUT_ACTIONS = frozenset({
-    "smart_load", "add_from_catalog", "clip_to_study_zone", "densite_par_maille", "compter_par_zone", "export_flood_map", "export_web_map", "export_temporal_map", "export_qfield", "export_grist", "execute_python",
+    "smart_load", "add_from_catalog", "clip_to_study_zone", "charger_sur_commune", "densite_par_maille", "compter_par_zone", "export_flood_map", "export_web_map", "export_temporal_map", "export_qfield", "export_grist", "execute_python",
 })
 
 
@@ -2268,6 +2349,7 @@ TOOL_HANDLERS = {
     "get_study_zone": _tool_get_study_zone,
     "smart_load": _tool_smart_load,
     "clip_to_study_zone": _tool_clip_to_study_zone,
+    "charger_sur_commune": _tool_charger_sur_commune,
     "densite_par_maille": _tool_densite_par_maille,
     "compter_par_zone": _tool_compter_par_zone,
     "set_layer_style": _tool_set_layer_style,

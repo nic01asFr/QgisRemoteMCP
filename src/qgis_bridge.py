@@ -250,7 +250,8 @@ class QGISBridge:
         "remove_layer", "run_processing", "zoom_to_extent",
         "set_layer_style", "set_layer_visibility", "apply_style",
         "add_from_catalog", "set_study_zone", "smart_load", "clip_to_study_zone",
-        "densite_par_maille", "compter_par_zone",
+        "densite_par_maille", "compter_par_zone", "contour_zone_etude",
+        "fond_de_plan",
         "apply_layout_template", "export_web_map", "export_flood_map", "export_temporal_map", "export_qfield", "export_grist",
         "mouse_click", "mouse_scroll", "key_press", "mouse_drag",
     })
@@ -6715,6 +6716,142 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
         if remplacees:
             reponse["remplace"] = "couche precedente du meme nom retiree du projet et reecrite"
         return reponse
+
+    # Contour seul, lisible sur l'orthophoto (choix du 2026-10-03).
+    _CONTOUR_COULEUR = "255,214,0,255"
+    _CONTOUR_EPAISSEUR_MM = "0.9"
+
+    def _action_contour_zone_etude(self, params: dict) -> dict:
+        """Couche du contour administratif de la zone d'etude (commune seule).
+
+        Rendu demande le 2026-10-03 : « charge le bati sur Aix » doit montrer
+        Aix seule, pas les vingt communes de son rectangle. Le contour est
+        celui que set_study_zone a memorise : aucun telechargement. Ecrit dans
+        les donnees de l'etude, trait seul sans remplissage, en tete de legende.
+        """
+        from qgis.core import QgsDistanceArea, QgsFeature, QgsGeometry
+        contour = qgis_helpers.get_study_zone_contour()
+        if "error" in contour:
+            return {"error": contour["error"]}
+        geometrie = QgsGeometry.fromWkt(contour["wkt"])
+        if geometrie is None or geometrie.isEmpty():
+            return {"error": "Le contour memorise est illisible : redefinis la "
+                             "zone avec set_study_zone et le nom de la commune."}
+        projet = QgsProject.instance()
+        crs = projet.crs()
+        if not crs.isValid() or crs.isGeographic():
+            crs = QgsCoordinateReferenceSystem("EPSG:2154")
+        geometrie.transform(QgsCoordinateTransform(
+            QgsCoordinateReferenceSystem("EPSG:4326"), crs, projet))
+        geometrie.convertToMultiType()
+
+        nom = self._nom_normalise(params.get("name") or f"commune_{contour['name']}")
+        if not nom:
+            return {"error": "Nom de sortie vide apres normalisation : donne un "
+                             "nom (name) fait de lettres ou de chiffres."}
+        chemin = str(self._dossier_donnees_etude() / f"{nom}.gpkg")
+
+        memoire = QgsVectorLayer(f"MultiPolygon?crs={crs.authid()}&field=nom:string(120)",
+                                 nom, "memory")
+        entite = QgsFeature(memoire.fields())
+        entite.setGeometry(geometrie)
+        entite.setAttribute("nom", contour["name"])
+        memoire.dataProvider().addFeatures([entite])
+        memoire.updateExtents()
+
+        # Meme nom = remplacement, pas de doublon dans la legende.
+        remplacees = [l.id() for l in projet.mapLayers().values()
+                      if (l.source() or "").split("|", 1)[0] == chemin]
+        if remplacees:
+            projet.removeMapLayers(remplacees)
+        options = QgsVectorFileWriter.SaveVectorOptions()
+        options.driverName = "GPKG"
+        options.layerName = nom
+        options.fileEncoding = "UTF-8"
+        options.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteFile
+        erreur = QgsVectorFileWriter.writeAsVectorFormatV3(
+            memoire, chemin, projet.transformContext(), options)
+        if erreur[0] != QgsVectorFileWriter.WriterError.NoError:
+            return {"error": f"Ecriture du GeoPackage impossible : {erreur[1]}"}
+        couche = QgsVectorLayer(f"{chemin}|layername={nom}", contour["name"], "ogr")
+        if not couche.isValid():
+            return {"error": f"GeoPackage ecrit mais illisible : {chemin}"}
+
+        symbole = QgsFillSymbol.createSimple({
+            "style": "no",
+            "outline_color": self._CONTOUR_COULEUR,
+            "outline_width": self._CONTOUR_EPAISSEUR_MM,
+            "outline_width_unit": "MM",
+        })
+        couche.setRenderer(QgsSingleSymbolRenderer(symbole))
+        projet.addMapLayer(couche, False)
+        projet.layerTreeRoot().insertLayer(0, couche)
+
+        surface_km2 = None
+        try:
+            mesure = QgsDistanceArea()
+            mesure.setSourceCrs(crs, projet.transformContext())
+            mesure.setEllipsoid(projet.ellipsoid() or "EPSG:7019")
+            surface_km2 = round(mesure.measureArea(geometrie) / 1e6, 2)
+        except Exception:
+            pass
+        emprise = geometrie.boundingBox()
+        return {
+            "success": True,
+            "layer_id": couche.id(),
+            "name": contour["name"],
+            "path": chemin,
+            "extent": [emprise.xMinimum(), emprise.yMinimum(),
+                       emprise.xMaximum(), emprise.yMaximum()],
+            "crs": crs.authid(),
+            "verification": {
+                "zone_etude": contour["name"],
+                "contour": contour.get("source") or None,
+                "surface_km2": surface_km2,
+                "lecture": f"Contour administratif de {contour['name']}, seul.",
+            },
+        }
+
+    # Fond par defaut du rendu « donnees sur une commune » (choix du 2026-10-03).
+    _FOND_PAR_DEFAUT = "ign_ortho_wmts"
+
+    def _action_fond_de_plan(self, params: dict) -> dict:
+        """Fond de plan du catalogue, une seule fois, sous toutes les couches.
+
+        Reutilise le fond s'il est deja dans le projet (meme couche du service,
+        reconnue a sa source) au lieu d'en empiler un second.
+        """
+        source_id = params.get("id") or self._FOND_PAR_DEFAUT
+        catalogue = {s.get("id"): s for s in
+                     self._load_datasources_catalog().get("sources", [])}
+        entree = catalogue.get(source_id)
+        if not entree:
+            return {"error": f"Fond inconnu du catalogue : {source_id}"}
+        couche_service = str((entree.get("params") or {}).get("layers") or "")
+        projet = QgsProject.instance()
+        couche = None
+        if couche_service:
+            for c in projet.mapLayers().values():
+                if isinstance(c, QgsRasterLayer) and couche_service in (c.source() or ""):
+                    couche = c
+                    break
+        reutilise = couche is not None
+        if couche is None:
+            charge = self._action_smart_load({"id": source_id})
+            if charge.get("error"):
+                return {"error": f"Fond « {entree.get('name')} » : {charge['error']}"}
+            couche = projet.mapLayer(charge.get("layer_id", ""))
+            if couche is None:
+                return {"error": f"Fond « {entree.get('name')} » charge mais introuvable."}
+        racine = projet.layerTreeRoot()
+        noeud = racine.findLayer(couche.id())
+        if noeud is not None:
+            parent = noeud.parent() or racine
+            clone = noeud.clone()
+            racine.addChildNode(clone)
+            parent.removeChildNode(noeud)
+        return {"success": True, "layer_id": couche.id(), "name": couche.name(),
+                "reutilise": reutilise}
 
     # ── Densite par maille, comptage par zone ─────────────────────
     #
