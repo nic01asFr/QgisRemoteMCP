@@ -226,9 +226,31 @@ def test_toute_action_qui_utilise_qgis_helpers_l_importe():
     assert fautives == []
 
 
-def test_le_wmts_passe_par_le_getcapabilities():
+def _uri_wmts():
     aides = (_RACINE / "src" / "qgis_helpers.py").read_text(encoding="utf-8")
-    code = aides.split("def add_wmts(")[1].split("\ndef ")[0]
-    construction = code.split("uri = (")[1].split(")\n")[0]
-    assert "REQUEST%3DGetCapabilities" in construction and "tileMatrixSet=" in construction
-    assert "type=xyz" not in construction
+    (code,) = [ast.get_source_segment(aides, n) for n in ast.walk(ast.parse(aides))
+               if isinstance(n, ast.FunctionDef) and n.name == "uri_wmts"]
+    espace = {}
+    exec(textwrap.dedent(code), espace)
+    return espace["uri_wmts"], aides
+
+
+def test_le_wmts_passe_par_le_getcapabilities():
+    uri_wmts, _ = _uri_wmts()
+    uri = uri_wmts("https://data.geopf.fr/wmts", "ORTHOIMAGERY.ORTHOPHOTOS")
+    assert uri.endswith("&url=https://data.geopf.fr/wmts?SERVICE%3DWMTS%26REQUEST%3DGetCapabilities")
+    assert "tileMatrixSet=PM" in uri and "layers=ORTHOIMAGERY.ORTHOPHOTOS" in uri
+    assert "type=xyz" not in uri
+    # Une URL deja munie d'une requete ne double pas le « ? ».
+    assert uri_wmts("https://x/wmts?SERVICE=WMTS", "L").count("?") == 1
+
+
+def test_les_deux_chemins_wmts_partagent_la_meme_adresse():
+    """Vecu le 2026-10-03 : le correctif d'add_wmts n'avait pas suffi, le
+    chargement du catalogue (pont) avait sa propre copie de l'ancienne forme."""
+    _, aides = _uri_wmts()
+    add_wmts = aides.split("def add_wmts(")[1].split("\ndef ")[0]
+    assert "uri_wmts(" in add_wmts
+    branche = _PONT.split('elif src_type == "wmts":')[1].split("elif src_type")[0]
+    assert "qgis_helpers.uri_wmts(" in branche and "type=xyz" not in branche
+    assert "tilematrixset={" not in _PONT, "plus aucune copie de l'ancienne adresse"
