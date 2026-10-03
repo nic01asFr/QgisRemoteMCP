@@ -5955,6 +5955,7 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
 
     def _action_add_from_catalog(self, params: dict) -> dict:
         """Add a data source from the catalog by its ID."""
+        import qgis_helpers
         source_id = params.get("id", "")
         catalog = self._load_datasources_catalog()
         source = None
@@ -6024,8 +6025,11 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
             tms = src_params.get("tilematrixset", "PM")
             crs = src_params.get("crs", "EPSG:3857")
             styles = src_params.get("styles", "normal")
-            uri = (f"url={source['url']}&layers={layers_param}&format={fmt}"
-                   f"&tilematrixset={tms}&crs={crs}&styles={styles}&type=xyz")
+            # Meme adresse que qgis_helpers.add_wmts (vraie couche WMTS) :
+            # l'ancienne copie ici rendait un fond blanc (2026-10-03).
+            uri = qgis_helpers.uri_wmts(source["url"], layers_param,
+                                        tilematrixset=tms, crs=crs,
+                                        fmt=fmt, styles=styles)
             layer = QgsRasterLayer(uri, name, "wms")
             if not layer.isValid():
                 return {"error": f"Invalid WMTS layer: {layers_param}"}

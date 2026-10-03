@@ -678,6 +678,25 @@ def add_wms(url, layers, name=None, crs="EPSG:3857", fmt="image/png"):
     return _finalize_layer(layer)
 
 
+def uri_wmts(url, layers, tilematrixset="PM", crs="EPSG:3857",
+             fmt="image/jpeg", styles="normal") -> str:
+    """Adresse QGIS d'une vraie couche WMTS, decrite par le GetCapabilities.
+
+    Seule source de cette adresse : add_wmts et le chargement du catalogue
+    (pont, smart_load) l'appellent tous deux. L'ancienne forme
+    (`url=<service>&...&type=xyz`) donnait une couche « valide » qui ne
+    rendait AUCUNE tuile dans un projet en Lambert 93 : fond blanc, constate
+    le 2026-10-03 avec l'orthophoto IGN (rendu hors ecran : une seule
+    couleur ; cette forme-ci : 97 couleurs sur 100 points). Le correctif
+    d'add_wmts seul n'avait pas suffi : le pont avait sa propre copie.
+    """
+    base = url.split("?", 1)[0]
+    return (f"contextualWMSLegend=0&crs={crs}&dpiMode=7&featureCount=10"
+            f"&format={fmt}&layers={layers}&styles={styles}"
+            f"&tileMatrixSet={tilematrixset}"
+            f"&url={base}?SERVICE%3DWMTS%26REQUEST%3DGetCapabilities")
+
+
 def add_wmts(url, layers, name=None, tilematrixset="PM",
              crs="EPSG:3857", fmt="image/jpeg", styles="normal"):
     """Add a WMTS tiled layer.
@@ -688,16 +707,8 @@ def add_wmts(url, layers, name=None, tilematrixset="PM",
     """
     if name is None:
         name = layers
-    # Vraie couche WMTS, decrite par le GetCapabilities du service. L'ancienne
-    # forme (`url=<service>&...&type=xyz`) donnait une couche « valide » qui
-    # ne rendait AUCUNE tuile dans un projet en Lambert 93 : fond blanc,
-    # constate le 2026-10-03 avec l'orthophoto IGN (rendu hors ecran : une
-    # seule couleur ; cette forme-ci : 97 couleurs sur 100 points).
-    base = url.split("?", 1)[0]
-    uri = (f"contextualWMSLegend=0&crs={crs}&dpiMode=7&featureCount=10"
-           f"&format={fmt}&layers={layers}&styles={styles}"
-           f"&tileMatrixSet={tilematrixset}"
-           f"&url={base}?SERVICE%3DWMTS%26REQUEST%3DGetCapabilities")
+    uri = uri_wmts(url, layers, tilematrixset=tilematrixset, crs=crs,
+                   fmt=fmt, styles=styles)
     layer = QgsRasterLayer(uri, name, "wms")
     if not layer.isValid():
         return {"error": f"Invalid WMTS layer: {layers}"}
