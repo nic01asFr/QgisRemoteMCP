@@ -118,7 +118,7 @@ def test_sans_contour_l_erreur_dit_quoi_faire():
 
 def test_la_zone_annonce_le_contour():
     assert '"contour": contour_source or None' in _ZONE
-    assert "clip_to_study_zone" in _ZONE
+    assert "charger_sur_commune" in _ZONE
 
 
 # ── 2. Le decoupage ──────────────────────────────────────────────────────

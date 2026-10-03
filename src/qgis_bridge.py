@@ -467,13 +467,18 @@ class QGISBridge:
                      "avant de charger des donnees.")
         elif par_bbox and contour:
             suite = (f"Avant de compter dans la commune, decoupe "
-                     f"« {_court(par_bbox[0])} » au contour : clip_to_study_zone.")
+                     f"« {_court(par_bbox[0])} » au contour : clip_to_study_zone. "
+                     "Pour une autre couche : charger_sur_commune.")
         elif par_bbox:
             suite = ("Zone sans contour : un compte porte sur le rectangle, "
                      "dis-le a l'utilisateur.")
         elif memoire:
             suite = (f"Exporte « {_court(memoire[0])} » (export_layer) pour la "
                      f"garder : une couche en memoire disparait au redemarrage.")
+        elif nv == 0 and contour:
+            suite = ("Pour afficher des donnees sur la commune : "
+                     "charger_sur_commune(id) en un appel (decoupe, contour, "
+                     "fond) ; list_datasources pour l'identifiant.")
         elif nv == 0:
             suite = ("Charge les donnees avec smart_load (list_datasources "
                      "pour le catalogue).")
@@ -6448,8 +6453,9 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
             "filtre": "rectangle (bbox) -- pas le contour administratif",
             "suite": ("Pour une carte, la couche convient telle quelle. Pour un "
                       "chiffre « dans la commune », decoupe d'abord au contour "
-                      "avec clip_to_study_zone (native:clip sur la limite "
-                      "communale), puis compte."),
+                      "avec clip_to_study_zone, puis compte. Pour charger une "
+                      "autre couche sur la commune : charger_sur_commune, qui "
+                      "decoupe en un appel."),
         }
         if couche is None:
             return verification

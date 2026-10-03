@@ -213,9 +213,10 @@ Auto-detected column types: `Choice` (colored dropdowns), `Date` (epoch timestam
 |------|-------------|
 | `set_study_zone` | Define study area (commune, address, bbox). Geocodes, stores bbox, zooms. |
 | `get_study_zone` | Get current zone (name, bbox in 4326 + 2154). |
-| `smart_load` | Load data by catalog ID. WFS → local GPKG. Rasters stream. |
+| `charger_sur_commune` | Data on a commune in one call: load, cut to the outline, commune outline, orthophoto, zoom. |
+| `smart_load` | Load data by catalog ID over the zone's rectangle. WFS → local GPKG. Rasters stream. |
+| `clip_to_study_zone` | Cut an already loaded layer to the commune's outline. |
 | `list_datasources` | Browse data catalog (filter by category or search). |
-| `add_from_catalog` | Add source by catalog ID. |
 
 ### Core
 | Tool | Description |

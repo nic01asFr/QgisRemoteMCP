@@ -57,8 +57,10 @@ Each worker exposes the same REST API on dynamic ports (9000+/9100+/9200+).
 ### Data loading
 - `set_study_zone` — Define study area (geocodes, stores bbox)
 - `get_study_zone` — Read stored zone
-- `smart_load` — Load from catalog (WFS → local GPKG, rasters stream)
-- `list_datasources` / `add_from_catalog` — Browse and add data sources
+- `charger_sur_commune` — Data on a commune in one call (load, cut, outline, orthophoto, zoom)
+- `smart_load` — Load from catalog over the zone's rectangle (WFS → local GPKG, rasters stream)
+- `clip_to_study_zone` — Cut an already loaded layer to the commune's outline
+- `list_datasources` — Browse the catalog (`add_from_catalog` is no longer listed; smart_load follows the same path)
 - `add_layer` / `remove_layer` — Manual layer management
 
 ### Analysis

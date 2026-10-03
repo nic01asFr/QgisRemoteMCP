@@ -295,7 +295,7 @@ TOOLS = [
     },
     {
         "name": "execute_python",
-        "description": "Execute Python/PyQGIS code inside the running QGIS instance. The script has access to qgis.core.*, iface, processing.run(), project = QgsProject.instance(), canvas = iface.mapCanvas(). A `helpers` module is available with ready-made functions: helpers.geocode(addr), helpers.add_wfs(url, typename, bbox), helpers.add_wms(url, layers), helpers.add_wmts(url, layers), helpers.add_xyz(url, name), helpers.zoom_to(target), helpers.create_point_layer(name, points), helpers.load_catalog_source(id), helpers.bbox_from_canvas(), helpers.search_commune(name), helpers.get_elevation(lon, lat). Store return values in the `result` dict. Read skill://helpers for full reference. Les couches creees par le script recoivent un bloc `verification` (compte, emprise, origine, `lecture` en clair) : lis-le. Avant d'ecrire du code, verifie qu'un outil ne couvre pas le besoin (smart_load, clip_to_study_zone, densite_par_maille, compter_par_zone, run_processing).",
+        "description": "Execute Python/PyQGIS code inside the running QGIS instance. The script has access to qgis.core.*, iface, processing.run(), project = QgsProject.instance(), canvas = iface.mapCanvas(). A `helpers` module is available with ready-made functions: helpers.geocode(addr), helpers.add_wfs(url, typename, bbox), helpers.add_wms(url, layers), helpers.add_wmts(url, layers), helpers.add_xyz(url, name), helpers.zoom_to(target), helpers.create_point_layer(name, points), helpers.load_catalog_source(id), helpers.bbox_from_canvas(), helpers.search_commune(name), helpers.get_elevation(lon, lat). Store return values in the `result` dict. Read skill://helpers for full reference. Les couches creees par le script recoivent un bloc `verification` (compte, emprise, origine, `lecture` en clair) : lis-le. Avant d'ecrire du code, verifie qu'un outil ne couvre pas le besoin (charger_sur_commune, smart_load, clip_to_study_zone, densite_par_maille, compter_par_zone, run_processing).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -653,23 +653,10 @@ TOOLS = [
             "required": []
         }
     },
-    {
-        "name": "add_from_catalog",
-        "description": "Add a data source from the catalog by ID. Prefer smart_load, which this tool now follows for WFS sources: the features are downloaded as a local GeoPackage limited to the bbox (or the study zone), never served live. Raster sources (WMS/WMTS/XYZ) stream. Use list_datasources to see available IDs.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "id": {"type": "string", "description": "Source ID from catalog (e.g. 'osm_xyz', 'bdtopo_batiments')"},
-                "name": {"type": "string", "description": "Override display name", "default": ""},
-                "bbox": {"type": "array", "items": {"type": "number"}, "description": "[xmin, ymin, xmax, ymax] in EPSG:4326. Optional: the study zone is used when omitted."}
-            },
-            "required": ["id"]
-        }
-    },
     # ── Study zone & smart load ─────────────────────────────────
     {
         "name": "set_study_zone",
-        "description": "Define the geographic study area. CALL THIS FIRST before loading WFS data. Geocodes the target, stores bbox in project variables (EPSG:4326 + EPSG:2154), and zooms the canvas. Subsequent smart_load calls auto-use this zone. Pour une commune ou un arrondissement (« Aix-en-Provence », « Marseille 4e »), le contour administratif est aussi memorise : clip_to_study_zone s'en sert. Une adresse, un point ou une emprise ne donnent qu'un rectangle.",
+        "description": "Define the geographic study area. CALL THIS FIRST before loading WFS data. Geocodes the target, stores bbox in project variables (EPSG:4326 + EPSG:2154), and zooms the canvas. Subsequent smart_load calls auto-use this zone. Pour une commune ou un arrondissement (« Aix-en-Provence », « Marseille 4e »), le contour administratif est aussi memorise : charger_sur_commune s'en sert pour charger des donnees decoupees a la commune, clip_to_study_zone pour une couche deja chargee. Une adresse, un point ou une emprise ne donnent qu'un rectangle.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -686,7 +673,7 @@ TOOLS = [
     },
     {
         "name": "clip_to_study_zone",
-        "description": "Decoupe une couche vecteur au CONTOUR administratif de la zone d'etude (commune ou arrondissement memorise par set_study_zone), pas au rectangle. Couche designee par layer_id ou par son nom exact (layer). A utiliser avant tout chiffre « dans la commune » : smart_load charge un rectangle qui deborde sur les communes voisines. Le resultat est un GeoPackage dans les donnees de l'etude, ajoute au projet, nomme <couche>_<zone> par defaut. Le retour porte un bloc `verification` (avant, apres, retirees, emprise, contour utilise, avertissement). Echoue en clair si la zone n'a pas de contour (emprise, point ou adresse) : redefinis-la alors avec le nom de la commune.",
+        "description": "Decoupe une couche DEJA chargee au CONTOUR administratif de la zone d'etude (commune ou arrondissement memorise par set_study_zone), pas au rectangle. Couche designee par layer_id ou par son nom exact (layer). Pour charger ET decouper des donnees sur une commune, charger_sur_commune fait tout en un appel ; cet outil sert a une couche deja presente, avant tout chiffre « dans la commune ». Le resultat est un GeoPackage dans les donnees de l'etude, ajoute au projet, nomme <couche>_<zone> par defaut. Le retour porte un bloc `verification` (avant, apres, retirees, emprise, contour utilise, avertissement). Echoue en clair si la zone n'a pas de contour (emprise, point ou adresse) : redefinis-la alors avec le nom de la commune.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -745,7 +732,7 @@ TOOLS = [
     },
     {
         "name": "smart_load",
-        "description": "Load data from the catalog. WFS sources are downloaded as local GeoPackage via ogr2ogr (automatic pagination, R-tree spatial index, fast for Processing). Raster sources (WMS/WMTS/XYZ) stream as usual. Use set_study_zone first to define the area, or provide a bbox. Il gere les grandes emprises : une ville entiere passe (300 551 batiments sur Marseille, mesure), le resultat est mis en cache 24 h et porte un index spatial. N'ecris JAMAIS ton propre telechargement WFS en execute_python : la combinaison `-spat` + `-t_srs` que tu ecrirais naturellement rend ZERO entite sans erreur, et cet outil contourne deja ce piege. Si le retour porte un `avertissement` disant qu'aucune entite n'a ete trouvee, ne poursuis pas l'analyse : verifie l'emprise. Lis le bloc `verification` (compte local, `lecture` : ce que l'emprise compare) avant tout chiffre. Le chargement couvre un rectangle : pour un chiffre dans la commune, clip_to_study_zone ensuite.",
+        "description": "Pour « charge / affiche <donnees> sur <commune> », utilise charger_sur_commune (chargement, decoupage, contour, fond en UN appel) plutot que cet outil. Load data from the catalog. WFS sources are downloaded as local GeoPackage via ogr2ogr (automatic pagination, R-tree spatial index, fast for Processing). Raster sources (WMS/WMTS/XYZ) stream as usual. Use set_study_zone first to define the area, or provide a bbox. Il gere les grandes emprises : une ville entiere passe (300 551 batiments sur Marseille, mesure), le resultat est mis en cache 24 h et porte un index spatial. N'ecris JAMAIS ton propre telechargement WFS en execute_python : la combinaison `-spat` + `-t_srs` que tu ecrirais naturellement rend ZERO entite sans erreur, et cet outil contourne deja ce piege. Si le retour porte un `avertissement` disant qu'aucune entite n'a ete trouvee, ne poursuis pas l'analyse : verifie l'emprise. Lis le bloc `verification` (compte local, `lecture` : ce que l'emprise compare) avant tout chiffre. Le chargement couvre un rectangle qui deborde de la commune : une couche deja chargee ainsi se decoupe avec clip_to_study_zone.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1003,7 +990,7 @@ PROMPTS = [
     },
     {
         "name": "workflow_donnees",
-        "description": "Guided workflow for loading and analyzing French geospatial data. Uses smart pipeline (set_study_zone + smart_load) for reliable, fast data loading.",
+        "description": "Guided workflow for loading and analyzing French geospatial data. Uses set_study_zone + charger_sur_commune (data cut to the commune, outline, background) for reliable, fast data loading.",
         "arguments": [
             {"name": "zone", "description": "Study area (commune, address, or region)", "required": True},
             {"name": "theme", "description": "Analysis theme: urbanisme, environnement, transport, agriculture, risques", "required": False},
@@ -1056,29 +1043,29 @@ Services vision : Moondream ({MOONDREAM_URL}), SAMGeo3 ({SAMGEO3_URL}), DepthPro
         layers = theme_layers.get(theme, theme_layers["general"])
         return [{"type": "text", "text": f"""Workflow données — {zone} ({theme})
 
-Utilise le pipeline smart_load pour charger les données de manière fiable.
 Les WFS sont téléchargés en GeoPackage local (index spatial, Processing rapide).
 
 1. set_study_zone(target="{zone}")
-   → Géocode, stocke bbox 4326+2154, zoom canvas
+   → Géocode, stocke bbox 4326+2154 et le contour d'une commune, zoom canvas
 
-2. smart_load(id="osm_xyz") — fond de carte
+2. Données thématiques ({theme}), un appel par couche :
+   {chr(10).join(f'   charger_sur_commune(id="{lid.strip()}")' for lid in layers.split(','))}
+   → découpées au contour de la commune, contour seul, fond orthophoto (ajouté une fois), cadrage.
+   Zone sans contour (adresse, emprise) : le chargement reste sur le rectangle, le retour le dit.
+   Pour garder une marge autour de la commune, smart_load(id) à la place.
 
-3. Données thématiques ({theme}):
-   {chr(10).join(f'   smart_load(id="{lid.strip()}")' for lid in layers.split(','))}
+3. get_screenshot — vérifier que les données sont au bon endroit
 
-4. get_screenshot — vérifier que les données sont au bon endroit
-
-5. Analyse Processing adaptée au thème :
+4. Analyse Processing adaptée au thème :
    - urbanisme : densité bâti (creategrid + countpointsinpolygon), distances routes
    - environnement : buffer cours d'eau, intersection végétation
    - transport : réseau routier (v.clean), zones de desserte (service area)
    - agriculture : surfaces par culture (dissolve + area), proximité eau
    - risques : zones inondables (buffer hydro), bâtiments exposés (intersection)
 
-6. Mise en forme : set_layer_style (graduated/categorized), labels
+5. Mise en forme : set_layer_style (graduated/categorized), labels
 
-7. Export : print layout (titre, légende, échelle, sources) → export_pdf
+6. Export : print layout (titre, légende, échelle, sources) → export_pdf
 
 Skills : skill://smart-loading, skill://processing, skill://cartography, skill://data-sources"""}]
 
@@ -2390,11 +2377,12 @@ INSTRUCTIONS = f"""You control a live QGIS Desktop instance. Every modifying too
 
 ## Recommended workflow for data analysis
 1. **set_study_zone** — Define where: "Montpellier", "Sete", "Gare de Lyon, Paris". Stores bbox in project variables.
-2. **smart_load** — Load data by catalog ID (e.g. 'bdtopo_batiments'). WFS data is downloaded as local GeoPackage with spatial index (fast for Processing). Rasters stream as usual.
-3. **clip_to_study_zone** — Before any figure "in the commune": cut the layer to the administrative outline (smart_load loads a rectangle).
-4. **Act** — densite_par_maille / compter_par_zone for density or counts per zone (native algorithms, seconds; never a PyQGIS loop), run_processing, execute_python on local layers (no network delays)
-5. **Verify** — read the `verification` block returned by each tool (count, extent vs zone, warnings), then get_screenshot
-6. **Deliver** — export_layer, export_pdf, download_project
+2. **Load data** (catalog IDs from list_datasources, e.g. 'bdtopo_batiments'):
+   - « charge / affiche <données> sur <commune> » → **charger_sur_commune**(id, commune): load, cut to the administrative outline, commune outline, IGN orthophoto and zoom in ONE call. One call per dataset.
+   - A rectangle or a margin around the zone (recipes, analysis beyond the boundary) → **smart_load**(id). A layer already loaded this way is cut with **clip_to_study_zone** before any figure "in the commune".
+3. **Act** — densite_par_maille / compter_par_zone for density or counts per zone (native algorithms, seconds; never a PyQGIS loop), run_processing, execute_python on local layers (no network delays)
+4. **Verify** — read the `verification` block returned by each tool (count, extent vs zone, warnings), then get_screenshot
+5. **Deliver** — export_layer, export_pdf, download_project
 
 IMPORTANT: Always call set_study_zone BEFORE smart_load for WFS sources. Downloaded WFS layers are in EPSG:2154 (Lambert 93) with R-tree spatial index. Results are cached 24h in /data/cache/.
 
@@ -2429,7 +2417,6 @@ Use these instead of writing boilerplate. Read skill://helpers for full docs and
 
 ## Data catalog (pre-configured French national sources — free, no API key)
 - **list_datasources** — Browse available sources: IGN orthophotos, Plan IGN, BD TOPO (buildings, roads, rivers, communes...), OSM, cadastre, DEM, BAN geocoding, Panoramax. Filter by category or search.
-- **add_from_catalog** — Add a source by ID (e.g. `osm_xyz`, `bdtopo_batiments`). Same path as smart_load for WFS (local GeoPackage within the bbox or the study zone). Prefer smart_load.
 
 ## File management
 - **upload_file** — Upload a file (base64) into the QGIS container /data/. Supports shapefiles, GeoJSON, GPKG, CSV, TIFF, project files.
@@ -2458,7 +2445,7 @@ Use these instead of writing boilerplate. Read skill://helpers for full docs and
 
 ## Workflow pattern
 1. **get_project_info** → understand current layers, CRS, layouts, extents
-2. **Add data** — set_study_zone + smart_load for French data, add_layer for custom URIs, upload_file for user files
+2. **Add data** — charger_sur_commune for data on a commune, smart_load for a rectangle, add_layer for custom URIs, upload_file for user files
 3. **Act** — run_processing, execute_python, zoom_to → each returns screenshot
 4. **Style** — set_layer_style, set_layer_visibility
 5. **Layout** — apply_layout_template (a3_landscape, a4_portrait)

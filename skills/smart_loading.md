@@ -1,5 +1,15 @@
 # Smart Data Loading Pipeline
 
+## On a commune: one call
+
+« Charge / affiche <données> sur <commune> » → `charger_sur_commune(id, commune)`:
+zone, download, cut to the administrative outline, commune outline (stroke only),
+IGN orthophoto background and zoom, in ONE call. Call it once per dataset.
+
+The pipeline below (`set_study_zone` + `smart_load`) loads the zone's RECTANGLE:
+use it for recipes or an analysis that needs a margin around the commune. A layer
+loaded this way is cut with `clip_to_study_zone` before any figure "in the commune".
+
 ## Why Smart Loading?
 
 Direct WFS connections have critical issues for analysis:

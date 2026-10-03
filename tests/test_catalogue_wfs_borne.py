@@ -66,10 +66,12 @@ def test_l_ajout_est_une_action_longue_pour_les_recettes():
     assert '"add_from_catalog"' in bloc
 
 
-def test_la_description_ne_reclame_plus_de_bbox():
-    bloc = _MCP.split('"name": "add_from_catalog"')[1].split('"name":')[0]
-    assert "required for WFS" not in bloc
-    assert "smart_load" in bloc
+def test_l_ajout_n_est_plus_propose_mais_reste_appelable():
+    """smart_load fait le meme chemin : deux outils de chargement proposes,
+    c'etait un choix de plus pour le modele (2026-10-03). Un client qui
+    l'appelle encore par son nom est toujours servi."""
+    assert '"name": "add_from_catalog"' not in _MCP
+    assert '"add_from_catalog": _tool_add_from_catalog,' in _MCP
 
 
 # ── 3. Le chargement dit ce qu'il a charge ───────────────────────────────
@@ -81,7 +83,7 @@ def test_le_chargement_porte_une_verification():
 def test_la_verification_rappelle_bbox_et_contour():
     bloc = _PONT.split("def _verification_chargement")[1].split("\n    def ")[0]
     assert "pas le contour administratif" in bloc
-    assert "native:clip" in bloc
+    assert "clip_to_study_zone" in bloc and "charger_sur_commune" in bloc
 
 
 def _rapport(zone, couche):
