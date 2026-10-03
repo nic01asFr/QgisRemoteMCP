@@ -1118,8 +1118,9 @@ def set_study_zone(target, buffer_km=2):
         "resume": (f"Zone d'etude : {zone_name} — {largeur_km} x {hauteur_km} km "
                    f"({methode}). La carte est cadree dessus, et les prochains "
                    f"chargements s'y limiteront sauf emprise explicite. "
-                   + ("Contour communal memorise : clip_to_study_zone decoupera "
-                      "une couche a la limite de la commune."
+                   + ("Contour communal memorise : charger_sur_commune(id) "
+                      "charge des donnees decoupees a la commune, avec son "
+                      "contour et un fond, en un appel."
                       if contour_wkt else
                       "Pas de contour administratif (la zone n'est pas une "
                       "commune) : tout compte portera sur ce rectangle.")),

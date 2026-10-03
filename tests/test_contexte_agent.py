@@ -94,8 +94,9 @@ def test_une_couche_vide_est_a_corriger(hint):
 def test_chargee_par_rectangle_on_decoupe_avant_de_compter(hint):
     etat, suite = hint(_etat(par_bbox=["batiment"]))
     assert "(contour communal)" in etat
-    assert suite == ("Avant de compter dans la commune, decoupe « batiment » "
-                     "au contour : clip_to_study_zone.")
+    assert suite.startswith("Avant de compter dans la commune, decoupe « batiment » "
+                            "au contour : clip_to_study_zone.")
+    assert "Pour une autre couche : charger_sur_commune" in suite
 
 
 def test_zone_sans_contour_le_compte_porte_sur_le_rectangle(hint):
@@ -126,8 +127,18 @@ def test_sans_rien_a_corriger_la_phase_guide(hint, phase, attendu):
     assert attendu in suite
 
 
-def test_sans_couche_vecteur_on_charge(hint):
+def test_sans_couche_sur_une_commune_on_charge_en_un_appel(hint):
+    """Essai du 2026-10-03 : apres set_study_zone, cette ligne disait
+    « Charge les donnees avec smart_load » ; un passage sur trois, le modele
+    a suivi list_datasources, smart_load puis clip_to_study_zone (7 etapes,
+    ni contour ni fond) au lieu de charger_sur_commune."""
     _, suite = hint(_etat(nb_vecteurs=0, phase="setup"))
+    assert "charger_sur_commune" in suite
+    assert "smart_load" not in suite
+
+
+def test_sans_couche_ni_contour_on_charge_le_rectangle(hint):
+    _, suite = hint(_etat(nb_vecteurs=0, contour=False, phase="setup"))
     assert "smart_load" in suite
 
 

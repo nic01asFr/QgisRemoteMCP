@@ -254,3 +254,43 @@ def test_les_deux_chemins_wmts_partagent_la_meme_adresse():
     branche = _PONT.split('elif src_type == "wmts":')[1].split("elif src_type")[0]
     assert "qgis_helpers.uri_wmts(" in branche and "type=xyz" not in branche
     assert "tilematrixset={" not in _PONT, "plus aucune copie de l'ancienne adresse"
+
+
+# ── Un seul chemin enseigne au modele ─────────────────────────────────────
+# Essai du 2026-10-03 : un passage sur trois, le modele a charge par
+# smart_load puis decoupe par clip_to_study_zone (7 etapes, ni contour ni
+# fond). Une dizaine de textes lui enseignaient ce chemin en deux temps ;
+# corriger l'un laissait les autres le reenseigner. Regle : un texte qui
+# enseigne les deux temps nomme aussi charger_sur_commune.
+
+def _textes_lus_par_le_modele():
+    """(nom, texte) : instructions du serveur, descriptions d'outils,
+    demarche guidee, fiches skill://."""
+    textes = [("instructions", _MCP.split('INSTRUCTIONS = f"""')[1].split('"""')[0])]
+    outils = _MCP.split("\nTOOLS = [")[1].split("\n]\n")[0]
+    for bloc in outils.split('\n        "name": "')[1:]:
+        textes.append((bloc.split('"')[0], _description(bloc.split('"')[0])))
+    textes.append(("workflow_donnees",
+                   _MCP.split('elif name == "workflow_donnees":')[1].split("\n    return ")[0]))
+    for fiche in sorted((_RACINE / "skills").glob("*.md")):
+        textes.append((f"skill://{fiche.stem}", fiche.read_text(encoding="utf-8")))
+    return textes
+
+
+def test_les_textes_lus_par_le_modele_sont_tous_recenses():
+    noms = [nom for nom, _ in _textes_lus_par_le_modele()]
+    assert {"instructions", "smart_load", "clip_to_study_zone", "set_study_zone",
+            "charger_sur_commune", "workflow_donnees", "skill://smart_loading"} <= set(noms)
+
+
+def test_aucun_texte_n_enseigne_le_chemin_en_deux_temps_seul():
+    seuls = [nom for nom, texte in _textes_lus_par_le_modele()
+             if "smart_load" in texte and "clip_to_study_zone" in texte
+             and "charger_sur_commune" not in texte]
+    assert seuls == []
+
+
+def test_les_instructions_chargent_une_commune_en_un_appel():
+    instructions = _textes_lus_par_le_modele()[0][1]
+    demarche = instructions.split("## Recommended workflow")[1].split("\n## ")[0]
+    assert demarche.index("charger_sur_commune") < demarche.index("smart_load")
