@@ -198,3 +198,37 @@ def test_le_fond_est_reutilise_et_place_sous_les_couches():
     assert "reutilise" in code and "couche_service in (c.source()" in code
     assert "racine.addChildNode(clone)" in code
     assert '_FOND_PAR_DEFAUT = "ign_ortho_wmts"' in _PONT
+
+
+# ── 4. Corrections apres l'essai en direct (2026-10-03) ──────────────────
+# Le contour n'apparaissait pas (NameError : qgis_helpers non importe) et le
+# fond orthophoto restait blanc (adresse WMTS ecrite comme du XYZ).
+
+
+def test_toute_action_qui_utilise_qgis_helpers_l_importe():
+    """Le module n'est pas importe en tete du pont : chaque methode qui s'en
+    sert doit l'importer, sinon NameError a l'execution seulement."""
+    arbre = ast.parse(_PONT)
+    en_tete = any(isinstance(n, (ast.Import, ast.ImportFrom)) and any(
+        a.name == "qgis_helpers" for a in n.names) for n in arbre.body)
+    if en_tete:
+        return
+    fautives = []
+    for f in ast.walk(arbre):
+        if not isinstance(f, ast.FunctionDef):
+            continue
+        utilise = any(isinstance(n, ast.Name) and n.id == "qgis_helpers"
+                      for n in ast.walk(f))
+        importe = any(isinstance(n, ast.Import) and any(
+            a.name == "qgis_helpers" for a in n.names) for n in ast.walk(f))
+        if utilise and not importe:
+            fautives.append(f.name)
+    assert fautives == []
+
+
+def test_le_wmts_passe_par_le_getcapabilities():
+    aides = (_RACINE / "src" / "qgis_helpers.py").read_text(encoding="utf-8")
+    code = aides.split("def add_wmts(")[1].split("\ndef ")[0]
+    construction = code.split("uri = (")[1].split(")\n")[0]
+    assert "REQUEST%3DGetCapabilities" in construction and "tileMatrixSet=" in construction
+    assert "type=xyz" not in construction

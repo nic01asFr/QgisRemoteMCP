@@ -688,9 +688,16 @@ def add_wmts(url, layers, name=None, tilematrixset="PM",
     """
     if name is None:
         name = layers
-    uri = (f"url={url}&layers={layers}&format={fmt}"
-           f"&tilematrixset={tilematrixset}&crs={crs}"
-           f"&styles={styles}&type=xyz")
+    # Vraie couche WMTS, decrite par le GetCapabilities du service. L'ancienne
+    # forme (`url=<service>&...&type=xyz`) donnait une couche « valide » qui
+    # ne rendait AUCUNE tuile dans un projet en Lambert 93 : fond blanc,
+    # constate le 2026-10-03 avec l'orthophoto IGN (rendu hors ecran : une
+    # seule couleur ; cette forme-ci : 97 couleurs sur 100 points).
+    base = url.split("?", 1)[0]
+    uri = (f"contextualWMSLegend=0&crs={crs}&dpiMode=7&featureCount=10"
+           f"&format={fmt}&layers={layers}&styles={styles}"
+           f"&tileMatrixSet={tilematrixset}"
+           f"&url={base}?SERVICE%3DWMTS%26REQUEST%3DGetCapabilities")
     layer = QgsRasterLayer(uri, name, "wms")
     if not layer.isValid():
         return {"error": f"Invalid WMTS layer: {layers}"}

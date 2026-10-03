@@ -6729,6 +6729,7 @@ Object.keys(_GRIST_TABLES).forEach(function(tname){{
         celui que set_study_zone a memorise : aucun telechargement. Ecrit dans
         les donnees de l'etude, trait seul sans remplissage, en tete de legende.
         """
+        import qgis_helpers
         from qgis.core import QgsDistanceArea, QgsFeature, QgsGeometry
         contour = qgis_helpers.get_study_zone_contour()
         if "error" in contour:
